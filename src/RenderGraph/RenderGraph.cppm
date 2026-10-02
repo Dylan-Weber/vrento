@@ -83,6 +83,13 @@ public:
 
     auto getPass(PassHandle) -> Option<Pass&>;
     auto getPass(PassHandle) const -> Option<const Pass&>;
+    template<typename T> auto getPass(PassHandle handle) const -> Option<const T&> {
+        auto pass = m_passes.get(handle);
+        if (pass.is_none() || (**pass)->ConcreteType() != rstd::any::TypeId::of<T>()) return None();
+        return Some<const T&>(static_cast<const T&>((**pass)->AsConstPass()));
+    }
+    auto readsTexture(NodeHandle pass, TextureNodeRef texture) const -> bool;
+    auto writesTexture(NodeHandle pass, TextureNodeRef texture) const -> bool;
     auto passState(NodeHandle) const -> Option<PassNodeState>;
     auto textureState(TextureNodeRef) const -> Option<TextureNodeState>;
     auto latestTexture(ref<str> key) const -> Option<TextureNodeRef>;

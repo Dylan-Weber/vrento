@@ -26,6 +26,7 @@ auto PassTypeName(PassNode::Type type) -> ref<str> {
     case PassNode::Type::CustomShader: return "CustomShader"_str;
     case PassNode::Type::Copy: return "Copy"_str;
     case PassNode::Type::Virtual: return "Virtual"_str;
+    case PassNode::Type::Extension: return "Extension"_str;
     }
     return "Unknown"_str;
 }

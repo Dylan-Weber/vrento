@@ -625,20 +625,29 @@ private:
 
 // ---------- Swapchain.hpp ----------
 
+struct SwapchainOptions {
+    bool require_srgb { false };
+    VkImageUsageFlags usage { VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT };
+};
+
 class Swapchain {
 public:
-    static bool              Create(Device&, VkSurfaceKHR, VkExtent2D, Swapchain&);
+    static bool              Create(Device&, VkSurfaceKHR, VkExtent2D, Swapchain&,
+                                    SwapchainOptions = {});
+    static auto CreateResult(Device&, VkSurfaceKHR, VkExtent2D, Swapchain&,
+                             SwapchainOptions = {}) -> VkResult;
     const vvk::SwapchainKHR& handle() const;
     VkFormat                 format() const;
     VkExtent2D               extent() const;
     VkPresentModeKHR         presentMode() const;
     slice<ImageParameters>   images() const;
+    void reset();
 
 private:
     vvk::SwapchainKHR    m_handle;
-    VkSurfaceFormatKHR   m_format;
-    VkExtent2D           m_extent;
-    VkPresentModeKHR     m_present_mode;
+    VkSurfaceFormatKHR   m_format {};
+    VkExtent2D           m_extent {};
+    VkPresentModeKHR     m_present_mode {};
     Vec<ImageParameters> m_images;
     Vec<vvk::ImageView>  m_imageviews;
 };
@@ -920,7 +929,8 @@ public:
     Device();
     ~Device();
 
-    static bool Create(Instance&, slice<Extension> exts, VkExtent2D extent, Device&);
+    static bool Create(Instance&, slice<Extension> exts, VkExtent2D extent, Device&,
+                       SwapchainOptions = {});
     static bool CheckGPU(vvk::PhysicalDevice gpu, slice<Extension> exts, VkSurfaceKHR surface);
 
     void Destroy();
@@ -929,6 +939,12 @@ public:
     const auto&                  present_queue() const { return m_present_queue; }
     const auto&                  device() const { return m_device; }
     const auto&                  handle() const { return m_device; }
+    auto lost() const -> bool { return __atomic_load_n(&m_lost, __ATOMIC_ACQUIRE); }
+    auto observe_result(VkResult result) const -> VkResult {
+        if (result == VK_ERROR_DEVICE_LOST)
+            __atomic_store_n(&m_lost, true, __ATOMIC_RELEASE);
+        return result;
+    }
     const auto&                  gpu() const { return m_gpu; }
     const vvk::InstanceDispatch& instance_dispatch() const { return *m_instance_dispatch; }
     VkInstance                   instance_handle() const { return m_instance; }
@@ -946,6 +962,10 @@ public:
     const auto& out_extent() const { return m_extent; }
     const auto& capabilities() const { return m_capabilities; }
     void        set_out_extent(VkExtent2D v) { m_extent = v; }
+    // The caller must retire graphics and presentation work before replacement.
+    bool recreateSwapchain(VkSurfaceKHR, VkExtent2D, SwapchainOptions = {});
+    auto recreateSwapchainResult(VkSurfaceKHR, VkExtent2D, SwapchainOptions = {}) -> VkResult;
+    void releaseSwapchain();
 
     bool supportExt(ref<str>) const;
 
@@ -960,6 +980,7 @@ private:
     VkInstance                   m_instance { VK_NULL_HANDLE };
     rstd::uint32_t               m_instance_api_version { WP_VULKAN_VERSION };
     vvk::Device                  m_device;
+    mutable bool                 m_lost{};
     vvk::PhysicalDevice          m_gpu;
     vvk::MemoryAllocator         m_allocator;
 

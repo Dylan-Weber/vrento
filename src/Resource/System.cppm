@@ -119,6 +119,13 @@ struct ExternalResourcePreparer {
     using Funcs = TraitFuncs<&T::PrepareExternal>;
 };
 
+enum class FontAtlasUploadStatus
+{
+    NotResident,
+    Uploaded,
+    Failed
+};
+
 class RenderResourceSystem {
 public:
     bool Initialize(const vulkan::Device& device) { return m_registries.Initialize(device); }
@@ -546,11 +553,14 @@ public:
     }
 
     void Collect(mut_ref<dyn<vulkan::MemoryBudgetSource>> memory) {
+        Collect(memory.as_ref());
+    }
+    void Collect(ref<dyn<vulkan::MemoryBudgetSource>> memory) {
         m_registries.PipelineCache().PruneExpired();
         m_registries.PipelineLayouts().PruneExpired();
         m_registries.RenderPassCache().PruneExpired();
         m_registries.FramebufferCache().PruneExpired();
-        m_registries.Memory().Refresh(memory.as_ref());
+        m_registries.Memory().Refresh(memory);
         if (! m_registries.Memory().ShouldEvictTransient()) return;
         m_registries.TextureEntries().EvictUnused();
         m_registries.Buffers().EvictUnused();
@@ -562,16 +572,19 @@ public:
     void SetVideoDecodeOptions(vulkan::TextureCache::VideoDecodeOptions options) {
         m_registries.Textures().SetVideoDecodeOptions(rstd::move(options));
     }
-    bool UploadFontAtlasRegion(ref<str> key, const rstd::uint8_t* atlas, rstd::uint32_t atlas_width,
-                               rstd::uint32_t x, rstd::uint32_t y, rstd::uint32_t width,
-                               rstd::uint32_t height) {
+    FontAtlasUploadStatus UploadFontAtlasRegion(ref<str> key, const rstd::uint8_t* atlas,
+                                                rstd::uint32_t atlas_width, rstd::uint32_t x,
+                                                rstd::uint32_t y, rstd::uint32_t width,
+                                                rstd::uint32_t height) {
         auto handle =
             m_registries.TextureEntries().Find(resource::TextureRequestKind::Imported, key);
-        if (handle.is_none()) return false;
+        if (handle.is_none()) return FontAtlasUploadStatus::NotResident;
         auto physical = m_registries.TextureEntries().ResolveCurrent(*handle);
-        if (physical.is_none()) return false;
+        if (physical.is_none()) return FontAtlasUploadStatus::NotResident;
         return m_registries.Textures().UploadFontAtlasRegion(
-            (**physical).allocation.deref(), atlas, atlas_width, x, y, width, height);
+                   (**physical).allocation.deref(), atlas, atlas_width, x, y, width, height)
+                   ? FontAtlasUploadStatus::Uploaded
+                   : FontAtlasUploadStatus::Failed;
     }
     auto CreateLocalSwapchain(const vulkan::Device& device, unsigned width, unsigned height,
                               VkImageTiling tiling) -> Option<ExSwapchainOwner> {

@@ -21,6 +21,8 @@ struct MaterialPipelineDesc {
     float        depth_bias_clamp {};
     float        depth_bias_slope {};
 
+    bool UsesDepthAttachment() const { return depth_test || depth_write; }
+
     friend bool operator==(const MaterialPipelineDesc& a, const MaterialPipelineDesc& b) {
         return a.blend_mode == b.blend_mode && a.alpha_write.is_some() == b.alpha_write.is_some() &&
                (a.alpha_write.is_none() || *a.alpha_write == *b.alpha_write) &&

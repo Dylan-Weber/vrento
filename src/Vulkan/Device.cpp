@@ -51,24 +51,32 @@ bool Device::CheckGPU(vvk::PhysicalDevice gpu, slice<Extension> exts, VkSurfaceK
     auto extensions = BTreeSet<String>::make();
     EnumateDeviceExts(gpu, extensions);
     bool requires_timeline_semaphore { false };
+    bool requires_maintenance { false };
     for (auto& ext : exts) {
         if (ext.required) {
             if (! extensions.contains(ext.name)) return false;
+            if (ext.name == "VK_EXT_swapchain_maintenance1"_str) requires_maintenance = true;
             if (ext.name ==
                 CStr::from_ptr(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME).to_str().unwrap()) {
                 requires_timeline_semaphore = true;
             }
         }
     }
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT maintenance_features {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT,
+    };
     VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timeline_features {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR,
         .pNext = nullptr,
     };
     VkPhysicalDeviceFeatures2KHR features2 {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR,
-        .pNext = requires_timeline_semaphore ? &timeline_features : nullptr,
+        .pNext = requires_timeline_semaphore ? static_cast<void*>(&timeline_features)
+                 : (requires_maintenance ? &maintenance_features : nullptr),
     };
+    if (requires_timeline_semaphore && requires_maintenance) timeline_features.pNext = &maintenance_features;
     gpu.GetFeatures2KHR(features2);
+    if (requires_maintenance && !maintenance_features.swapchainMaintenance1) return false;
 #if ! __is_target_os(macos)
     if (! features2.features.geometryShader) return false;
 #endif
@@ -118,7 +126,8 @@ Vec<VkDeviceQueueCreateInfo> Device::ChooseDeviceQueue(VkSurfaceKHR surface) {
     return queues;
 }
 
-bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, Device& device) {
+bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, Device& device,
+                    SwapchainOptions swapchain_options) {
     device.m_instance             = *inst.inst();
     device.m_instance_api_version = inst.api_version();
     device.m_gpu                  = inst.gpu();
@@ -162,6 +171,12 @@ bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, De
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
         .pNext = &supported_sync2,
     };
+    const bool maintenance = tested_exts.contains("VK_EXT_swapchain_maintenance1"_str);
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT supported_maintenance {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT,
+    };
+    if (maintenance) supported_ycbcr.pNext = &supported_maintenance;
+    supported_maintenance.pNext = &supported_sync2;
     supported_timeline.pNext = &supported_ycbcr;
     VkPhysicalDeviceFeatures2KHR supported2 {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR,
@@ -223,6 +238,15 @@ bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, De
                               : (enable_depth_clip ? &enabled_depth_clip : nullptr),
         .samplerYcbcrConversion = supported_ycbcr.samplerYcbcrConversion,
     };
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT enabled_maintenance {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT,
+        .pNext = enabled_ycbcr.pNext,
+        .swapchainMaintenance1 = VK_TRUE,
+    };
+    if (maintenance) {
+        if (!supported_maintenance.swapchainMaintenance1) return false;
+        enabled_ycbcr.pNext = &enabled_maintenance;
+    }
     enabled_timeline.pNext = &enabled_ycbcr;
 
     auto               queue_create_infos = device.ChooseDeviceQueue(*inst.surface());
@@ -291,10 +315,11 @@ bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, De
     };
 
     if (rq_surface) {
-        if (! Swapchain::Create(device, *inst.surface(), extent, device.m_swapchain)) {
+        if (! Swapchain::Create(device, *inst.surface(), extent, device.m_swapchain, swapchain_options)) {
             rstd_error("create swapchain failed");
             return false;
         }
+        device.set_out_extent(device.m_swapchain.extent());
     }
     {
         VkCommandPoolCreateInfo info { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -336,3 +361,17 @@ Device::Device() = default;
 Device::~Device() {}
 
 bool Device::supportExt(ref<str> name) const { return m_extensions.contains(name); }
+
+bool Device::recreateSwapchain(VkSurfaceKHR surface, VkExtent2D extent, SwapchainOptions options) {
+    return recreateSwapchainResult(surface, extent, options) == VK_SUCCESS;
+}
+auto Device::recreateSwapchainResult(VkSurfaceKHR surface, VkExtent2D extent, SwapchainOptions options) -> VkResult {
+    auto result = observe_result(Swapchain::CreateResult(*this, surface, extent, m_swapchain, options));
+    if (result == VK_SUCCESS) set_out_extent(m_swapchain.extent());
+    return result;
+}
+
+void Device::releaseSwapchain() {
+    m_swapchain.reset();
+    m_extent = {};
+}

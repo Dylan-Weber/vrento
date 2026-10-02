@@ -15,7 +15,8 @@ struct PassNode {
     {
         CustomShader,
         Copy,
-        Virtual
+        Virtual,
+        Extension
     };
 
     NodeHandle handle;

@@ -669,3 +669,16 @@ auto RenderGraph::resourcePlan() const -> resource::ResourcePlan {
     }
     return plan;
 }
+
+auto RenderGraph::readsTexture(NodeHandle pass, TextureNodeRef texture) const -> bool {
+    if (getPassNode(pass).is_none()) return false;
+    auto node = getTexNode(texture.handle);
+    if (node.is_none()) return false;
+    for (auto reader : node->readers) if (reader == pass) return true;
+    return false;
+}
+auto RenderGraph::writesTexture(NodeHandle pass, TextureNodeRef texture) const -> bool {
+    if (getPassNode(pass).is_none()) return false;
+    auto node = getTexNode(texture.handle);
+    return node.is_some() && node->writer.is_some() && *node->writer == pass;
+}

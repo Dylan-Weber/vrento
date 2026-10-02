@@ -31,10 +31,11 @@ struct PassObject {
         using Trait = PassObject;
         auto AsPass() -> Pass& { return rstd::trait_call<0>(this); }
         auto AsConstPass() const -> const Pass& { return rstd::trait_call<1>(this); }
+        auto ConcreteType() const -> rstd::any::TypeId { return rstd::trait_call<2>(this); }
     };
 
     template<typename T>
-    using Funcs = rstd::TraitFuncs<&T::AsPass, &T::AsConstPass>;
+    using Funcs = rstd::TraitFuncs<&T::AsPass, &T::AsConstPass, &T::ConcreteType>;
 };
 
 struct VirtualPass : Pass {
@@ -54,6 +55,7 @@ template<typename T>
 struct Impl<vrento::rg::PassObject, T> : ImplBase<T> {
     auto AsPass() -> vrento::rg::Pass& { return this->self(); }
     auto AsConstPass() const -> const vrento::rg::Pass& { return this->self(); }
+    auto ConcreteType() const -> rstd::any::TypeId { return rstd::any::TypeId::of<T>(); }
 };
 
 template<>
