@@ -44,6 +44,8 @@ VkFormat ToVkType(TextureFormat tf) {
     case TextureFormat::RGB8: return VK_FORMAT_R8G8B8_UNORM;
     case TextureFormat::RGBA8: return VK_FORMAT_R8G8B8A8_UNORM;
     case TextureFormat::D32F: return VK_FORMAT_D32_SFLOAT;
+    case TextureFormat::RGBA8_SRGB: return VK_FORMAT_R8G8B8A8_SRGB;
+    case TextureFormat::RGBA32F: return VK_FORMAT_R32G32B32A32_SFLOAT;
     default: rstd_assert(false); return VK_FORMAT_R8G8B8A8_UNORM;
     }
 }
@@ -53,6 +55,7 @@ VkSamplerAddressMode ToVkType(vrento::TextureWrap sam) {
     switch (sam) {
     case TextureWrap::CLAMP_TO_EDGE: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     case TextureWrap::CLAMP_TO_BORDER: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    case TextureWrap::MIRRORED_REPEAT: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
     case TextureWrap::REPEAT:
     default: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
     }
@@ -86,7 +89,9 @@ VkSamplerCreateInfo GenSamplerInfo(TextureKey key) {
                                        .pNext            = nullptr,
                                        .magFilter        = ToVkType(sam.magFilter),
                                        .minFilter        = (ToVkType(sam.minFilter)),
-                                       .mipmapMode       = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+                                       .mipmapMode       = sam.mipFilter == TextureMipmapFilter::Nearest
+                                                               ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+                                                               : VK_SAMPLER_MIPMAP_MODE_LINEAR,
                                        .addressModeU     = (ToVkType(sam.wrapS)),
                                        .addressModeV     = (ToVkType(sam.wrapT)),
                                        .addressModeW     = (ToVkType(sam.wrapT)),
@@ -95,7 +100,8 @@ VkSamplerCreateInfo GenSamplerInfo(TextureKey key) {
                                        .compareEnable    = sam.compare_enable,
                                        .compareOp        = ToVkType(sam.compare_op),
                                        .minLod           = (0.0f),
-                                       .maxLod           = (1.0f),
+                                       .maxLod           = sam.mipFilter == TextureMipmapFilter::None
+                                                               ? 0.0f : float(key.mipmap_level - 1),
                                        .borderColor      = ToVkBorderColor(sam.border_color),
                                        .unnormalizedCoordinates = (false) };
     return sampler_info;
@@ -444,24 +450,9 @@ TextureCache::AllocateImportedTexture(const Image&                          imag
 
         // check data
         if (! image_slot) return rstd::None();
-        VkSamplerCreateInfo sampler_info {
-            .sType                   = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-            .pNext                   = nullptr,
-            .magFilter               = ToVkType(sam.magFilter),
-            .minFilter               = (ToVkType(sam.minFilter)),
-            .mipmapMode              = VK_SAMPLER_MIPMAP_MODE_LINEAR,
-            .addressModeU            = (ToVkType(sam.wrapS)),
-            .addressModeV            = (ToVkType(sam.wrapS)),
-            .addressModeW            = (ToVkType(sam.wrapT)),
-            .anisotropyEnable        = (false),
-            .maxAnisotropy           = (1.0f),
-            .compareEnable           = (false),
-            .compareOp               = VK_COMPARE_OP_NEVER,
-            .minLod                  = (0.0f),
-            .maxLod                  = (float)mipmap_levels,
-            .borderColor             = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
-            .unnormalizedCoordinates = (false),
-        };
+        auto sampler_info = GenSamplerInfo(TextureKey {
+            .sample = sam, .mipmap_level = unsigned(mipmap_levels),
+        });
         VkFormat   format = ToVkType(image.header.format);
         VkExtent3D ext { static_cast<rstd::uint32_t>(image_slot.width),
                          static_cast<rstd::uint32_t>(image_slot.height),
@@ -1131,24 +1122,9 @@ TextureCache::CreateVideoTex(const Image& image, Option<Arc<rstd::dyn<VideoPlayb
     }
 
     /* 1) Allocate the stable RGBA8 target. */
-    VkSamplerCreateInfo sampler_info {
-        .sType                   = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .pNext                   = nullptr,
-        .magFilter               = ToVkType(image.header.sample.magFilter),
-        .minFilter               = ToVkType(image.header.sample.minFilter),
-        .mipmapMode              = VK_SAMPLER_MIPMAP_MODE_LINEAR,
-        .addressModeU            = ToVkType(image.header.sample.wrapS),
-        .addressModeV            = ToVkType(image.header.sample.wrapS),
-        .addressModeW            = ToVkType(image.header.sample.wrapT),
-        .anisotropyEnable        = false,
-        .maxAnisotropy           = 1.0f,
-        .compareEnable           = false,
-        .compareOp               = VK_COMPARE_OP_NEVER,
-        .minLod                  = 0.0f,
-        .maxLod                  = 1.0f,
-        .borderColor             = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
-        .unnormalizedCoordinates = false,
-    };
+    auto sampler_info = GenSamplerInfo(TextureKey {
+        .sample = image.header.sample, .mipmap_level = 1,
+    });
     VkExtent3D ext { runtime.width, runtime.height, 1 };
     auto       img_opt = CreateImage(m_device,
                                      ext,

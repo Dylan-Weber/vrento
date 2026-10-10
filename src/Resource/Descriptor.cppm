@@ -231,6 +231,7 @@ struct DescriptorBufferBinding {
     VkBuffer       buffer { VK_NULL_HANDLE };
     VkDeviceSize   offset { 0 };
     VkDeviceSize   size { 0 };
+    VkDescriptorType type { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
 };
 
 } // namespace vrento::resource_registry
@@ -260,7 +261,7 @@ struct DescriptorSetPacketKey {
             const auto& rhs_buffer = rhs.buffers[index];
             if (lhs_buffer.binding != rhs_buffer.binding ||
                 lhs_buffer.buffer != rhs_buffer.buffer || lhs_buffer.offset != rhs_buffer.offset ||
-                lhs_buffer.size != rhs_buffer.size) {
+                lhs_buffer.size != rhs_buffer.size || lhs_buffer.type != rhs_buffer.type) {
                 return false;
             }
         }
@@ -287,6 +288,7 @@ struct Impl<hash::Hash, vrento::resource_registry::DescriptorSetPacketKey>
             hash::hash_into(reinterpret_cast<rstd::uintptr_t>(buffer.buffer), state);
             hash::hash_into(buffer.offset, state);
             hash::hash_into(buffer.size, state);
+            hash::hash_into(u32(static_cast<rstd::uint32_t>(buffer.type)), state);
         }
     }
 };
@@ -523,7 +525,7 @@ struct PreparedDescriptorBinding {
                 .dstSet          = {},
                 .dstBinding      = buffer.binding,
                 .descriptorCount = 1,
-                .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .descriptorType  = buffer.type,
                 .pBufferInfo     = &info,
             };
             command.PushDescriptorSetKHR(
@@ -582,8 +584,9 @@ public:
             }
         }
         for (usize index {}; index < buffers.len(); ++index) {
-            if (! HasBinding(
-                    layout.schema, buffers[index].binding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)) {
+            if ((buffers[index].type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+                 buffers[index].type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) ||
+                ! HasBinding(layout.schema, buffers[index].binding, buffers[index].type)) {
                 return Err(resource::ResourceError {
                     .kind    = resource::ResourceErrorKind::MissingDefinition,
                     .message = rstd::format("descriptor buffer binding {} is outside the layout",
@@ -656,7 +659,7 @@ public:
             if (! updates.WriteBuffer(
                     prepared.set->clone(),
                     buffer.binding,
-                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                    buffer.type,
                     slice<VkDescriptorBufferInfo>::from_raw_parts(&info, usize(1)))) {
                 return Err(resource::ResourceError {
                     .kind    = resource::ResourceErrorKind::BackendFailure,
@@ -729,6 +732,10 @@ private:
         });
         sizes.push(VkDescriptorPoolSize {
             .type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 2048,
+        });
+        sizes.push(VkDescriptorPoolSize {
+            .type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .descriptorCount = 2048,
         });
         auto created = vvk::DescriptorArenaGeneration::Create(

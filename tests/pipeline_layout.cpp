@@ -4,6 +4,7 @@ import rstd;
 import vrento.pipeline_layout;
 import vrento.resource;
 import vrento.vulkan;
+import vrento.resource_registry;
 
 using namespace rstd::prelude;
 using namespace vrento::vulkan;
@@ -25,6 +26,11 @@ static auto Requirement(u64 index, u32 set_index, bool shared) -> PipelineLayout
 }
 
 int main() {
+    vrento::resource_registry::DescriptorSetPacketKey uniform, storage;
+    uniform.buffers.push({.binding = 0, .offset = 0, .size = 64});
+    storage.buffers.push({.binding = 0, .offset = 0, .size = 64,
+                         .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER});
+    rstd_assert(!(uniform == storage));
     auto requirements = Vec<PipelineLayoutRequirement>::make();
     requirements.push(Requirement(u64(1), u32(), false));
     auto local = PlanPipelineLayouts(requirements.as_slice(), {}, false);

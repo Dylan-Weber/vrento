@@ -13,13 +13,16 @@ enum class TextureFormat
     RGBA8,
     RG8,
     R8,
-    D32F
+    D32F,
+    RGBA8_SRGB,
+    RGBA32F
 };
 enum class TextureWrap
 {
     CLAMP_TO_EDGE,
     CLAMP_TO_BORDER,
-    REPEAT
+    REPEAT,
+    MIRRORED_REPEAT
 };
 enum class TextureFilter
 {
@@ -37,6 +40,7 @@ enum class CompareOp
     NotEqual,
     Always
 };
+enum class TextureMipmapFilter { None, Nearest, Linear };
 enum class TextureBorderColor
 {
     TransparentBlack,
@@ -52,6 +56,7 @@ struct TextureSample {
     bool               compare_enable { false };
     CompareOp          compare_op { CompareOp::Never };
     TextureBorderColor border_color { TextureBorderColor::OpaqueBlack };
+    TextureMipmapFilter mipFilter { TextureMipmapFilter::Linear };
 };
 
 } // namespace vrento
@@ -72,6 +77,7 @@ struct Impl<hash::Hash, vrento::TextureSample> : ImplBase<vrento::TextureSample>
         hash::hash_into(sample.compare_enable, state);
         hash::hash_into(u32(static_cast<rstd::uint32_t>(sample.compare_op)), state);
         hash::hash_into(u32(static_cast<rstd::uint32_t>(sample.border_color)), state);
+        hash::hash_into(u32(static_cast<rstd::uint32_t>(sample.mipFilter)), state);
     }
 };
 

@@ -315,6 +315,15 @@ int main() {
     changed.sample.border_color = TextureBorderColor::TransparentBlack;
     rstd_assert(hash != TextureKey::HashValue(changed));
     rstd_assert(ToVkType(TextureFormat::D32F) == VK_FORMAT_D32_SFLOAT);
+    rstd_assert(ToVkType(TextureFormat::RGBA8_SRGB) == VK_FORMAT_R8G8B8A8_SRGB);
+    rstd_assert(ToVkType(TextureFormat::RGBA32F) == VK_FORMAT_R32G32B32A32_SFLOAT);
+    changed = key;
+    changed.sample.mipFilter = TextureMipmapFilter::Nearest;
+    rstd_assert(hash != TextureKey::HashValue(changed));
+    resource::TextureDefinition original, mip_filtered;
+    mip_filtered.sample.mipFilter = TextureMipmapFilter::None;
+    rstd_assert(!(original == mip_filtered));
+    rstd_assert(ToVkType(TextureWrap::MIRRORED_REPEAT) == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT);
     rstd_assert(ToVkType(TextureFormat::BC1) == VK_FORMAT_BC1_RGBA_UNORM_BLOCK);
     rstd_assert(ToVkType(TextureWrap::CLAMP_TO_BORDER) == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER);
     rstd_assert(ToVkType(TextureFilter::NEAREST) == VK_FILTER_NEAREST);
