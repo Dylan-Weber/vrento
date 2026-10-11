@@ -209,6 +209,12 @@ struct ImageCopyOperation {
     Vec<ImageMipCopyOperation> mipmaps;
 };
 
+struct ImageRegionOperation {
+    VkImage           destination;
+    VkBufferImageCopy region;
+    Arc<UploadBlock>  source;
+};
+
 struct ImageClearOperation {
     Arc<TextureAllocation> destination_lease;
     ImageParameters        destination;
@@ -229,6 +235,7 @@ struct BufferAllocation::State {
 };
 
 struct RecordedBufferUploads::State {
+    BufferManager*           owner {};
     u64                      serial { 0 };
     bool                     recorded { false };
     Vec<BufferCopyOperation> copies;
@@ -241,6 +248,9 @@ struct RecordedImageUploads::State {
     bool                     recorded { false };
     Vec<ImageCopyOperation>  copies;
     Vec<ImageClearOperation> clears;
+    Vec<ImageRegionOperation> regions;
+    usize                     recorded_regions {};
+    bool                      streaming {};
     Vec<Arc<UploadBlock>>    blocks;
     Vec<ImageUploadTicket>   tickets;
 };
@@ -266,6 +276,30 @@ struct ImageUploadManager::Impl {
     u64                                      next_batch { 0 };
     Vec<Arc<UploadBlock>>                    upload_blocks;
     Option<Arc<RecordedImageUploads::State>> pending;
+    auto AllocateUpload(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset)
+        -> Option<Arc<UploadBlock>> {
+        Option<Arc<UploadBlock>> block;
+        for (const auto& candidate : (*pending)->blocks) {
+            if (candidate->TryAllocate(size, alignment, offset)) return Some(candidate.clone());
+        }
+        for (const auto& candidate : upload_blocks) {
+            if (candidate.strong_count() != usize(1) || candidate->size() < size) continue;
+            candidate->Reset();
+            if (candidate->TryAllocate(size, alignment, offset)) {
+                block = Some(candidate.clone());
+                break;
+            }
+        }
+        if (! block) {
+            block = UploadBlock::Create(device,
+                                        size > kUploadBlockSize ? AlignUp(size, kLargeAlignment)
+                                                                : kUploadBlockSize);
+            if (! block || ! (*block)->TryAllocate(size, alignment, offset)) return None();
+            upload_blocks.push(block->clone());
+        }
+        (*pending)->blocks.push(block->clone());
+        return block;
+    }
 };
 
 BufferAllocation::BufferAllocation()             = default;
@@ -417,6 +451,7 @@ Option<BufferUploadTicket> BufferManager::QueueWrite(BufferAllocation&    alloca
         if (m_impl->next_batch == u64()) ++m_impl->next_batch;
         m_impl->pending            = Some(Arc<RecordedBufferUploads::State>::make());
         (*m_impl->pending)->serial = m_impl->next_batch;
+        (*m_impl->pending)->owner  = this;
     }
 
     VkDeviceSize             upload_offset { 0 };
@@ -525,6 +560,24 @@ BufferManager::CommitRecordedUploads(RecordedBufferUploads&& recorded) {
     state->recorded  = false;
     m_impl->pending  = None();
     return Some(BufferUploadBatchLease(rstd::move(state)));
+}
+
+bool BufferManager::RestoreUploads(BufferUploadBatchLease uploads) {
+    if (! m_impl->initialized || ! uploads.m_state || (*uploads.m_state)->owner != this ||
+        (m_impl->pending && (*m_impl->pending)->recorded))
+        return false;
+    auto state = uploads.m_state.take().unwrap();
+    if (! m_impl->pending) {
+        m_impl->pending = Some(rstd::move(state));
+        return true;
+    }
+    Vec<BufferCopyOperation> copies;
+    for (auto& copy : state->copies) copies.push(rstd::move(copy));
+    for (auto& copy : (*m_impl->pending)->copies) copies.push(rstd::move(copy));
+    (*m_impl->pending)->copies = rstd::move(copies);
+    for (auto& block : state->blocks) (*m_impl->pending)->blocks.push(rstd::move(block));
+    for (auto ticket : state->tickets) (*m_impl->pending)->tickets.push(BufferUploadTicket(ticket));
+    return true;
 }
 
 void BufferManager::CancelRecordedUploads(const Arc<RecordedBufferUploads::State>& state) {
@@ -654,34 +707,9 @@ Option<ImageUploadTicket> ImageUploadManager::QueueWrite(Arc<TextureAllocation> 
             }
 
             VkDeviceSize             upload_offset { 0 };
-            Option<Arc<UploadBlock>> block;
-            for (const auto& candidate : (*m_impl->pending)->blocks) {
-                if (candidate->TryAllocate(size, 256, upload_offset)) {
-                    block = Some(candidate.clone());
-                    break;
-                }
-            }
-            if (! block) {
-                for (const auto& candidate : m_impl->upload_blocks) {
-                    if (candidate.strong_count() != usize(1) || candidate->size() < size) continue;
-                    candidate->Reset();
-                    if (candidate->TryAllocate(size, 256, upload_offset)) {
-                        block = Some(candidate.clone());
-                        break;
-                    }
-                }
-                if (! block) {
-                    const auto block_size =
-                        size > kUploadBlockSize ? AlignUp(size, kLargeAlignment) : kUploadBlockSize;
-                    block = UploadBlock::Create(m_impl->device, block_size);
-                    if (! block || ! (*block)->TryAllocate(size, 256, upload_offset)) return None();
-                    m_impl->upload_blocks.push(block->clone());
-                    rstd_info("new image upload buffer block, size: {}, blocks: {}",
-                              block_size,
-                              m_impl->upload_blocks.len());
-                }
-                (*m_impl->pending)->blocks.push(block->clone());
-            }
+            const auto block_bytes = texture::format_layout(image.header.format).block_bytes;
+            auto block = m_impl->AllocateUpload(size, block_bytes == 3 ? 768 : 256, upload_offset);
+            if (! block) return None();
 
             (*block)->Write(upload_offset,
                             slice<rstd::uint8_t>::from_raw_parts(source.data.get(), usize(size)));
@@ -736,9 +764,63 @@ ImageUploadManager::QueueTransparentClear(Arc<TextureAllocation> allocation) {
     return Some(ticket);
 }
 
+Option<ImageUploadTicket> ImageUploadManager::QueueRegion(VkImage image, VkBufferImageCopy region,
+                                                          slice<rstd::uint8_t> bytes,
+                                                          rstd::uint32_t       block_bytes) {
+    if (! block_bytes || ! m_impl->initialized || ! image || bytes.is_empty() ||
+        (m_impl->pending && (*m_impl->pending)->recorded && ! (*m_impl->pending)->streaming))
+        return None();
+    if (! m_impl->pending) {
+        ++m_impl->next_batch;
+        m_impl->pending            = Some(Arc<RecordedImageUploads::State>::make());
+        (*m_impl->pending)->serial = m_impl->next_batch;
+    }
+    const auto   size = VkDeviceSize(bytes.len().to_primitive());
+    VkDeviceSize offset {};
+    VkDeviceSize gcd = 256, divisor = block_bytes;
+    while (divisor) {
+        auto remainder = gcd % divisor;
+        gcd            = divisor;
+        divisor        = remainder;
+    }
+    auto block = m_impl->AllocateUpload(size, 256 / gcd * block_bytes, offset);
+    if (! block) return None();
+    (*block)->Write(offset, bytes);
+    region.bufferOffset = offset;
+    (*m_impl->pending)->regions.push(ImageRegionOperation { image, region, block.take().unwrap() });
+    ImageUploadTicket ticket { .value = ++m_impl->next_ticket };
+    (*m_impl->pending)->tickets.push(decltype(ticket)(ticket));
+    return Some(ticket);
+}
+
 bool ImageUploadManager::HasPendingUploads() const noexcept {
     return m_impl->pending &&
-           (! (*m_impl->pending)->copies.is_empty() || ! (*m_impl->pending)->clears.is_empty());
+           (! (*m_impl->pending)->copies.is_empty() || ! (*m_impl->pending)->clears.is_empty() ||
+            ! (*m_impl->pending)->regions.is_empty());
+}
+
+bool ImageUploadManager::RecordQueuedRegions(vvk::CommandBuffer&   command,
+                                             RecordedImageUploads& recorded) {
+    if (! m_impl->pending || (*m_impl->pending)->regions.is_empty()) return true;
+    auto& state = **m_impl->pending;
+    if (! state.copies.is_empty() || ! state.clears.is_empty()) return false;
+    if (recorded.Valid() && (recorded.m_owner != this || ! Arc<RecordedImageUploads::State>::ptr_eq(
+                                                             *recorded.m_state, *m_impl->pending)))
+        return false;
+    for (const auto& block : state.blocks)
+        if (! block->Flush()) return false;
+    for (usize index = state.recorded_regions; index < state.regions.len(); ++index) {
+        auto& copy = state.regions[index];
+        command.CopyBufferToImage(copy.source->handle(),
+                                  copy.destination,
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                  copy.region);
+    }
+    state.recorded_regions = state.regions.len();
+    state.streaming        = true;
+    state.recorded         = true;
+    if (! recorded.Valid()) recorded = RecordedImageUploads(this, m_impl->pending->clone());
+    return true;
 }
 
 bool ImageUploadManager::RecordPendingUploads(vvk::CommandBuffer&   command,
@@ -851,6 +933,11 @@ bool ImageUploadManager::RecordPendingUploads(vvk::CommandBuffer&   command,
                                 to_sampled);
     }
 
+    for (const auto& copy : (*m_impl->pending)->regions)
+        command.CopyBufferToImage(copy.source->handle(),
+                                  copy.destination,
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                  copy.region);
     (*m_impl->pending)->recorded = true;
     recorded                     = RecordedImageUploads(this, m_impl->pending->clone());
     return true;
@@ -871,8 +958,11 @@ auto ImageUploadManager::CommitRecordedUploads(RecordedImageUploads&& recorded)
 }
 
 void ImageUploadManager::CancelRecordedUploads(const Arc<RecordedImageUploads::State>& state) {
-    if (m_impl->pending && Arc<RecordedImageUploads::State>::ptr_eq(state, *m_impl->pending))
-        state->recorded = false;
+    if (m_impl->pending && Arc<RecordedImageUploads::State>::ptr_eq(state, *m_impl->pending)) {
+        state->recorded         = false;
+        state->streaming        = false;
+        state->recorded_regions = usize();
+    }
 }
 
 void ImageUploadManager::DiscardPendingUploads() { m_impl->pending = None(); }

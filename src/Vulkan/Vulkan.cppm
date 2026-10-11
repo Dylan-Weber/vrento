@@ -10,7 +10,8 @@ export module vrento.vulkan;
 import rstd;
 import rstd.log;
 import vrento.texture_types;
-import vrento.image;
+export import vrento.texture;
+export import vrento.image;
 import vrento.video_playback;
 
 // Vulkan FFI: vvk::ffi::vulkan exposes the full Vk symbol surface as
@@ -807,7 +808,10 @@ public:
         -> Option<ImageUploadTicket>;
     auto QueueTransparentClear(Arc<TextureAllocation> allocation) -> Option<ImageUploadTicket>;
 
+    auto QueueRegion(VkImage image, VkBufferImageCopy region, slice<rstd::uint8_t> bytes,
+                     rstd::uint32_t block_bytes = 4) -> Option<ImageUploadTicket>;
     bool HasPendingUploads() const noexcept;
+    bool RecordQueuedRegions(vvk::CommandBuffer& command, RecordedImageUploads& recorded);
     bool RecordPendingUploads(vvk::CommandBuffer& command, RecordedImageUploads& recorded);
     auto CommitRecordedUploads(RecordedImageUploads&& recorded) -> Option<ImageUploadBatchLease>;
     void CancelRecordedUploads(const Arc<RecordedImageUploads::State>& state);
@@ -1140,6 +1144,7 @@ public:
     bool HasPendingUploads() const noexcept;
     bool RecordPendingUploads(vvk::CommandBuffer& cmd, RecordedBufferUploads& recorded);
     Option<BufferUploadBatchLease> CommitRecordedUploads(RecordedBufferUploads&& recorded);
+    bool                           RestoreUploads(BufferUploadBatchLease uploads);
     void CancelRecordedUploads(const Arc<RecordedBufferUploads::State>& state);
     void Trim();
 
