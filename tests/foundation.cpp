@@ -1,21 +1,18 @@
 #include <rstd/macro.hpp>
+#include <rstd/test/gtest.hpp>
 
 import rstd;
+import rstd.test;
 import rstd.cppstd;
-import vrento.texture_types;
-import vrento.graphics_types;
-import vrento.shader_compile;
-import vrento.vulkan;
-import vrento.image;
-import vrento.video_playback;
-import vrento.trace;
-import vrento.resource;
+import vrento;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
 using namespace vrento;
 using namespace vrento::vulkan;
 
+namespace vrento_test::foundation
+{
 struct Counts {
     int  preprocess {};
     int  compile {};
@@ -39,15 +36,21 @@ struct FakeTextureLoader {
     }
 };
 
+} // namespace vrento_test::foundation
+
 namespace rstd
 {
 template<>
-struct Impl<resource::TextureLoader, FakeTextureLoader> : ImplBase<FakeTextureLoader> {
+struct Impl<resource::TextureLoader, vrento_test::foundation::FakeTextureLoader>
+    : ImplBase<vrento_test::foundation::FakeTextureLoader> {
     auto LoadTexture(ref<str> key) const -> Result<sync::Arc<Image>, resource::ResourceError> {
         return this->self().LoadTexture(key);
     }
 };
 } // namespace rstd
+
+namespace vrento_test::foundation
+{
 
 struct FakeTextureProvider {
     rstd::sync::Arc<Image> image;
@@ -71,10 +74,13 @@ struct FakeTextureProvider {
     }
 };
 
+} // namespace vrento_test::foundation
+
 namespace rstd
 {
 template<>
-struct Impl<resource::TextureContentProvider, FakeTextureProvider> : ImplBase<FakeTextureProvider> {
+struct Impl<resource::TextureContentProvider, vrento_test::foundation::FakeTextureProvider>
+    : ImplBase<vrento_test::foundation::FakeTextureProvider> {
     auto ResolveTextureContent(const resource::TextureRequest& request) const
         -> Result<resource::ImportedTextureContentIdentity, resource::ResourceError> {
         return this->self().ResolveTextureContent(request);
@@ -89,6 +95,9 @@ struct Impl<resource::TextureContentProvider, FakeTextureProvider> : ImplBase<Fa
     }
 };
 } // namespace rstd
+
+namespace vrento_test::foundation
+{
 
 struct PlaybackData {
     VideoPlaybackSnapshot snapshot;
@@ -165,10 +174,13 @@ struct FakeShaderBackend {
     Counts* counts;
 };
 
+} // namespace vrento_test::foundation
+
 namespace rstd
 {
 template<>
-struct Impl<VideoPlayback, FakePlayback> : ImplBase<FakePlayback> {
+struct Impl<VideoPlayback, vrento_test::foundation::FakePlayback>
+    : ImplBase<vrento_test::foundation::FakePlayback> {
     auto Snapshot() const -> VideoPlaybackSnapshot { return this->self().Snapshot(); }
     void PublishTime(f64 current, Option<f64> duration) const {
         this->self().PublishTime(current, duration);
@@ -176,13 +188,15 @@ struct Impl<VideoPlayback, FakePlayback> : ImplBase<FakePlayback> {
 };
 
 template<>
-struct Impl<RenderObserver, FakeObserver> : ImplBase<FakeObserver> {
+struct Impl<RenderObserver, vrento_test::foundation::FakeObserver>
+    : ImplBase<vrento_test::foundation::FakeObserver> {
     auto Begin(RenderEvent event) const -> u64 { return this->self().Begin(event); }
     void End(u64 token) const { this->self().End(token); }
 };
 
 template<>
-struct Impl<ShaderBackend, FakeShaderBackend> : ImplBase<FakeShaderBackend> {
+struct Impl<ShaderBackend, vrento_test::foundation::FakeShaderBackend>
+    : ImplBase<vrento_test::foundation::FakeShaderBackend> {
     bool Preprocess(ref<str> source, ShaderType stage, SourceLang lang, String& output) const {
         return this->self().Preprocess(source, stage, lang, output);
     }
@@ -196,6 +210,9 @@ struct Impl<ShaderBackend, FakeShaderBackend> : ImplBase<FakeShaderBackend> {
     }
 };
 } // namespace rstd
+
+namespace vrento_test::foundation
+{
 
 static_assert(static_cast<int>(TextureFormat::BC1) == 0);
 static_assert(static_cast<int>(TextureFormat::D32F) == 7);
@@ -296,7 +313,7 @@ void CheckPendingImageLifetime() {
     rstd_assert(moved.buffer() == VK_NULL_HANDLE && moved.offset() == 0 && moved.size() == 0);
 }
 
-int main() {
+TEST(Foundation, Resources) {
     CheckImageDataLifetime();
     CheckPendingImageLifetime();
     TextureKey key { .width        = i32(32),
@@ -317,12 +334,12 @@ int main() {
     rstd_assert(ToVkType(TextureFormat::D32F) == VK_FORMAT_D32_SFLOAT);
     rstd_assert(ToVkType(TextureFormat::RGBA8_SRGB) == VK_FORMAT_R8G8B8A8_SRGB);
     rstd_assert(ToVkType(TextureFormat::RGBA32F) == VK_FORMAT_R32G32B32A32_SFLOAT);
-    changed = key;
+    changed                  = key;
     changed.sample.mipFilter = TextureMipmapFilter::Nearest;
     rstd_assert(hash != TextureKey::HashValue(changed));
     resource::TextureDefinition original, mip_filtered;
     mip_filtered.sample.mipFilter = TextureMipmapFilter::None;
-    rstd_assert(!(original == mip_filtered));
+    rstd_assert(! (original == mip_filtered));
     rstd_assert(ToVkType(TextureWrap::MIRRORED_REPEAT) == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT);
     rstd_assert(ToVkType(TextureFormat::BC1) == VK_FORMAT_BC1_RGBA_UNORM_BLOCK);
     rstd_assert(ToVkType(TextureWrap::CLAMP_TO_BORDER) == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER);
@@ -432,3 +449,4 @@ int main() {
     rstd_assert(counts.preprocess == 2 && counts.compile == 2 && counts.reflect == 2);
     rstd_assert(counts.destroyed == 1);
 }
+} // namespace vrento_test::foundation

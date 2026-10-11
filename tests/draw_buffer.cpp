@@ -1,15 +1,17 @@
 #include <rstd/macro.hpp>
+#include <rstd/test/gtest.hpp>
 import rstd;
+import rstd.test;
 import rstd.cppstd;
-import vrento.draw_buffer;
-import vrento.resource_registry;
-import vrento.vulkan;
+import vrento;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
 using rstd::sync::Arc;
 using namespace vrento;
 
+namespace vrento_test::draw_buffer
+{
 struct Writer {
     usize writes {};
     usize fail_on {};
@@ -21,7 +23,7 @@ struct Writer {
     }
 };
 
-int main() {
+TEST(DrawBuffer, Allocations) {
     VertexArray first({ { "position"_Str, VertexType::FLOAT3, false } }, usize(3));
     VertexArray second({ { "color"_Str, VertexType::FLOAT4, false } }, usize(2));
     (void)first.RewriteVertices([](VertexWriter& writer) {
@@ -175,3 +177,4 @@ int main() {
     geometry = view();
     rstd_assert(missing_resolver.prepareDrawBuffers(request).is_none());
 }
+} // namespace vrento_test::draw_buffer

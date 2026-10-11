@@ -1,0 +1,16 @@
+export module vrento:resource_registry;
+export import :resource;
+export import :resource_registry.resource_key;
+export import :resource_registry.graphics;
+export import :resource_registry.texture_registry;
+export import :resource_registry.buffer_registry;
+export import :resource_registry.shader_registry;
+export import :resource_registry.owner;
+export import :resource_registry.system;
+export import :resource_registry.descriptor;
+export import :resource_registry.prepared;
+export import :resource_registry.lifetime;
+export import :resource_registry.barrier;
+export import :resource_registry.state;
+export import :resource_registry.policy;
+export import :resource_registry.external;

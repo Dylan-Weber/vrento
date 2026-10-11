@@ -1,14 +1,18 @@
 #include <rstd/macro.hpp>
+#include <rstd/test/gtest.hpp>
 
 import rstd;
-import vrento.geometry;
+import rstd.test;
+import vrento;
 
 using namespace rstd::literals;
 
 using namespace rstd::prelude;
 using namespace vrento;
 
-int main() {
+namespace vrento_test::geometry
+{
+TEST(Geometry, Mutations) {
     auto attributes = Vec<VertexArray::VertexAttribute>::with_capacity(usize(2));
     attributes.push({ "position"_Str, VertexType::FLOAT3, true });
     attributes.push({ "uv"_Str, VertexType::FLOAT2, false });
@@ -89,3 +93,4 @@ int main() {
     rstd_assert(moved_indices.Data()[1] == 1);
     rstd_assert(moved_indices.RenderDataCount() == usize(2));
 }
+} // namespace vrento_test::geometry

@@ -1,10 +1,14 @@
 #include <rstd/macro.hpp>
+#include <rstd/test/gtest.hpp>
 import rstd;
-import vrento.material;
+import rstd.test;
+import vrento;
 using namespace rstd::prelude;
 using namespace vrento;
 
-int main() {
+namespace vrento_test::material
+{
+TEST(Material, PipelineState) {
     MaterialPipelineState state;
     const auto            initial = state.Snapshot();
     rstd_assert(initial.revision == u64(1));
@@ -94,3 +98,4 @@ int main() {
     });
     rstd_assert(captured.value.depth_bias_slope == -4.0f);
 }
+} // namespace vrento_test::material

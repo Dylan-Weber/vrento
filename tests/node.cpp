@@ -1,12 +1,16 @@
 #include <rstd/macro.hpp>
+#include <rstd/test/gtest.hpp>
 import rstd;
-import vrento.node;
+import rstd.test;
+import vrento;
 
 using namespace rstd::prelude;
 using rstd::sync::Arc;
 
 // Scalar composition isolates relationship/cache behavior from the host's math
 // library.
+namespace vrento_test::node
+{
 struct ScalarMatrix {
     int                 value { 1 };
     static ScalarMatrix Identity() { return {}; }
@@ -19,7 +23,7 @@ struct Node {
     const auto&                           NodeState() const { return state; }
 };
 
-int main() {
+TEST(Node, Relationships) {
     auto root  = Arc<Node>::make();
     auto child = Arc<Node>::make();
     auto leaf  = Arc<Node>::make();
@@ -96,3 +100,4 @@ int main() {
     child->state.SetTransformParent(nullptr);
     rstd_assert(! child->state.AppendChild(root.clone()));
 }
+} // namespace vrento_test::node

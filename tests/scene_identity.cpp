@@ -1,12 +1,16 @@
 #include <rstd/macro.hpp>
+#include <rstd/test/gtest.hpp>
 import rstd;
-import vrento.scene_identity;
+import rstd.test;
+import vrento;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
 using namespace vrento;
 
-int main() {
+namespace vrento_test::scene_identity
+{
+TEST(SceneIdentity, Values) {
     NamedIdentityIndex<TextureId> index;
     rstd_assert(! TextureId {}.Valid());
     auto names = Vec<String>::make();
@@ -43,3 +47,4 @@ int main() {
     index.Rebuild(names.as_slice(), u32(8));
     rstd_assert(index.Find("c"_str).is_none());
 }
+} // namespace vrento_test::scene_identity

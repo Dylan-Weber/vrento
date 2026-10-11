@@ -1,14 +1,18 @@
 #include <rstd/macro.hpp>
+#include <rstd/test/gtest.hpp>
 #include <fcntl.h>
 #include <unistd.h>
 
 import rstd;
-import vrento.vulkan;
+import rstd.test;
+import vrento;
 
 using namespace rstd::prelude;
 using namespace vrento;
 using rstd::sync::atomic::Atomic;
 
+namespace vrento_test::external_swapchain
+{
 struct Counts {
     int destroyed {};
     int submitted {};
@@ -59,7 +63,7 @@ private:
     Atomic<int*>  inprogress_;
 };
 
-int main() {
+TEST(ExternalSwapchain, Lifetime) {
     Counts submitted;
     {
         auto owner = ExSwapchain::Make<TestSwapchain>(submitted);
@@ -100,5 +104,5 @@ int main() {
     rstd_assert(triple.getInprogress() == slots[usize(1)]);
     rstd_assert(triple.eatFrame() == slots[usize(2)]);
     rstd_assert(triple.eatFrame() == nullptr);
-    return 0;
 }
+} // namespace vrento_test::external_swapchain

@@ -1,10 +1,14 @@
 #include <rstd/macro.hpp>
+#include <rstd/test/gtest.hpp>
 import rstd;
-import vrento.camera;
+import rstd.test;
+import vrento;
 
 using namespace rstd::prelude;
 
 // Affine transforms make multiplication order observable without a math dependency.
+namespace vrento_test::camera
+{
 struct Affine {
     double        scale { 1 };
     double        offset {};
@@ -15,7 +19,7 @@ struct Affine {
     }
 };
 
-int main() {
+TEST(Camera, Revisions) {
     vrento::CameraState<Affine> camera;
     const auto                  initial = camera.Snapshot();
     rstd_assert(initial.revision == u64(1));
@@ -52,3 +56,4 @@ int main() {
     rstd_assert(camera.Set({ 1, 0 }, { 1, 12 }));
     rstd_assert(camera.Set({ 1, 12 }, { 1, 0 }));
 }
+} // namespace vrento_test::camera

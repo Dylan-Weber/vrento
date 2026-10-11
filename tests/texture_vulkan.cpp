@@ -1,10 +1,14 @@
 #include <rstd/macro.hpp>
+#include <rstd/test/gtest.hpp>
 import rstd;
-import vrento.texture_vulkan;
+import rstd.test;
+import vrento;
 using namespace rstd::prelude;
 namespace tex = vrento::texture;
 namespace vk  = vrento::vulkan;
 
+namespace vrento_test::texture_vulkan
+{
 auto read(vk::TextureContext& device, tex::TextureViewRef view, unsigned mip = 0,
           unsigned layer = 0) -> Vec<u8> {
     auto               extent = tex::mip_extent(view.texture().description(), mip);
@@ -60,7 +64,7 @@ void fill(tex::Submission& work, tex::TextureViewRef target, unsigned width, uns
     for (unsigned i = 0; i < width * height * 4; ++i) upload.bytes.push(u8(value));
     work.commands()->Upload(rstd::move(upload)).unwrap();
 }
-int main() {
+TEST(TextureVulkan, Resources) {
     auto             session = vk::DeviceSession::create({ .validation = true }).unwrap();
     auto             device  = vk::TextureContext::create(session).unwrap();
     auto             factory = dyn<tex::TextureDevice>::from_ref(device);
@@ -184,8 +188,11 @@ int main() {
         vrento::ImageData { 4, 4, isize(16), vrento::ImageDataPtr(atlas_bytes, [](rstd::uint8_t*) {
                             }) });
     atlas.slots.push(rstd::move(atlas_slot));
-    auto legacy_image = legacy_backend->CreateImportedTexture(rstd::ref<vrento::Image>::from_raw_parts(&atlas), None()).unwrap();
-    work              = queue->Begin().unwrap();
+    auto legacy_image =
+        legacy_backend
+            ->CreateImportedTexture(rstd::ref<vrento::Image>::from_raw_parts(&atlas), None())
+            .unwrap();
+    work                                    = queue->Begin().unwrap();
     auto                     legacy_command = vk::native_recording(work, session).unwrap();
     vvk::CommandBuffer       command(legacy_command, session.device().handle().Dispatch());
     vk::RecordedImageUploads legacy_recorded;
@@ -200,3 +207,4 @@ int main() {
     legacy_uploads.destroy();
     rstd_assert(session.validation_errors() == 0);
 }
+} // namespace vrento_test::texture_vulkan

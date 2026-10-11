@@ -1,16 +1,16 @@
 #include <rstd/macro.hpp>
+#include <rstd/test/gtest.hpp>
 
 import rstd;
-import vrento.runtime;
-import vrento.uniform_source;
-import vrento.uniform_buffer;
-import vrento.uniform_binding;
-import vrento.resource;
+import rstd.test;
+import vrento;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
 using namespace vrento;
 
+namespace vrento_test::uniform
+{
 struct NodeId {
     u32  index {};
     u32  generation { 1 };
@@ -86,14 +86,16 @@ struct Source {
     bool                   active { true };
 };
 
+} // namespace vrento_test::uniform
+
 namespace rstd
 {
 template<>
-struct Impl<RuntimeSystem, System> : ImplBase<System> {
+struct Impl<RuntimeSystem, vrento_test::uniform::System> : ImplBase<vrento_test::uniform::System> {
     void Update(ref<FrameContext> frame) { this->self().Update(frame); }
 };
 template<>
-struct Impl<UniformSource, Source> : ImplBase<Source> {
+struct Impl<UniformSource, vrento_test::uniform::Source> : ImplBase<vrento_test::uniform::Source> {
     auto Describe(mut_ref<dyn<UniformBindingSink>> sink) const -> Result<empty, UniformError> {
         return this->self().Describe(sink);
     }
@@ -109,6 +111,9 @@ struct Impl<UniformSource, Source> : ImplBase<Source> {
     }
 };
 } // namespace rstd
+
+namespace vrento_test::uniform
+{
 
 static void RuntimeOrder() {
     auto    state = rstd::sync::Arc<State>::make();
@@ -299,9 +304,10 @@ static void BindingRetriesAndOwnsSources() {
     rstd_assert(state->leases_destroyed == u32(1));
 }
 
-int main() {
+TEST(Uniform, RuntimeAndBindings) {
     RuntimeOrder();
     SourceOwnership();
     ValuesAndLayout();
     BindingRetriesAndOwnsSources();
 }
+} // namespace vrento_test::uniform

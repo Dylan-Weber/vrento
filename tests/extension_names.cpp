@@ -1,9 +1,11 @@
 #include <rstd/macro.hpp>
+#include <rstd/test/gtest.hpp>
 
 import rstd;
-import vrento.vulkan;
+import rstd.test;
+import vrento;
 
-#include "../src/Vulkan/ExtensionNames.hpp"
+#include "../src/vulkan/impl/ExtensionNames.hpp"
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
@@ -12,7 +14,9 @@ using rstd::ffi::CString;
 using vrento::vulkan::Extension;
 using vrento::vulkan::detail::SelectExtensionNames;
 
-int main() {
+namespace vrento_test::extension_names
+{
+TEST(ExtensionNames, Selection) {
     auto supported = BTreeSet<String>::make();
     supported.insert("VK_test_b"_Str);
     supported.insert("VK_test_a"_Str);
@@ -66,3 +70,4 @@ int main() {
     rstd_assert(callback.as_mut_ref()->operator()(vvk::PhysicalDevice {}));
     rstd_assert(calls == 2);
 }
+} // namespace vrento_test::extension_names

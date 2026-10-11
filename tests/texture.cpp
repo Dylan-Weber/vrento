@@ -1,11 +1,14 @@
 #include <rstd/macro.hpp>
+#include <rstd/test/gtest.hpp>
 import rstd;
-import vrento.texture;
-import vrento.texture_image;
+import rstd.test;
+import vrento;
 using namespace rstd::prelude;
 using namespace vrento;
 using namespace vrento::texture;
 
+namespace vrento_test::texture
+{
 struct FakeDevice {
     Serial next {};
     auto   QuerySupport(const TextureDesc& desc) const -> Result<empty, Error> {
@@ -89,10 +92,13 @@ struct FakeQueue {
         return Ok(empty {});
     }
 };
+} // namespace vrento_test::texture
+
 namespace rstd
 {
 template<>
-struct Impl<TextureDevice, FakeDevice> : ImplBase<FakeDevice> {
+struct Impl<TextureDevice, vrento_test::texture::FakeDevice>
+    : ImplBase<vrento_test::texture::FakeDevice> {
     auto QuerySupport(const TextureDesc& d) const -> Result<empty, Error> {
         return self().QuerySupport(d);
     }
@@ -107,7 +113,8 @@ struct Impl<TextureDevice, FakeDevice> : ImplBase<FakeDevice> {
     }
 };
 template<>
-struct Impl<Dependency, FakeDependency> : ImplBase<FakeDependency> {
+struct Impl<Dependency, vrento_test::texture::FakeDependency>
+    : ImplBase<vrento_test::texture::FakeDependency> {
     auto IdentityValue() const -> Identity { return { 1, 1, 1 }; }
     auto Value() const -> Serial { return self().value; }
     auto Poll() const -> Result<bool, Error> {
@@ -119,7 +126,8 @@ struct Impl<Dependency, FakeDependency> : ImplBase<FakeDependency> {
     }
 };
 template<>
-struct Impl<TextureCommands, FakeCommands> : ImplBase<FakeCommands> {
+struct Impl<TextureCommands, vrento_test::texture::FakeCommands>
+    : ImplBase<vrento_test::texture::FakeCommands> {
     auto Upload(TextureUpload u) -> Result<empty, Error> { return self().Upload(rstd::move(u)); }
     auto UseTexture(TextureAccess a) -> Result<empty, Error> {
         return self().UseTexture(rstd::move(a));
@@ -134,7 +142,8 @@ struct Impl<TextureCommands, FakeCommands> : ImplBase<FakeCommands> {
     }
 };
 template<>
-struct Impl<SubmissionQueue, FakeQueue> : ImplBase<FakeQueue> {
+struct Impl<SubmissionQueue, vrento_test::texture::FakeQueue>
+    : ImplBase<vrento_test::texture::FakeQueue> {
     auto Begin() -> Result<Submission, Error> { return self().Begin(); }
     auto Submit(Submission work) -> Result<SubmissionToken, Error> {
         return self().Submit(rstd::move(work));
@@ -142,6 +151,9 @@ struct Impl<SubmissionQueue, FakeQueue> : ImplBase<FakeQueue> {
     auto Poll() -> Result<empty, Error> { return self().Poll(); }
 };
 } // namespace rstd
+
+namespace vrento_test::texture
+{
 auto FakeQueue::Begin() -> Result<Submission, Error> {
     return Ok(Submission(Box<dyn<TextureCommands>>::make(FakeCommands {})));
 }
@@ -153,7 +165,7 @@ auto FakeQueue::Submit(Submission work) -> Result<SubmissionToken, Error> {
     return Ok(SubmissionToken(rstd::sync::Arc<dyn<Dependency>>::make(
         FakeDependency { progress.clone(), progress->submitted })));
 }
-int main() {
+TEST(Texture, PublicApi) {
     FakeDevice  receiver;
     auto        api = dyn<TextureDevice>::from_ref(receiver);
     TextureDesc desc;
@@ -267,3 +279,4 @@ int main() {
         rstd::as<TextureContentPreparer>(preparer).PrepareImage(oversized).unwrap_err().kind ==
         ErrorKind::Invalid);
 }
+} // namespace vrento_test::texture
