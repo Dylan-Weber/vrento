@@ -198,28 +198,10 @@ struct BufferCopyOperation {
     BufferUploadClass usage { BufferUploadClass::Vertex };
 };
 
-struct ImageMipCopyOperation {
-    Arc<UploadBlock> source;
-    VkDeviceSize     source_offset { 0 };
-    VkExtent3D       extent {};
-    rstd::uint32_t   mip_level { 0 };
-};
-
-struct ImageCopyOperation {
-    Arc<TextureAllocation>     destination_lease;
-    ImageParameters            destination;
-    Vec<ImageMipCopyOperation> mipmaps;
-};
-
 struct ImageRegionOperation {
     VkImage           destination;
     VkBufferImageCopy region;
     Arc<UploadBlock>  source;
-};
-
-struct ImageClearOperation {
-    Arc<TextureAllocation> destination_lease;
-    ImageParameters        destination;
 };
 
 } // namespace
@@ -246,15 +228,12 @@ struct RecordedBufferUploads::State {
 };
 
 struct RecordedImageUploads::State {
-    u64                      serial { 0 };
-    bool                     recorded { false };
-    Vec<ImageCopyOperation>  copies;
-    Vec<ImageClearOperation> clears;
+    u64                       serial { 0 };
+    bool                      recorded { false };
     Vec<ImageRegionOperation> regions;
     usize                     recorded_regions {};
-    bool                      streaming {};
-    Vec<Arc<UploadBlock>>    blocks;
-    Vec<ImageUploadTicket>   tickets;
+    Vec<Arc<UploadBlock>>     blocks;
+    Vec<ImageUploadTicket>    tickets;
 };
 
 struct BufferManager::Impl {
@@ -670,108 +649,10 @@ void ImageUploadManager::destroy() {
     m_impl->initialized = false;
 }
 
-Option<ImageUploadTicket> ImageUploadManager::QueueWrite(Arc<TextureAllocation> allocation,
-                                                         const Image&           image) {
-    if (! m_impl->initialized || image.header.kind == ImageKind::Video) return None();
-    auto destinations = allocation->View();
-    if (destinations.slots.len() != image.slots.len() || destinations.slots.is_empty()) {
-        return None();
-    }
-    if (m_impl->pending && (*m_impl->pending)->recorded) {
-        rstd_error("queue image write while the pending upload batch is recorded");
-        return None();
-    }
-    if (! m_impl->pending) {
-        ++m_impl->next_batch;
-        if (m_impl->next_batch == u64()) ++m_impl->next_batch;
-        m_impl->pending            = Some(Arc<RecordedImageUploads::State>::make());
-        (*m_impl->pending)->serial = m_impl->next_batch;
-    }
-
-    Vec<ImageCopyOperation> operations;
-    operations.reserve(image.slots.len());
-    for (usize slot_index {}; slot_index < image.slots.len(); ++slot_index) {
-        const auto& source_slot = image.slots[slot_index];
-        const auto& destination = destinations.slots[slot_index];
-        if (! source_slot || source_slot.mipmaps.len() != usize(destination.mipmap_level))
-            return None();
-
-        ImageCopyOperation operation {
-            .destination_lease = allocation.clone(),
-            .destination       = destination,
-        };
-        operation.mipmaps.reserve(source_slot.mipmaps.len());
-        for (usize mip_index {}; mip_index < source_slot.mipmaps.len(); ++mip_index) {
-            const auto& source = source_slot.mipmaps[mip_index];
-            const auto  size   = static_cast<VkDeviceSize>(source.size.to_primitive());
-            if (size == 0 || ! source.data || source.width <= 0 || source.height <= 0) {
-                return None();
-            }
-
-            VkDeviceSize             upload_offset { 0 };
-            const auto block_bytes = texture::format_layout(image.header.format).block_bytes;
-            auto block = m_impl->AllocateUpload(size, block_bytes == 3 ? 768 : 256, upload_offset);
-            if (! block) return None();
-
-            (*block)->Write(upload_offset,
-                            slice<rstd::uint8_t>::from_raw_parts(source.data.get(), usize(size)));
-            operation.mipmaps.push(ImageMipCopyOperation {
-                .source        = block.take().unwrap(),
-                .source_offset = upload_offset,
-                .extent        = VkExtent3D { static_cast<rstd::uint32_t>(source.width),
-                                              static_cast<rstd::uint32_t>(source.height),
-                                              1 },
-                .mip_level     = static_cast<rstd::uint32_t>(mip_index.to_primitive()),
-            });
-        }
-        operations.push(rstd::move(operation));
-    }
-
-    for (auto& operation : operations) {
-        (*m_impl->pending)->copies.push(rstd::move(operation));
-    }
-    ++m_impl->next_ticket;
-    if (m_impl->next_ticket == u64()) ++m_impl->next_ticket;
-    ImageUploadTicket ticket { .value = m_impl->next_ticket };
-    (*m_impl->pending)->tickets.push(decltype(ticket)(ticket));
-    return Some(ticket);
-}
-
-Option<ImageUploadTicket>
-ImageUploadManager::QueueTransparentClear(Arc<TextureAllocation> allocation) {
-    if (! m_impl->initialized) return None();
-    auto destinations = allocation->View();
-    if (destinations.slots.is_empty()) return None();
-    if (m_impl->pending && (*m_impl->pending)->recorded) {
-        rstd_error("queue image clear while the pending upload batch is recorded");
-        return None();
-    }
-    if (! m_impl->pending) {
-        ++m_impl->next_batch;
-        if (m_impl->next_batch == u64()) ++m_impl->next_batch;
-        m_impl->pending            = Some(Arc<RecordedImageUploads::State>::make());
-        (*m_impl->pending)->serial = m_impl->next_batch;
-    }
-    for (const auto& destination : destinations.slots) {
-        (*m_impl->pending)
-            ->clears.push(ImageClearOperation {
-                .destination_lease = allocation.clone(),
-                .destination       = destination,
-            });
-    }
-    ++m_impl->next_ticket;
-    if (m_impl->next_ticket == u64()) ++m_impl->next_ticket;
-    ImageUploadTicket ticket { .value = m_impl->next_ticket };
-    (*m_impl->pending)->tickets.push(decltype(ticket)(ticket));
-    return Some(ticket);
-}
-
 Option<ImageUploadTicket> ImageUploadManager::QueueRegion(VkImage image, VkBufferImageCopy region,
                                                           slice<rstd::uint8_t> bytes,
                                                           rstd::uint32_t       block_bytes) {
-    if (! block_bytes || ! m_impl->initialized || ! image || bytes.is_empty() ||
-        (m_impl->pending && (*m_impl->pending)->recorded && ! (*m_impl->pending)->streaming))
-        return None();
+    if (! block_bytes || ! m_impl->initialized || ! image || bytes.is_empty()) return None();
     if (! m_impl->pending) {
         ++m_impl->next_batch;
         m_impl->pending            = Some(Arc<RecordedImageUploads::State>::make());
@@ -796,16 +677,13 @@ Option<ImageUploadTicket> ImageUploadManager::QueueRegion(VkImage image, VkBuffe
 }
 
 bool ImageUploadManager::HasPendingUploads() const noexcept {
-    return m_impl->pending &&
-           (! (*m_impl->pending)->copies.is_empty() || ! (*m_impl->pending)->clears.is_empty() ||
-            ! (*m_impl->pending)->regions.is_empty());
+    return m_impl->pending && ! (*m_impl->pending)->regions.is_empty();
 }
 
 bool ImageUploadManager::RecordQueuedRegions(vvk::CommandBuffer&   command,
                                              RecordedImageUploads& recorded) {
     if (! m_impl->pending || (*m_impl->pending)->regions.is_empty()) return true;
     auto& state = **m_impl->pending;
-    if (! state.copies.is_empty() || ! state.clears.is_empty()) return false;
     if (recorded.Valid() && (recorded.m_owner != this || ! Arc<RecordedImageUploads::State>::ptr_eq(
                                                              *recorded.m_state, *m_impl->pending)))
         return false;
@@ -819,129 +697,8 @@ bool ImageUploadManager::RecordQueuedRegions(vvk::CommandBuffer&   command,
                                   copy.region);
     }
     state.recorded_regions = state.regions.len();
-    state.streaming        = true;
     state.recorded         = true;
     if (! recorded.Valid()) recorded = RecordedImageUploads(this, m_impl->pending->clone());
-    return true;
-}
-
-bool ImageUploadManager::RecordPendingUploads(vvk::CommandBuffer&   command,
-                                              RecordedImageUploads& recorded) {
-    recorded.Reset();
-    if (! HasPendingUploads()) return true;
-    if ((*m_impl->pending)->recorded) {
-        rstd_error("image upload batch is already recorded");
-        return false;
-    }
-    for (const auto& block : (*m_impl->pending)->blocks) {
-        if (! block->Flush()) return false;
-    }
-
-    for (const auto& clear : (*m_impl->pending)->clears) {
-        VkImageSubresourceRange range {
-            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel   = 0,
-            .levelCount     = clear.destination.mipmap_level,
-            .baseArrayLayer = 0,
-            .layerCount     = 1,
-        };
-        VkImageMemoryBarrier to_transfer {
-            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask    = 0,
-            .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .image            = clear.destination.handle,
-            .subresourceRange = range,
-        };
-        command.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                VK_DEPENDENCY_BY_REGION_BIT,
-                                to_transfer);
-        const VkClearColorValue transparent {};
-        command.ClearColorImage(
-            clear.destination.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &transparent, range);
-        VkImageMemoryBarrier to_sampled {
-            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
-            .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            .image            = clear.destination.handle,
-            .subresourceRange = range,
-        };
-        command.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                VK_DEPENDENCY_BY_REGION_BIT,
-                                to_sampled);
-    }
-
-    for (const auto& copy : (*m_impl->pending)->copies) {
-        VkImageSubresourceRange range {
-            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-            .baseMipLevel   = 0,
-            .levelCount     = static_cast<rstd::uint32_t>(copy.mipmaps.len().to_primitive()),
-            .baseArrayLayer = 0,
-            .layerCount     = 1,
-        };
-        VkImageMemoryBarrier to_transfer {
-            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask    = 0,
-            .dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .image            = copy.destination.handle,
-            .subresourceRange = range,
-        };
-        command.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                VK_DEPENDENCY_BY_REGION_BIT,
-                                to_transfer);
-
-        for (const auto& mip : copy.mipmaps) {
-            VkBufferImageCopy region {
-                .bufferOffset = mip.source_offset,
-                .imageSubresource =
-                    VkImageSubresourceLayers {
-                        .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-                        .mipLevel       = mip.mip_level,
-                        .baseArrayLayer = 0,
-                        .layerCount     = 1,
-                    },
-                .imageExtent = mip.extent,
-            };
-            command.CopyBufferToImage(mip.source->handle(),
-                                      copy.destination.handle,
-                                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                      region);
-        }
-
-        VkImageMemoryBarrier to_sampled {
-            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask    = VK_ACCESS_SHADER_READ_BIT,
-            .oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            .image            = copy.destination.handle,
-            .subresourceRange = range,
-        };
-        command.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                VK_DEPENDENCY_BY_REGION_BIT,
-                                to_sampled);
-    }
-
-    for (const auto& copy : (*m_impl->pending)->regions)
-        command.CopyBufferToImage(copy.source->handle(),
-                                  copy.destination,
-                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                  copy.region);
-    (*m_impl->pending)->recorded = true;
-    recorded                     = RecordedImageUploads(this, m_impl->pending->clone());
     return true;
 }
 
@@ -962,7 +719,6 @@ auto ImageUploadManager::CommitRecordedUploads(RecordedImageUploads&& recorded)
 void ImageUploadManager::CancelRecordedUploads(const Arc<RecordedImageUploads::State>& state) {
     if (m_impl->pending && Arc<RecordedImageUploads::State>::ptr_eq(state, *m_impl->pending)) {
         state->recorded         = false;
-        state->streaming        = false;
         state->recorded_regions = usize();
     }
 }
@@ -978,40 +734,6 @@ void ImageUploadManager::Trim() {
             return true;
         }
         return false;
-    });
-}
-
-auto ImagePrepareContext::CreateImportedTexture(ref<Image>                            image,
-                                                Option<Arc<rstd::dyn<VideoPlayback>>> playback)
-    -> Option<PreparedImageAllocation> {
-    auto allocation = m_textures.AllocateImportedTexture(*image, rstd::move(playback));
-    if (allocation.is_none()) return None();
-    if (image->header.kind == ImageKind::Video) {
-        return Some(PreparedImageAllocation {
-            .allocation = rstd::move(*allocation),
-        });
-    }
-    auto ticket = m_uploads.QueueWrite(allocation->clone(), *image);
-    if (ticket.is_none()) return None();
-    return Some(PreparedImageAllocation {
-        .allocation = rstd::move(*allocation),
-        .upload     = Some(*ticket),
-    });
-}
-
-auto ImagePrepareContext::AllocateTexture(TextureKey key) -> Option<Arc<TextureAllocation>> {
-    return m_textures.AllocateTexture(rstd::move(key));
-}
-
-auto ImagePrepareContext::AllocateTransparentTexture(TextureKey key)
-    -> Option<PreparedImageAllocation> {
-    auto allocation = m_textures.AllocateTexture(rstd::move(key));
-    if (allocation.is_none()) return None();
-    auto ticket = m_uploads.QueueTransparentClear(allocation->clone());
-    if (ticket.is_none()) return None();
-    return Some(PreparedImageAllocation {
-        .allocation = rstd::move(*allocation),
-        .upload     = Some(*ticket),
     });
 }
 

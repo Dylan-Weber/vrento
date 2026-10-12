@@ -16,6 +16,7 @@ sources = [
   "tests/foundation.cpp",
   "tests/texture.cpp",
   "tests/texture_vulkan.cpp",
+  "tests/texture_registry.cpp",
   "tests/external_swapchain.cpp",
   "tests/extension_names.cpp",
   "tests/uniform.cpp",

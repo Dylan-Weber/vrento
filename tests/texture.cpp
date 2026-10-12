@@ -34,6 +34,7 @@ struct FakeDevice {
 struct Progress {
     Serial submitted {}, completed {};
     bool   failed {};
+    bool   uncertain {};
 };
 struct FakeDependency {
     rstd::sync::Arc<Progress> progress;
@@ -159,6 +160,12 @@ auto FakeQueue::Begin() -> Result<Submission, Error> {
 }
 auto FakeQueue::Submit(Submission work) -> Result<SubmissionToken, Error> {
     if (! work.valid()) return Err(Error { ErrorKind::Invalid });
+    if (progress->uncertain) {
+        BackendAccess::Uncertain(work);
+        pending.push(rstd::move(work));
+        return Err(Error { ErrorKind::Backend });
+    }
+    if (progress->failed) return Err(Error { ErrorKind::Backend });
     ++progress->submitted;
     BackendAccess::Submitted(work);
     pending.push(rstd::move(work));
@@ -278,5 +285,56 @@ TEST(Texture, PublicApi) {
     rstd_assert(
         rstd::as<TextureContentPreparer>(preparer).PrepareImage(oversized).unwrap_err().kind ==
         ErrorKind::Invalid);
+}
+TEST(Texture, MultisampleValidation) {
+    TextureDesc desc;
+    desc.extent  = { 8, 8 };
+    desc.samples = 4;
+    desc.usage   = Usage::ColorAttachment | Usage::Sampled | Usage::TransferSource;
+    rstd_assert(validate(desc).is_ok());
+    Count invalid_samples[] { 0, 3, 128 };
+    for (Count invalid : invalid_samples) {
+        desc.samples = invalid;
+        rstd_assert(validate(desc).unwrap_err().kind == ErrorKind::Invalid);
+    }
+    desc.samples    = 4;
+    desc.mip_levels = 2;
+    rstd_assert(validate(desc).is_err());
+    desc.mip_levels = 1;
+    desc.format     = TextureFormat::BC1;
+    rstd_assert(validate(desc).is_err());
+    desc.format = TextureFormat::RGBA8;
+    desc.usage  = Usage::ColorAttachment | Usage::TransferDestination;
+    FakeDevice    factory;
+    auto          texture = factory.CreateTexture(desc).unwrap();
+    auto          view    = factory.CreateView(texture, {}).unwrap();
+    TextureUpload upload;
+    upload.target = view;
+    upload.width = upload.height = 1;
+    for (int i = 0; i < 4; ++i) upload.bytes.push(u8(0));
+    rstd_assert(validate_upload(upload).is_err());
+}
+TEST(Texture, SubmissionOutcomes) {
+    FakeQueue queue;
+    auto      cancelled    = queue.Begin().unwrap();
+    auto      cancellation = cancelled.receipt();
+    auto      replacement  = queue.Begin().unwrap();
+    cancelled              = rstd::move(replacement);
+    rstd_assert(cancellation.cancelled());
+    auto rejected          = queue.Begin().unwrap();
+    auto rejection         = rejected.receipt();
+    queue.progress->failed = true;
+    rstd_assert(queue.Submit(rstd::move(rejected)).is_err());
+    rstd_assert(rejection.cancelled() && ! rejection.submitted());
+    queue.progress->failed    = false;
+    queue.progress->uncertain = true;
+    int  dropped              = 0;
+    auto possible             = queue.Begin().unwrap();
+    possible.retain(DropProbe(dropped));
+    auto uncertainty = possible.receipt();
+    rstd_assert(queue.Submit(rstd::move(possible)).is_err());
+    rstd_assert(uncertainty.uncertain() && ! uncertainty.cancelled() && dropped == 0);
+    queue.pending.clear();
+    rstd_assert(uncertainty.uncertain() && dropped == 1);
 }
 } // namespace vrento_test::texture

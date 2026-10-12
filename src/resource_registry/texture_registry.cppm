@@ -4,6 +4,7 @@ export module vrento:resource_registry.texture_registry;
 import rstd;
 import :resource;
 import :vulkan.api;
+export import :resource_registry.texture;
 
 using rstd::collections::HashMap;
 using rstd::collections::HashSet;
@@ -34,12 +35,12 @@ struct Texture {
 };
 
 struct TexturePhysical {
-    Arc<vulkan::TextureAllocation> allocation;
-    u64                            generation { 1 };
-    u64                            source_generation { 0 };
-    u64                            definition_version { 0 };
-    u64                            content_version { 0 };
-    ReadyToken                     ready;
+    Arc<resource_registry::TextureAllocation> allocation;
+    u64                                       generation { 1 };
+    u64                                       source_generation { 0 };
+    u64                                       definition_version { 0 };
+    u64                                       content_version { 0 };
+    texture::SubmissionToken                  completion;
 
     auto clone() const -> TexturePhysical {
         return TexturePhysical {
@@ -48,7 +49,7 @@ struct TexturePhysical {
             .source_generation  = source_generation,
             .definition_version = definition_version,
             .content_version    = content_version,
-            .ready              = ready,
+            .completion         = completion,
         };
     }
 };
@@ -169,9 +170,9 @@ private:
     }
 
 public:
-    auto Publish(resource::TextureHandle handle, Arc<vulkan::TextureAllocation> allocation,
-                 ReadyToken ready, Option<vulkan::ImageUploadTicket> upload = None())
-        -> Option<u64> {
+    auto Publish(resource::TextureHandle                   handle,
+                 Arc<resource_registry::TextureAllocation> allocation,
+                 Option<vulkan::ImageUploadTicket>         upload = None()) -> Option<u64> {
         auto image = allocation->View();
         if (ResolveTexture(handle).is_none() || image.slots.is_empty()) return None();
 
@@ -183,15 +184,17 @@ public:
         if (current.is_some() && (**current).source_generation != source_generation) {
             ++physical_generation;
         }
+        auto completion =
+            upload.is_some() ? allocation->UploadCompletion() : allocation->Completion();
         TexturePhysical physical {
             .allocation         = rstd::move(allocation),
             .generation         = physical_generation,
             .source_generation  = source_generation,
             .definition_version = (**logical).definition_version,
             .content_version    = (**logical).content_version,
-            .ready              = ready,
+            .completion         = completion,
         };
-        if (upload.is_some() && upload->Valid()) {
+        if (upload.is_some() && upload->Valid() && ! completion.valid()) {
             auto pending = m_pending_uploads.get_mut(upload->value);
             if (pending.is_none()) {
                 (void)m_pending_uploads.insert(upload->value, Vec<PendingTextureUpload>::make());
@@ -212,15 +215,62 @@ public:
         return Some(physical_generation);
     }
 
-    void MarkUploadsSubmitted(slice<vulkan::ImageUploadTicket> tickets, Option<ReadyToken> ready) {
+    void MarkUploadsSubmitted(slice<vulkan::ImageUploadTicket> tickets,
+                              texture::SubmissionToken         completion) {
+        if (! completion.valid()) return;
         for (const auto& ticket : tickets) {
             auto pending = m_pending_uploads.remove(ticket.value);
             if (pending.is_none()) continue;
             for (auto& item : *pending) {
-                if (ready.is_some()) item.physical.ready = *ready;
+                auto logical = ResolveTexture(item.handle);
+                if (logical.is_none() ||
+                    (**logical).definition_version != item.physical.definition_version ||
+                    (**logical).content_version != item.physical.content_version)
+                    continue;
+                item.physical.completion = completion;
                 (void)m_resources.insert(item.handle, rstd::move(item.physical));
             }
         }
+    }
+
+    void ReservePublications() {
+        auto count   = m_resources.len();
+        auto batches = m_pending_uploads.values();
+        for (auto batch = batches.next(); batch.is_some(); batch = batches.next())
+            count += (*batch)->len();
+        m_resources.reserve(count);
+    }
+
+    void PublishSubmitted() {
+        m_pending_uploads.retain([&](const u64&, Vec<PendingTextureUpload>& batch) {
+            if (batch.is_empty() ||
+                ! batch[usize()].physical.allocation->UploadCompletion().valid())
+                return true;
+            for (auto& item : batch) {
+                auto logical = ResolveTexture(item.handle);
+                if (logical.is_none() ||
+                    (**logical).definition_version != item.physical.definition_version ||
+                    (**logical).content_version != item.physical.content_version)
+                    continue;
+                item.physical.completion = item.physical.allocation->UploadCompletion();
+                (void)m_resources.insert(item.handle, rstd::move(item.physical));
+            }
+            return false;
+        });
+    }
+
+    auto Pump(vulkan::TextureContext& context, double seconds) -> Result<empty, texture::Error> {
+        rstd::collections::HashSet<texture::Serial> pumped;
+        auto                                        resources = m_resources.values();
+        for (auto item = resources.next(); item.is_some(); item = resources.next()) {
+            auto slots = (**item).allocation->Slots();
+            if (slots.is_empty()) continue;
+            auto identity = slots[usize()].view.texture().identity().resource;
+            if (! pumped.insert(identity)) continue;
+            auto result = (**item).allocation->Pump(context, seconds);
+            if (result.is_err()) return result;
+        }
+        return Ok(empty {});
     }
 
     void DiscardPendingUploads() { m_pending_uploads.clear(); }
@@ -400,6 +450,16 @@ struct Impl<vrento::resource::TextureLogicalRegistryView, vrento::resource::Text
     auto ResolveTextureState(vrento::resource::TextureHandle handle) const
         -> Option<vrento::resource::TextureLogicalState> {
         return this->self().ResolveTextureState(handle);
+    }
+};
+
+template<>
+struct Impl<vrento::resource_registry::TextureUploadPublisher, vrento::resource::TextureRegistry>
+    : ImplBase<vrento::resource::TextureRegistry> {
+    void Reserve() { self().ReservePublications(); }
+    void Submitted(slice<vrento::vulkan::ImageUploadTicket> tickets,
+                   vrento::texture::SubmissionToken         completion) {
+        self().MarkUploadsSubmitted(tickets, rstd::move(completion));
     }
 };
 

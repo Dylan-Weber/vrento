@@ -305,8 +305,8 @@ private:
 
 // Producer-side abstraction over the offscreen swapchain. Two
 // implementations exist:
-//   - LocalExSwapchain: self-allocates 3 DMA-BUF-backed VkImages via the
-//     Vulkan TextureCache; the standalone viewers and any in-process host
+//   - LocalExSwapchain: owns 3 DMA-BUF-backed VkImages; standalone viewers
+//     and in-process hosts
 //     drive bind_buffers / frame_ready themselves and consume `eatFrame()`
 //     / `snapshot_all_slots()`.
 //   - BridgeExSwapchain: wraps a `ww_pool_t`; bridge owns the slot images
@@ -486,22 +486,6 @@ struct BufferParameters {
         : handle(o.handle.handle()), req_size(o.req_size) {}
 };
 
-struct AllocatedImageParameters {
-    AllocatedImageParameters(const AllocatedImageParameters&)            = delete;
-    AllocatedImageParameters& operator=(const AllocatedImageParameters&) = delete;
-    vvk::AllocatedImage       handle;
-    vvk::ImageView            view;
-    vvk::Sampler              sampler;
-    VkExtent3D                extent;
-    unsigned                  mipmap_level { 1 };
-    u64                       generation { 0 };
-
-    AllocatedImageParameters();
-    ~AllocatedImageParameters();
-    AllocatedImageParameters(AllocatedImageParameters&& o) noexcept;
-    AllocatedImageParameters& operator=(AllocatedImageParameters&& o) noexcept;
-};
-
 struct ExImageParameters {
     ExImageParameters(const ExImageParameters&)              = delete;
     ExImageParameters&   operator=(const ExImageParameters&) = delete;
@@ -531,16 +515,6 @@ struct ExImageParameters {
 // Swapchain/ExSwapchain.hpp). These free helpers replace the conversion
 // ctors that used to live on it — those ctors needed module-attached
 // Allocated/Ex types which can't be visible in classic purview.
-inline ImageParameters ToImageParameters(const AllocatedImageParameters& o) noexcept {
-    ImageParameters out;
-    out.handle       = o.handle.handle();
-    out.view         = *o.view;
-    out.sampler      = *o.sampler;
-    out.extent       = o.extent;
-    out.mipmap_level = o.mipmap_level;
-    out.generation   = o.generation;
-    return out;
-}
 inline ImageParameters ToImageParameters(const ExImageParameters& o) noexcept {
     ImageParameters out;
     out.handle       = *o.handle;
@@ -551,17 +525,6 @@ inline ImageParameters ToImageParameters(const ExImageParameters& o) noexcept {
     out.generation   = o.generation;
     return out;
 }
-
-struct ImageSlots {
-    ImageSlots(const ImageSlots&)                              = delete;
-    ImageSlots&                   operator=(const ImageSlots&) = delete;
-    Vec<AllocatedImageParameters> slots;
-
-    ImageSlots();
-    ~ImageSlots();
-    ImageSlots(ImageSlots&& o) noexcept;
-    ImageSlots& operator=(ImageSlots&& o) noexcept;
-};
 
 struct ImageSlotsRef {
     Vec<ImageParameters> slots;
@@ -575,7 +538,6 @@ struct ImageSlotsRef {
     }
     ImageSlotsRef();
     ~ImageSlotsRef();
-    ImageSlotsRef(const ImageSlots&);
     ImageSlotsRef(const ImageSlotsRef& other): slots(other.slots.clone()), active(other.active) {}
     ImageSlotsRef& operator=(const ImageSlotsRef& other) {
         if (this != &other) {
@@ -588,53 +550,25 @@ struct ImageSlotsRef {
     ImageSlotsRef& operator=(ImageSlotsRef&&) noexcept = default;
 };
 
-struct TextureAllocationRuntime {
-    using Trait                  = TextureAllocationRuntime;
-    static constexpr bool direct = false;
-
-    template<typename Self, typename = void>
-    struct Api {
-        using Trait = TextureAllocationRuntime;
-
-        void Pump(double seconds) { rstd::trait_call<0>(this, seconds); }
-    };
-
-    template<typename T>
-    using Funcs = rstd::TraitFuncs<&T::Pump>;
-};
-
-class TextureAllocation {
-public:
-    explicit TextureAllocation(ImageSlots                                 slots,
-                               Option<Arc<dyn<TextureAllocationRuntime>>> runtime = None())
-        : m_slots(rstd::move(slots)), m_runtime(rstd::move(runtime)) {}
-
-    auto View() const -> ImageSlotsRef { return ImageSlotsRef(m_slots); }
-
-private:
-    ImageSlots                                 m_slots;
-    Option<Arc<dyn<TextureAllocationRuntime>>> m_runtime;
-};
-
 // ---------- Swapchain.hpp ----------
 
 struct SwapchainOptions {
-    bool require_srgb { false };
-    VkImageUsageFlags usage { VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT };
+    bool              require_srgb { false };
+    VkImageUsageFlags usage { VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT };
 };
 
 class Swapchain {
 public:
-    static bool              Create(Device&, VkSurfaceKHR, VkExtent2D, Swapchain&,
-                                    SwapchainOptions = {});
-    static auto CreateResult(Device&, VkSurfaceKHR, VkExtent2D, Swapchain&,
-                             SwapchainOptions = {}) -> VkResult;
+    static bool Create(Device&, VkSurfaceKHR, VkExtent2D, Swapchain&, SwapchainOptions = {});
+    static auto CreateResult(Device&, VkSurfaceKHR, VkExtent2D, Swapchain&, SwapchainOptions = {})
+        -> VkResult;
     const vvk::SwapchainKHR& handle() const;
     VkFormat                 format() const;
     VkExtent2D               extent() const;
     VkPresentModeKHR         presentMode() const;
     slice<ImageParameters>   images() const;
-    void reset();
+    void                     reset();
 
 private:
     vvk::SwapchainKHR    m_handle;
@@ -645,97 +579,17 @@ private:
     Vec<vvk::ImageView>  m_imageviews;
 };
 
-// ---------- TextureCache.hpp ----------
+// ---------- Texture formats and upload staging ----------
 
 VkFormat             ToVkType(TextureFormat);
 VkSamplerAddressMode ToVkType(TextureWrap);
 VkFilter             ToVkType(TextureFilter);
-
-using TexHash = usize;
-
-struct TextureKey {
-    i32                   width;
-    i32                   height;
-    VkImageUsageFlags     usage;
-    TextureFormat         format;
-    TextureSample         sample;
-    unsigned              mipmap_level { 1 };
-    VkSampleCountFlagBits samples { VK_SAMPLE_COUNT_1_BIT };
-
-    static TexHash HashValue(const TextureKey&);
-};
-
-class TextureCache {
-public:
-    TextureCache(const TextureCache&)            = delete;
-    TextureCache& operator=(const TextureCache&) = delete;
-    TextureCache(TextureCache&&)                 = delete;
-    TextureCache& operator=(TextureCache&&)      = delete;
-    struct VideoRegistry;
-
-    struct VideoDecodeOptions {
-        String hwdec { "auto"_Str };
-        String render_node;
-        auto clone() const -> VideoDecodeOptions { return { hwdec.clone(), render_node.clone() }; }
-    };
-
-    TextureCache(const Device&);
-    ~TextureCache();
-
-    void Clear();
-
-    void SetVideoDecodeOptions(VideoDecodeOptions);
-
-    Option<ExImageParameters> CreateExTex(u32 witdh, u32 height, VkFormat, VkImageTiling);
-    rstd::Option<Arc<TextureAllocation>>
-    AllocateImportedTexture(const Image&, Option<Arc<rstd::dyn<VideoPlayback>>> playback);
-    rstd::Option<Arc<TextureAllocation>> AllocateTexture(TextureKey);
-
-    /* Per-frame hook: advance every registered video-tex by `dt_seconds`,
-     * pull as many decoded frames as needed to catch up to wall PTS,
-     * convert NV12→RGBA on the CPU, and upload to the slot's stable
-     * VkImage. No-op if no video textures are registered. */
-    void PumpVideoTextures(double dt_seconds);
-
-    /* vkCmdCopyBufferToImage a sub-rect of `atlas` into the supplied texture. */
-    bool UploadFontAtlasRegion(ref<TextureAllocation> texture, const rstd::uint8_t* atlas,
-                               rstd::uint32_t atlas_w, rstd::uint32_t x, rstd::uint32_t y,
-                               rstd::uint32_t w, rstd::uint32_t h);
-
-private:
-    Option<AllocatedImageParameters> CreateTex(TextureKey);
-    u64                              nextImageGeneration();
-    void                             AssignImageGeneration(AllocatedImageParameters&);
-    void                             AssignImageGeneration(ExImageParameters&);
-    /* VIDEO-typed Image branch of AllocateImportedTexture: registers a wavsen
-     * VideoDecoder + stable RGBA8 VkImage and returns an ImageSlotsRef
-     * pointing at that same VkImage so material binding is transparent. */
-    rstd::Option<Arc<TextureAllocation>>
-         CreateVideoTex(const Image&, Option<Arc<rstd::dyn<VideoPlayback>>> playback);
-    void allocateCmd();
-    vvk::CommandBuffers m_tex_cmds;
-    vvk::CommandBuffer  m_tex_cmd;
-
-    const Device&      m_device;
-    VideoDecodeOptions m_video_decode_options;
-    u64                m_next_image_generation { 1 };
-
-    /* Opaque pImpl for the active video-tex set. Defined inside
-     * TextureCache.cpp to keep wavsen.video out of the public
-     * vrento.vulkan module interface. */
-    Option<Box<VideoRegistry>> m_video_registry;
-};
 
 struct ImageUploadTicket {
     u64 value { 0 };
 
     bool        Valid() const noexcept { return value != u64(); }
     friend bool operator==(const ImageUploadTicket&, const ImageUploadTicket&) = default;
-};
-
-struct PreparedImageAllocation {
-    Arc<TextureAllocation>          allocation;
-    rstd::Option<ImageUploadTicket> upload;
 };
 
 class ImageUploadManager;
@@ -796,15 +650,10 @@ public:
     bool init();
     void destroy();
 
-    auto QueueWrite(Arc<TextureAllocation> allocation, const Image& image)
-        -> Option<ImageUploadTicket>;
-    auto QueueTransparentClear(Arc<TextureAllocation> allocation) -> Option<ImageUploadTicket>;
-
     auto QueueRegion(VkImage image, VkBufferImageCopy region, slice<rstd::uint8_t> bytes,
                      rstd::uint32_t block_bytes = 4) -> Option<ImageUploadTicket>;
     bool HasPendingUploads() const noexcept;
     bool RecordQueuedRegions(vvk::CommandBuffer& command, RecordedImageUploads& recorded);
-    bool RecordPendingUploads(vvk::CommandBuffer& command, RecordedImageUploads& recorded);
     auto CommitRecordedUploads(RecordedImageUploads&& recorded) -> Option<ImageUploadBatchLease>;
     void CancelRecordedUploads(const Arc<RecordedImageUploads::State>& state);
     void DiscardPendingUploads();
@@ -814,51 +663,6 @@ private:
     struct Impl;
     Box<Impl> m_impl;
 };
-
-class ImagePrepareContext {
-public:
-    ImagePrepareContext(TextureCache& textures, ImageUploadManager& uploads)
-        : m_textures(textures), m_uploads(uploads) {}
-
-    auto CreateImportedTexture(ref<Image> image, Option<Arc<rstd::dyn<VideoPlayback>>> playback)
-        -> Option<PreparedImageAllocation>;
-    auto AllocateTexture(TextureKey key) -> Option<Arc<TextureAllocation>>;
-    auto AllocateTransparentTexture(TextureKey key) -> Option<PreparedImageAllocation>;
-
-private:
-    TextureCache&       m_textures;
-    ImageUploadManager& m_uploads;
-};
-
-struct ImagePrepareBackend {
-    using Trait                  = ImagePrepareBackend;
-    static constexpr bool direct = false;
-
-    template<typename Self, typename = void>
-    struct Api {
-        using Trait = ImagePrepareBackend;
-
-        auto CreateImportedTexture(rstd::ref<Image>                      image,
-                                   Option<Arc<rstd::dyn<VideoPlayback>>> playback)
-            -> rstd::Option<PreparedImageAllocation> {
-            return rstd::trait_call<0>(this, image, rstd::move(playback));
-        }
-
-        auto AllocateTexture(TextureKey key) -> rstd::Option<Arc<TextureAllocation>> {
-            return rstd::trait_call<1>(this, key);
-        }
-
-        auto AllocateTransparentTexture(TextureKey key) -> rstd::Option<PreparedImageAllocation> {
-            return rstd::trait_call<2>(this, key);
-        }
-    };
-
-    template<typename T>
-    using Funcs = rstd::TraitFuncs<&T::CreateImportedTexture, &T::AllocateTexture,
-                                   &T::AllocateTransparentTexture>;
-};
-
-void RecordGenerateMipmaps(vvk::CommandBuffer&, const ImageParameters&);
 
 // ---------- Device.hpp ----------
 
@@ -931,14 +735,13 @@ public:
 
     void Destroy();
 
-    const auto&                  graphics_queue() const { return m_graphics_queue; }
-    const auto&                  present_queue() const { return m_present_queue; }
-    const auto&                  device() const { return m_device; }
-    const auto&                  handle() const { return m_device; }
-    auto lost() const -> bool { return __atomic_load_n(&m_lost, __ATOMIC_ACQUIRE); }
-    auto observe_result(VkResult result) const -> VkResult {
-        if (result == VK_ERROR_DEVICE_LOST)
-            __atomic_store_n(&m_lost, true, __ATOMIC_RELEASE);
+    const auto& graphics_queue() const { return m_graphics_queue; }
+    const auto& present_queue() const { return m_present_queue; }
+    const auto& device() const { return m_device; }
+    const auto& handle() const { return m_device; }
+    auto        lost() const -> bool { return __atomic_load_n(&m_lost, __ATOMIC_ACQUIRE); }
+    auto        observe_result(VkResult result) const -> VkResult {
+        if (result == VK_ERROR_DEVICE_LOST) __atomic_store_n(&m_lost, true, __ATOMIC_RELEASE);
         return result;
     }
     const auto&                  gpu() const { return m_gpu; }
@@ -976,7 +779,7 @@ private:
     VkInstance                   m_instance { VK_NULL_HANDLE };
     rstd::uint32_t               m_instance_api_version { WP_VULKAN_VERSION };
     vvk::Device                  m_device;
-    mutable bool                 m_lost{};
+    mutable bool                 m_lost {};
     vvk::PhysicalDevice          m_gpu;
     vvk::MemoryAllocator         m_allocator;
 
@@ -1428,21 +1231,6 @@ private:
     bool                           m_surface_pending { false };
 };
 
-inline Option<ExSwapchainOwner> CreateLocalExSwapchain(const Device& device, TextureCache& textures,
-                                                       unsigned w, unsigned h,
-                                                       VkImageTiling tiling) {
-    rstd::array<LocalExHandle, 3> handles;
-    for (auto& handle : handles) {
-        if (auto rv = textures.CreateExTex(u32(w), u32(h), VK_FORMAT_R8G8B8A8_UNORM, tiling);
-            rv.is_some())
-            handle.image = rstd::move(rv).unwrap();
-        else
-            return None();
-    }
-    return Some(ExSwapchain::Make<LocalExSwapchain>(
-        rstd::move(handles), VkExtent2D { w, h }, device.graphics_queue().family_index));
-}
-
 } // namespace vulkan
 } // namespace vrento
 
@@ -1488,26 +1276,6 @@ struct Impl<vrento::vulkan::BufferBackend, vrento::vulkan::BufferManager>
             slice<rstd::uint8_t>::from_raw_parts(
                 reinterpret_cast<const rstd::uint8_t*>(content.as_raw_ptr()), content.len()),
             destination_offset);
-    }
-};
-
-template<>
-struct Impl<vrento::vulkan::ImagePrepareBackend, vrento::vulkan::ImagePrepareContext>
-    : ImplBase<vrento::vulkan::ImagePrepareContext> {
-    auto CreateImportedTexture(ref<vrento::Image>                                  image,
-                               Option<sync::Arc<rstd::dyn<vrento::VideoPlayback>>> playback)
-        -> Option<vrento::vulkan::PreparedImageAllocation> {
-        return this->self().CreateImportedTexture(image, rstd::move(playback));
-    }
-
-    auto AllocateTexture(vrento::vulkan::TextureKey key)
-        -> Option<sync::Arc<vrento::vulkan::TextureAllocation>> {
-        return this->self().AllocateTexture(rstd::move(key));
-    }
-
-    auto AllocateTransparentTexture(vrento::vulkan::TextureKey key)
-        -> Option<vrento::vulkan::PreparedImageAllocation> {
-        return this->self().AllocateTransparentTexture(rstd::move(key));
     }
 };
 

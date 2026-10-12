@@ -4,15 +4,148 @@ import rstd;
 import rstd.test;
 import vrento;
 using namespace rstd::prelude;
+using namespace rstd::literals;
 namespace tex = vrento::texture;
 namespace vk  = vrento::vulkan;
 
 namespace vrento_test::texture_vulkan
 {
+struct ReadbackDevice {
+    vk::TextureContext& context;
+};
+} // namespace vrento_test::texture_vulkan
+namespace rstd
+{
+template<>
+struct Impl<tex::TextureDevice, vrento_test::texture_vulkan::ReadbackDevice>
+    : ImplBase<vrento_test::texture_vulkan::ReadbackDevice> {
+    auto QuerySupport(const tex::TextureDesc& description) const -> Result<empty, tex::Error> {
+        auto desc  = description;
+        desc.usage = desc.usage | tex::Usage::TransferSource;
+        return self().context.QuerySupport(desc);
+    }
+    auto CreateTexture(const tex::TextureDesc& description) -> Result<tex::TextureRef, tex::Error> {
+        auto desc  = description;
+        desc.usage = desc.usage | tex::Usage::TransferSource;
+        return self().context.CreateTexture(desc);
+    }
+    auto CreateView(const tex::TextureRef& texture, tex::ViewDesc desc)
+        -> Result<tex::TextureViewRef, tex::Error> {
+        return self().context.CreateView(texture, desc);
+    }
+    auto CreateSampler(const tex::SamplerDesc& desc) -> Result<tex::SamplerRef, tex::Error> {
+        return self().context.CreateSampler(desc);
+    }
+};
+} // namespace rstd
+
+namespace vrento_test::texture_vulkan
+{
+struct SynchronizationOwner {
+    vk::DeviceSession session;
+    vvk::Semaphore    semaphore;
+    vvk::Fence        fence;
+    explicit SynchronizationOwner(vk::DeviceSession value): session(rstd::move(value)) {}
+};
+auto semaphore(vk::DeviceSession session, bool timeline = false)
+    -> rstd::sync::Arc<SynchronizationOwner> {
+    auto                      owner = rstd::sync::Arc<SynchronizationOwner>::make(session);
+    VkSemaphoreTypeCreateInfo type { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo info { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    if (timeline) info.pNext = &type;
+    rstd_assert(session.device().handle().CreateSemaphore(info, owner->semaphore) == VK_SUCCESS);
+    return owner;
+}
+auto pin(const rstd::sync::Arc<SynchronizationOwner>& owner)
+    -> rstd::sync::Arc<dyn<rstd::any::Any>> {
+    return rstd::sync::Arc<dyn<rstd::any::Any>>::make(owner.clone());
+}
+void host_signal(vk::DeviceSession session, VkSemaphore semaphore, tex::Serial value) {
+    auto signal = reinterpret_cast<PFN_vkSignalSemaphoreKHR>(
+        session.device().handle().Dispatch().vkGetDeviceProcAddr(*session.device().handle(),
+                                                                 "vkSignalSemaphoreKHR"));
+    rstd_assert(signal);
+    VkSemaphoreSignalInfo info { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
+    info.semaphore = semaphore;
+    info.value     = value;
+    rstd_assert(signal(*session.device().handle(), &info) == VK_SUCCESS);
+}
+struct NativePassOwner {
+    vk::DeviceSession session;
+    vvk::RenderPass   pass;
+    vvk::Framebuffer  framebuffer;
+    explicit NativePassOwner(vk::DeviceSession value): session(rstd::move(value)) {}
+};
+struct ProducerOwner {
+    vk::DeviceSession session;
+    unsigned*         dropped;
+    ProducerOwner(vk::DeviceSession value, unsigned& count)
+        : session(rstd::move(value)), dropped(&count) {}
+    ProducerOwner(const ProducerOwner&) = delete;
+    ProducerOwner(ProducerOwner&& other)
+        : session(rstd::move(other.session)), dropped(rstd::exchange(other.dropped, nullptr)) {}
+    ~ProducerOwner() {
+        if (dropped) ++*dropped;
+    }
+};
+struct SurfaceOwner {
+    vk::DeviceSession                     session;
+    tex::TextureViewRef                   view;
+    rstd::sync::Arc<SynchronizationOwner> acquire;
+};
+void producer_clear(tex::Submission& work, vk::DeviceSession session,
+                    const vk::ProducerTarget& target, float value) {
+    auto                 command  = vk::native_recording(work, session).unwrap();
+    auto&                dispatch = session.device().handle().Dispatch();
+    VkImageMemoryBarrier barrier { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    barrier.srcAccessMask       = target.initial.access;
+    barrier.dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.oldLayout           = target.initial.layout;
+    barrier.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image                                             = target.image.handle;
+    barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    dispatch.vkCmdPipelineBarrier(command,
+                                  target.initial.stages,
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  0,
+                                  0,
+                                  nullptr,
+                                  0,
+                                  nullptr,
+                                  1,
+                                  &barrier);
+    VkClearColorValue clear {};
+    for (auto& channel : clear.float32) channel = value;
+    dispatch.vkCmdClearColorImage(command,
+                                  target.image.handle,
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                  &clear,
+                                  1,
+                                  &barrier.subresourceRange);
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = target.final.access;
+    barrier.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout     = target.final.layout;
+    dispatch.vkCmdPipelineBarrier(command,
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  target.final.stages,
+                                  0,
+                                  0,
+                                  nullptr,
+                                  0,
+                                  nullptr,
+                                  1,
+                                  &barrier);
+}
 auto read(vk::TextureContext& device, tex::TextureViewRef view, unsigned mip = 0,
           unsigned layer = 0) -> Vec<u8> {
     auto               extent = tex::mip_extent(view.texture().description(), mip);
-    auto               size   = extent.width * extent.height * 4;
+    auto               format = tex::format_layout(view.texture().description().format);
+    auto               size   = ((extent.width + format.block_width - 1) / format.block_width) *
+                                ((extent.height + format.block_height - 1) / format.block_height) *
+                                format.block_bytes;
     VkBufferCreateInfo info { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     info.size   = size;
     info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -174,37 +307,453 @@ TEST(TextureVulkan, Resources) {
     rstd_assert(pool.acquire().is_err());
     copy = {};
     rstd_assert(pool.acquire().is_ok());
-    vk::TextureCache       legacy_textures(session.device());
-    vk::ImageUploadManager legacy_uploads(session.device());
-    rstd_assert(legacy_uploads.init());
-    vk::ImagePrepareContext legacy_context(legacy_textures, legacy_uploads);
-    auto                    legacy_backend = dyn<vk::ImagePrepareBackend>::from_ref(legacy_context);
-    vrento::Image           atlas;
+    ReadbackDevice           readback_device { device };
+    auto                     readback_factory = dyn<tex::TextureDevice>::from_ref(readback_device);
+    tex::ImagePrepareContext atlas_context(readback_factory.as_mut_ref());
+    auto          atlas_preparer = dyn<tex::TextureContentPreparer>::from_ref(atlas_context);
+    vrento::Image atlas;
     atlas.header.format = vrento::TextureFormat::R8;
-    rstd::uint8_t       atlas_bytes[16] {};
+    rstd::uint8_t atlas_bytes[16] {};
+    for (unsigned i = 0; i < 16; ++i) atlas_bytes[i] = rstd::uint8_t(i);
     vrento::Image::Slot atlas_slot;
     atlas_slot.width = atlas_slot.height = 4;
     atlas_slot.mipmaps.push(
         vrento::ImageData { 4, 4, isize(16), vrento::ImageDataPtr(atlas_bytes, [](rstd::uint8_t*) {
                             }) });
     atlas.slots.push(rstd::move(atlas_slot));
-    auto legacy_image =
-        legacy_backend
-            ->CreateImportedTexture(rstd::ref<vrento::Image>::from_raw_parts(&atlas), None())
-            .unwrap();
-    work                                    = queue->Begin().unwrap();
-    auto                     legacy_command = vk::native_recording(work, session).unwrap();
-    vvk::CommandBuffer       command(legacy_command, session.device().handle().Dispatch());
-    vk::RecordedImageUploads legacy_recorded;
-    rstd_assert(legacy_uploads.RecordPendingUploads(command, legacy_recorded));
-    work.retain(legacy_uploads.CommitRecordedUploads(rstd::move(legacy_recorded)).unwrap());
-    work.retain(legacy_image.allocation.clone());
-    auto legacy_done = queue->Submit(rstd::move(work)).unwrap();
-    device.wait(legacy_done).unwrap();
+    auto prepared_atlas = atlas_preparer->PrepareImage(atlas).unwrap();
+    rstd_assert(prepared_atlas.len() == usize(1));
+    auto& atlas_image = prepared_atlas[usize()];
+    rstd_assert(atlas_image.view.texture().description().format == vrento::TextureFormat::R8);
     atlas_bytes[5] = 99;
-    rstd_assert(legacy_textures.UploadFontAtlasRegion(
-        legacy_image.allocation.deref(), atlas_bytes, 4, 1, 1, 1, 1));
-    legacy_uploads.destroy();
+    work           = queue->Begin().unwrap();
+    for (auto& item : atlas_image.uploads) work.commands()->Upload(rstd::move(item)).unwrap();
+    work.commands()
+        ->UseSampledView(atlas_image.view, atlas_image.sampler, tex::Stages::Fragment)
+        .unwrap();
+    device.wait(queue->Submit(rstd::move(work)).unwrap()).unwrap();
+    auto atlas_pixels = read(device, atlas_image.view);
+    rstd_assert(atlas_pixels.len() == usize(16));
+    for (unsigned i = 0; i < 16; ++i) rstd_assert(atlas_pixels[usize(i)] == u8(i));
+    tex::TextureUpload atlas_update;
+    atlas_update.target = atlas_image.view;
+    atlas_update.x = atlas_update.y = 1;
+    atlas_update.width = atlas_update.height = 1;
+    atlas_update.bytes.push(u8(atlas_bytes[5]));
+    work = queue->Begin().unwrap();
+    work.commands()->Upload(rstd::move(atlas_update)).unwrap();
+    work.commands()
+        ->UseSampledView(atlas_image.view, atlas_image.sampler, tex::Stages::Fragment)
+        .unwrap();
+    device.wait(queue->Submit(rstd::move(work)).unwrap()).unwrap();
+    atlas_pixels = read(device, atlas_image.view);
+    rstd_assert(atlas_pixels.len() == usize(16));
+    for (unsigned i = 0; i < 16; ++i) rstd_assert(atlas_pixels[usize(i)] == u8(i == 5 ? 99 : i));
+    rstd_assert(session.validation_errors() == 0);
+}
+TEST(TextureVulkan, MixedSubmission) {
+    auto              session      = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto              context      = vk::TextureContext::create(session).unwrap();
+    auto              api          = dyn<vk::NativeSubmission>::from_ref(context);
+    auto              device       = *session.device().handle();
+    auto              acquire      = semaphore(session);
+    auto              timeline     = semaphore(session, true);
+    auto              gate         = semaphore(session, true);
+    auto              release      = semaphore(session);
+    auto              release_weak = release.downgrade();
+    auto              fence        = rstd::sync::Arc<SynchronizationOwner>::make(session);
+    VkFenceCreateInfo fence_info { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    rstd_assert(session.device().handle().CreateFence(fence_info, fence->fence) == VK_SUCCESS);
+    auto setup = context.Begin().unwrap();
+    api->AttachSignal(
+           setup, { device, *acquire->semaphore, vk::NativeSemaphoreKind::Binary, 0, pin(acquire) })
+        .unwrap();
+    api->AttachSignal(
+           setup,
+           { device, *timeline->semaphore, vk::NativeSemaphoreKind::Timeline, 3, pin(timeline) })
+        .unwrap();
+    auto setup_done = context.Submit(rstd::move(setup)).unwrap();
+    context.wait(setup_done).unwrap();
+    auto work = context.Begin().unwrap();
+    api->AttachWait(work,
+                    { device,
+                      *acquire->semaphore,
+                      vk::NativeSemaphoreKind::Binary,
+                      0,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      pin(acquire) })
+        .unwrap();
+    api->AttachWait(work,
+                    { device,
+                      *timeline->semaphore,
+                      vk::NativeSemaphoreKind::Timeline,
+                      1,
+                      VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                      pin(timeline) })
+        .unwrap();
+    api->AttachWait(work,
+                    { device,
+                      *timeline->semaphore,
+                      vk::NativeSemaphoreKind::Timeline,
+                      3,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                      pin(timeline) })
+        .unwrap();
+    api->AttachWait(work,
+                    { device,
+                      *gate->semaphore,
+                      vk::NativeSemaphoreKind::Timeline,
+                      1,
+                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                      pin(gate) })
+        .unwrap();
+    api->AttachSignal(
+           work, { device, *release->semaphore, vk::NativeSemaphoreKind::Binary, 0, pin(release) })
+        .unwrap();
+    api->AttachSignal(
+           work,
+           { device, *timeline->semaphore, vk::NativeSemaphoreKind::Timeline, 5, pin(timeline) })
+        .unwrap();
+    api->AttachFence(work, { device, *fence->fence, pin(fence) }).unwrap();
+    rstd_assert(api->AttachFence(work, { device, *fence->fence, pin(fence) }).is_err());
+    rstd_assert(api->AttachWait(work,
+                                { device,
+                                  *gate->semaphore,
+                                  vk::NativeSemaphoreKind::Binary,
+                                  1,
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  pin(gate) })
+                    .is_err());
+    auto recorder = vk::native_command_recording(work, session).unwrap();
+    (void)recorder;
+    auto receipt = work.receipt();
+    auto done    = context.Submit(rstd::move(work)).unwrap();
+    release.reset();
+    rstd_assert(receipt.submitted() && ! done.poll().unwrap());
+    context.Poll().unwrap();
+    rstd_assert(! release_weak.expired());
+    host_signal(session, *gate->semaphore, 1);
+    context.wait(done).unwrap();
+    rstd_assert(done.poll().unwrap() && release_weak.expired());
+    auto native_fence = *fence->fence;
+    rstd_assert(session.device().handle().Dispatch().vkResetFences(device, 1, &native_fence) ==
+                VK_SUCCESS);
+    rstd_assert(done.poll().unwrap());
+    auto external = context.ImportDependency(*timeline->semaphore, 5, pin(timeline)).unwrap();
+    rstd_assert(external.poll().unwrap());
+    auto rejected         = context.Begin().unwrap();
+    auto rejected_receipt = rejected.receipt();
+    auto other_context    = vk::TextureContext::create(session).unwrap();
+    rstd_assert(other_context.Submit(rstd::move(rejected)).unwrap_err().kind ==
+                tex::ErrorKind::DeviceMismatch);
+    rstd_assert(rejected_receipt.cancelled());
+    rstd_assert(session.validation_errors() == 0);
+}
+TEST(TextureVulkan, MultisampleResolveAndDepthLayout) {
+    auto             session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto             context = vk::TextureContext::create(session).unwrap();
+    tex::TextureDesc desc;
+    desc.extent = { 4, 4 };
+    desc.usage  = tex::Usage::ColorAttachment | tex::Usage::TransferSource;
+    VkImageFormatProperties properties {};
+    rstd_assert(session.device().instance_dispatch().vkGetPhysicalDeviceImageFormatProperties(
+                    *session.device().gpu(),
+                    VK_FORMAT_R8G8B8A8_UNORM,
+                    VK_IMAGE_TYPE_2D,
+                    VK_IMAGE_TILING_OPTIMAL,
+                    vk::image_usage(desc.usage),
+                    0,
+                    &properties) == VK_SUCCESS);
+    unsigned chosen = 0;
+    for (unsigned samples = 2; samples <= 64; samples *= 2) {
+        desc.samples = samples;
+        rstd_assert(context.QuerySupport(desc).is_ok() == bool(properties.sampleCounts & samples));
+        if (! chosen && context.QuerySupport(desc).is_ok()) chosen = samples;
+    }
+    rstd_assert(chosen != 0);
+    desc.samples     = chosen;
+    auto multisample = context.CreateTexture(desc).unwrap();
+    auto ms_view     = context.CreateView(multisample, {}).unwrap();
+    rstd_assert(vk::attachment_image(ms_view).unwrap().samples == VkSampleCountFlagBits(chosen));
+    desc.samples  = 1;
+    desc.usage    = desc.usage | tex::Usage::Sampled;
+    auto resolved = context.CreateView(context.CreateTexture(desc).unwrap(), {}).unwrap();
+    NativePassOwner         pass(session);
+    VkAttachmentDescription attachments[2] {};
+    for (unsigned i = 0; i < 2; ++i) {
+        attachments[i].format  = VK_FORMAT_R8G8B8A8_UNORM;
+        attachments[i].samples = i == 0 ? VkSampleCountFlagBits(chosen) : VK_SAMPLE_COUNT_1_BIT;
+        attachments[i].loadOp =
+            i == 0 ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachments[i].storeOp       = VK_ATTACHMENT_STORE_OP_STORE;
+        attachments[i].initialLayout = attachments[i].finalLayout =
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
+    VkAttachmentReference color { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkAttachmentReference resolve { 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription  subpass {};
+    subpass.pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments    = &color;
+    subpass.pResolveAttachments  = &resolve;
+    VkRenderPassCreateInfo pass_info { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+    pass_info.attachmentCount = 2;
+    pass_info.pAttachments    = attachments;
+    pass_info.subpassCount    = 1;
+    pass_info.pSubpasses      = &subpass;
+    rstd_assert(session.device().handle().CreateRenderPass(pass_info, pass.pass) == VK_SUCCESS);
+    VkImageView views[] { vk::native_view(ms_view).unwrap(), vk::native_view(resolved).unwrap() };
+    VkFramebufferCreateInfo framebuffer { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+    framebuffer.renderPass      = *pass.pass;
+    framebuffer.attachmentCount = 2;
+    framebuffer.pAttachments    = views;
+    framebuffer.width = framebuffer.height = 4;
+    framebuffer.layers                     = 1;
+    rstd_assert(session.device().handle().CreateFramebuffer(framebuffer, pass.framebuffer) ==
+                VK_SUCCESS);
+    auto work = context.Begin().unwrap();
+    work.commands()
+        ->UseTexture({ ms_view, tex::Access::ColorAttachment, tex::Stages::Color, true })
+        .unwrap();
+    work.commands()
+        ->UseTexture({ resolved, tex::Access::ColorAttachment, tex::Stages::Color, true })
+        .unwrap();
+    VkClearValue clear {};
+    clear.color.float32[0] = 1;
+    clear.color.float32[3] = 1;
+    VkRenderPassBeginInfo begin { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    begin.renderPass        = *pass.pass;
+    begin.framebuffer       = *pass.framebuffer;
+    begin.renderArea.extent = { 4, 4 };
+    begin.clearValueCount   = 1;
+    begin.pClearValues      = &clear;
+    auto command            = vk::native_recording(work, session).unwrap();
+    session.device().handle().Dispatch().vkCmdBeginRenderPass(
+        command, &begin, VK_SUBPASS_CONTENTS_INLINE);
+    session.device().handle().Dispatch().vkCmdEndRenderPass(command);
+    work.commands()->UseTexture({ resolved, tex::Access::Sampled, tex::Stages::Fragment }).unwrap();
+    work.retain(rstd::move(pass));
+    context.wait(context.Submit(rstd::move(work)).unwrap()).unwrap();
+    auto pixels = read(context, resolved);
+    for (unsigned i = 0; i < 16; ++i) {
+        rstd_assert(pixels[usize(i * 4)] == u8(255));
+        rstd_assert(pixels[usize(i * 4 + 1)] == u8(0));
+        rstd_assert(pixels[usize(i * 4 + 3)] == u8(255));
+    }
+    tex::TextureDesc depth_desc;
+    depth_desc.extent      = { 4, 4 };
+    depth_desc.format      = vrento::TextureFormat::D32F;
+    depth_desc.usage       = tex::Usage::DepthAttachment | tex::Usage::Sampled;
+    auto             depth = context
+                                 .CreateView(context.CreateTexture(depth_desc).unwrap(),
+                                             { tex::Dimension::D2, { tex::Aspect::Depth } })
+                                 .unwrap();
+    tex::SamplerDesc compare;
+    compare.sample.compare_enable = true;
+    auto sampler                  = context.CreateSampler(compare).unwrap();
+    rstd_assert(vk::sampled_image(depth, sampler).unwrap().layout ==
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+    auto invalid_final = context.Begin().unwrap();
+    rstd_assert(vk::RecordFinalState(invalid_final, session, { depth }).is_err());
+    work = context.Begin().unwrap();
+    work.commands()
+        ->UseTexture({ depth, tex::Access::DepthAttachment, tex::Stages::Depth, true })
+        .unwrap();
+    NativePassOwner         depth_pass(session);
+    VkAttachmentDescription attachment {};
+    attachment.format        = VK_FORMAT_D32_SFLOAT;
+    attachment.samples       = VK_SAMPLE_COUNT_1_BIT;
+    attachment.loadOp        = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    attachment.storeOp       = VK_ATTACHMENT_STORE_OP_STORE;
+    attachment.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    attachment.finalLayout   = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    VkAttachmentReference depth_reference { 0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    subpass.colorAttachmentCount = 0;
+    subpass.pColorAttachments = subpass.pResolveAttachments = nullptr;
+    subpass.pDepthStencilAttachment                         = &depth_reference;
+    pass_info.attachmentCount                               = 1;
+    pass_info.pAttachments                                  = &attachment;
+    rstd_assert(session.device().handle().CreateRenderPass(pass_info, depth_pass.pass) ==
+                VK_SUCCESS);
+    VkImageView depth_view      = vk::native_view(depth).unwrap();
+    framebuffer.renderPass      = *depth_pass.pass;
+    framebuffer.attachmentCount = 1;
+    framebuffer.pAttachments    = &depth_view;
+    rstd_assert(session.device().handle().CreateFramebuffer(framebuffer, depth_pass.framebuffer) ==
+                VK_SUCCESS);
+    clear.depthStencil.depth = 0.5f;
+    begin.renderPass         = *depth_pass.pass;
+    begin.framebuffer        = *depth_pass.framebuffer;
+    command                  = vk::native_recording(work, session).unwrap();
+    session.device().handle().Dispatch().vkCmdBeginRenderPass(
+        command, &begin, VK_SUBPASS_CONTENTS_INLINE);
+    session.device().handle().Dispatch().vkCmdEndRenderPass(command);
+    vk::RecordFinalState(work, session, { depth, tex::Access::Sampled, tex::Stages::Fragment })
+        .unwrap();
+    work.retain(rstd::move(depth_pass));
+    context.wait(context.Submit(rstd::move(work)).unwrap()).unwrap();
+    vk::prepare_texture_read(session, depth, tex::Stages::Fragment).unwrap();
+    {
+        auto cancelled = context.Begin().unwrap();
+        cancelled.commands()
+            ->UseTexture({ depth, tex::Access::DepthAttachment, tex::Stages::Depth })
+            .unwrap();
+    }
+    vk::prepare_texture_read(session, depth, tex::Stages::Fragment).unwrap();
+    rstd_assert(session.validation_errors() == 0);
+}
+TEST(TextureVulkan, ContinuousProducer) {
+    auto             session          = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto             context          = vk::TextureContext::create(session).unwrap();
+    auto             producer_context = vk::TextureContext::create(session).unwrap();
+    auto             interop          = dyn<vk::TextureInterop>::from_ref(context);
+    tex::TextureDesc desc;
+    desc.extent = { 4, 4 };
+    desc.usage = tex::Usage::Sampled | tex::Usage::TransferDestination | tex::Usage::TransferSource;
+    auto     texture  = context.CreateTexture(desc).unwrap();
+    auto     view     = context.CreateView(texture, {}).unwrap();
+    auto     identity = texture.identity();
+    unsigned dropped  = 0;
+    {
+        auto cancelled =
+            interop
+                ->BeginProducerWrite(
+                    { view,
+                      { tex::Access::Sampled, tex::Stages::Fragment },
+                      None(),
+                      rstd::sync::Arc<dyn<rstd::any::Any>>::make(ProducerOwner(session, dropped)) })
+                .unwrap();
+        auto conflict = context.Begin().unwrap();
+        rstd_assert(conflict.commands()->UseTexture({ view }).unwrap_err().kind ==
+                    tex::ErrorKind::Busy);
+        cancelled.cancel();
+        rstd_assert(conflict.commands()->UseTexture({ view }).is_ok());
+    }
+    rstd_assert(dropped == 1);
+    for (unsigned frame = 1; frame <= 2; ++frame) {
+        tex::SubmissionToken done;
+        {
+            auto write = interop
+                             ->BeginProducerWrite({ view,
+                                                    { tex::Access::Sampled, tex::Stages::Fragment },
+                                                    None(),
+                                                    rstd::sync::Arc<dyn<rstd::any::Any>>::make(
+                                                        ProducerOwner(session, dropped)) })
+                             .unwrap();
+            context.wait(write.target().dependency).unwrap();
+            auto work = producer_context.Begin().unwrap();
+            producer_clear(work, session, write.target(), frame == 1 ? 0.0f : 1.0f);
+            done = producer_context.Submit(rstd::move(work)).unwrap();
+            interop->CommitProducerWrite(write, done).unwrap();
+            rstd_assert(! write.active() && texture.identity() == identity &&
+                        texture.ready() == done);
+        }
+        rstd_assert(dropped == frame);
+        context.wait(done).unwrap();
+        producer_context.Poll().unwrap();
+        rstd_assert(dropped == frame + 1);
+        auto pixels = read(context, view);
+        for (auto pixel : pixels) rstd_assert(pixel == u8(frame == 1 ? 0 : 255));
+    }
+    auto poisoned_texture = context.CreateTexture(desc).unwrap();
+    auto poisoned         = context.CreateView(poisoned_texture, {}).unwrap();
+    {
+        auto uncertain =
+            context
+                .BeginProducerWrite(
+                    { poisoned,
+                      { tex::Access::Sampled, tex::Stages::Fragment },
+                      None(),
+                      rstd::sync::Arc<dyn<rstd::any::Any>>::make(ProducerOwner(session, dropped)) })
+                .unwrap();
+        uncertain.uncertain();
+        auto reader = context.Begin().unwrap();
+        rstd_assert(reader.commands()->UseTexture({ poisoned }).unwrap_err().kind ==
+                    tex::ErrorKind::Closed);
+    }
+    rstd_assert(dropped == 4);
+    rstd_assert(session.validation_errors() == 0);
+}
+TEST(TextureVulkan, SurfaceLeaseRecording) {
+    auto             session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto             context = vk::TextureContext::create(session).unwrap();
+    tex::TextureDesc desc;
+    desc.extent  = { 4, 4 };
+    desc.usage   = tex::Usage::ColorAttachment | tex::Usage::TransferDestination;
+    auto texture = context.CreateTexture(desc).unwrap();
+    auto view    = context.CreateView(texture, {}).unwrap();
+    auto acquire = semaphore(session);
+    auto owner =
+        rstd::sync::Arc<dyn<rstd::any::Any>>::make(SurfaceOwner { session, view, acquire.clone() });
+    auto                      family = session.device().graphics_queue().family_index;
+    vrento::FrameSurfaceLease lease;
+    lease.identity             = { u64(1), u32(0), u64(1) };
+    lease.image                = vk::attachment_image(view).unwrap().image;
+    lease.format               = VK_FORMAT_R8G8B8A8_UNORM;
+    lease.initial_layout       = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    lease.reuse.kind           = vrento::FrameSurfaceReuseKind::PresentationAcquired;
+    lease.acquire.kind         = vrento::FrameSurfaceAcquireKind::BinarySemaphore;
+    lease.acquire.semaphore    = *acquire->semaphore;
+    lease.initial_queue_family = lease.final_queue_family = family;
+    lease.final_layout                                    = VK_IMAGE_LAYOUT_GENERAL;
+    rstd_assert(lease.valid());
+    auto setup = context.Begin().unwrap();
+    context
+        .AttachSignal(setup,
+                      { *session.device().handle(),
+                        *acquire->semaphore,
+                        vk::NativeSemaphoreKind::Binary,
+                        0,
+                        pin(acquire) })
+        .unwrap();
+    context.wait(context.Submit(rstd::move(setup)).unwrap()).unwrap();
+    auto cancelled    = context.Begin().unwrap();
+    auto cancellation = cancelled.receipt();
+    rstd_assert(vk::recordRelease(cancelled, session, lease).unwrap_err().kind ==
+                tex::ErrorKind::Stale);
+    vk::recordAcquire(cancelled, session, lease, owner.clone()).unwrap();
+    rstd_assert(context.Submit(rstd::move(cancelled)).unwrap_err().kind == tex::ErrorKind::Invalid);
+    rstd_assert(cancellation.cancelled());
+    auto work = context.Begin().unwrap();
+    vk::recordAcquire(
+        work,
+        session,
+        lease,
+        owner.clone(),
+        vk::native_access({ tex::Access::TransferDestination, tex::Stages::Transfer }))
+        .unwrap();
+    rstd_assert(vk::recordAcquire(work, session, lease, owner.clone()).unwrap_err().kind ==
+                tex::ErrorKind::Busy);
+    auto                    command = vk::native_recording(work, session).unwrap();
+    VkClearColorValue       clear {};
+    VkImageSubresourceRange range { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    session.device().handle().Dispatch().vkCmdClearColorImage(
+        command, lease.image.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &range);
+    vk::recordSurfaceFinalState(
+        work,
+        session,
+        lease,
+        vk::native_access({ tex::Access::TransferDestination, tex::Stages::Transfer }))
+        .unwrap();
+    vk::recordRelease(work, session, lease).unwrap();
+    rstd_assert(vk::recordRelease(work, session, lease).unwrap_err().kind == tex::ErrorKind::Stale);
+    context.wait(context.Submit(rstd::move(work)).unwrap()).unwrap();
+    setup = context.Begin().unwrap();
+    context
+        .AttachSignal(setup,
+                      { *session.device().handle(),
+                        *acquire->semaphore,
+                        vk::NativeSemaphoreKind::Binary,
+                        0,
+                        pin(acquire) })
+        .unwrap();
+    context.wait(context.Submit(rstd::move(setup)).unwrap()).unwrap();
+    lease.identity.acquire_serial = u64(2);
+    lease.initial_layout          = VK_IMAGE_LAYOUT_GENERAL;
+    work                          = context.Begin().unwrap();
+    vk::recordAcquire(work, session, lease, owner.clone()).unwrap();
+    vk::recordRelease(work, session, lease).unwrap();
+    context.wait(context.Submit(rstd::move(work)).unwrap()).unwrap();
     rstd_assert(session.validation_errors() == 0);
 }
 } // namespace vrento_test::texture_vulkan

@@ -20,29 +20,6 @@ AllocatedBufferParameters::operator=(AllocatedBufferParameters&& o) noexcept {
     return *this;
 }
 
-AllocatedImageParameters::AllocatedImageParameters()  = default;
-AllocatedImageParameters::~AllocatedImageParameters() = default;
-AllocatedImageParameters::AllocatedImageParameters(AllocatedImageParameters&& o) noexcept
-    : handle(rstd::move(o.handle)),
-      view(rstd::move(o.view)),
-      sampler(rstd::move(o.sampler)),
-      extent(o.extent),
-      mipmap_level(o.mipmap_level),
-      generation(o.generation) {}
-AllocatedImageParameters&
-AllocatedImageParameters::operator=(AllocatedImageParameters&& o) noexcept {
-    if (this == &o) return *this;
-    view.reset();
-    sampler.reset();
-    handle       = rstd::move(o.handle);
-    view         = rstd::move(o.view);
-    sampler      = rstd::move(o.sampler);
-    extent       = o.extent;
-    mipmap_level = o.mipmap_level;
-    generation   = o.generation;
-    return *this;
-}
-
 ExImageParameters::ExImageParameters()  = default;
 ExImageParameters::~ExImageParameters() = default;
 ExImageParameters::ExImageParameters(ExImageParameters&& o) noexcept
@@ -76,20 +53,7 @@ ExImageParameters& ExImageParameters::operator=(ExImageParameters&& o) noexcept 
     return *this;
 }
 
-ImageSlots::ImageSlots()  = default;
-ImageSlots::~ImageSlots() = default;
-ImageSlots::ImageSlots(ImageSlots&& o) noexcept: slots(rstd::move(o.slots)) {}
-ImageSlots& ImageSlots::operator=(ImageSlots&& o) noexcept {
-    slots = rstd::move(o.slots);
-    return *this;
-}
-
 ImageSlotsRef::ImageSlotsRef()  = default;
 ImageSlotsRef::~ImageSlotsRef() = default;
-ImageSlotsRef::ImageSlotsRef(const ImageSlots& o) {
-    slots.reserve(o.slots.len());
-    for (const auto& image : o.slots) slots.push(ToImageParameters(image));
-}
-
 } // namespace vulkan
 } // namespace vrento

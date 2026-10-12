@@ -57,7 +57,8 @@ enum class Stages : Count
     Transfer = 8,
     Color    = 16,
     Depth    = 32,
-    All      = 63
+    Geometry = 64,
+    All      = 127
 };
 constexpr auto operator|(Stages a, Stages b) -> Stages { return Stages(Count(a) | Count(b)); }
 enum class Access
@@ -143,7 +144,11 @@ inline auto validate(const TextureDesc& desc) -> Result<empty, Error> {
         ! format_layout(desc.format).block_bytes || ! Count(desc.usage) ||
         (Count(desc.usage) & ~Count(63)))
         return Err(Error { ErrorKind::Invalid });
-    if (desc.samples != 1) return Err(Error { ErrorKind::Unsupported });
+    if (! desc.samples || desc.samples > 64 || (desc.samples & (desc.samples - 1)))
+        return Err(Error { ErrorKind::Invalid });
+    if (desc.samples != 1 && (desc.mip_levels != 1 || desc.dimension == Dimension::Cube ||
+                              format_layout(desc.format).block_width != 1))
+        return Err(Error { ErrorKind::Invalid });
     if ((desc.dimension == Dimension::D2 && desc.layers != 1) ||
         (desc.dimension == Dimension::Cube &&
          (desc.layers % 6 || desc.extent.width != desc.extent.height)))
@@ -403,6 +408,7 @@ class Submission;
 // Backend construction and commit hooks; consumers use references and traits.
 struct BackendAccess {
     static void Submitted(Submission& work);
+    static void Uncertain(Submission& work);
     static auto Storage(const TextureRef& value) -> const Arc<StorageState>& {
         return value.backend_state();
     }
@@ -433,10 +439,10 @@ inline auto validate_upload(const TextureUpload& upload) -> Result<UploadLayout,
         return Err(Error { ErrorKind::Invalid });
     auto& desc  = upload.target.texture().description();
     auto  range = upload.target.description().range;
-    if (! has(desc.usage, Usage::TransferDestination) || upload.mip >= desc.mip_levels ||
-        upload.layer >= desc.layers || upload.mip < range.first_mip ||
-        upload.mip - range.first_mip >= range.mip_count || upload.layer < range.first_layer ||
-        upload.layer - range.first_layer >= range.layer_count)
+    if (desc.samples != 1 || ! has(desc.usage, Usage::TransferDestination) ||
+        upload.mip >= desc.mip_levels || upload.layer >= desc.layers ||
+        upload.mip < range.first_mip || upload.mip - range.first_mip >= range.mip_count ||
+        upload.layer < range.first_layer || upload.layer - range.first_layer >= range.layer_count)
         return Err(Error { ErrorKind::Invalid });
     auto size = mip_extent(desc, upload.mip);
     if (! upload.width || ! upload.height || upload.x >= size.width || upload.y >= size.height ||
@@ -468,6 +474,40 @@ struct TextureAccess {
 inline bool writes(Access access) {
     return access == Access::ColorAttachment || access == Access::DepthAttachment ||
            access == Access::TransferDestination || access == Access::StorageWrite;
+}
+inline auto validate_access(const TextureAccess& use) -> Result<Range, Error> {
+    if (! use.view.valid() || ! use.view.permits(writes(use.access)) || ! Count(use.stages) ||
+        (Count(use.stages) & ~Count(Stages::All)) || (use.discard && ! writes(use.access)))
+        return Err(Error { ErrorKind::Invalid });
+    Usage required;
+    switch (use.access) {
+    case Access::Sampled: required = Usage::Sampled; break;
+    case Access::ColorAttachment: required = Usage::ColorAttachment; break;
+    case Access::DepthAttachment: required = Usage::DepthAttachment; break;
+    case Access::TransferSource: required = Usage::TransferSource; break;
+    case Access::TransferDestination: required = Usage::TransferDestination; break;
+    case Access::StorageRead:
+    case Access::StorageWrite: required = Usage::Storage; break;
+    default: return Err(Error { ErrorKind::Invalid });
+    }
+    if (! has(use.view.texture().description().usage, required) ||
+        ((use.access == Access::Sampled || use.access == Access::StorageRead ||
+          use.access == Access::StorageWrite) &&
+         (Count(use.stages) & ~Count(7))))
+        return Err(Error { ErrorKind::Invalid });
+    auto range = use.range.is_some() ? *use.range : use.view.description().range;
+    auto normalized =
+        normalize(use.view.texture().description(),
+                  { range.layer_count == 1 ? Dimension::D2 : Dimension::Array2D, range });
+    if (normalized.is_err()) return Err(normalized.unwrap_err());
+    range        = normalized.unwrap().range;
+    auto visible = use.view.description().range;
+    if (range.aspect != visible.aspect || range.first_mip < visible.first_mip ||
+        range.first_layer < visible.first_layer ||
+        range.first_mip + range.mip_count > visible.first_mip + visible.mip_count ||
+        range.first_layer + range.layer_count > visible.first_layer + visible.layer_count)
+        return Err(Error { ErrorKind::Invalid });
+    return Ok(range);
 }
 struct TextureDevice {
     using Trait                  = TextureDevice;
@@ -521,8 +561,16 @@ struct TextureCommands {
                                    &T::Backend, &T::Wait>;
 };
 struct SubmissionState {
-    bool submitted {};
+    enum class Status
+    {
+        Recording,
+        Submitted,
+        Cancelled,
+        Uncertain
+    };
+    Status status { Status::Recording };
 };
+using SubmissionStatus = SubmissionState::Status;
 class SubmissionReceipt {
     Arc<SubmissionState> state_;
     friend class Submission;
@@ -536,13 +584,22 @@ public:
     }
     SubmissionReceipt(SubmissionReceipt&&)                    = default;
     auto operator=(SubmissionReceipt&&) -> SubmissionReceipt& = default;
-    bool submitted() const { return bool(state_) && state_->submitted; }
+    auto status() const -> SubmissionStatus {
+        return state_ ? state_->status : SubmissionStatus::Cancelled;
+    }
+    bool submitted() const { return status() == SubmissionStatus::Submitted; }
+    bool cancelled() const { return status() == SubmissionStatus::Cancelled; }
+    bool uncertain() const { return status() == SubmissionStatus::Uncertain; }
 };
 class Submission {
     Box<dyn<TextureCommands>> commands_;
     Arc<SubmissionState>      state_;
     friend struct BackendAccess;
     bool valid_ { true };
+    void cancel() {
+        if (valid_ && state_ && state_->status == SubmissionStatus::Recording)
+            state_->status = SubmissionStatus::Cancelled;
+    }
 
 public:
     explicit Submission(Box<dyn<TextureCommands>> commands)
@@ -555,12 +612,14 @@ public:
           valid_(rstd::exchange(other.valid_, false)) {}
     auto operator=(Submission&& other) -> Submission& {
         if (this != &other) {
+            cancel();
             commands_ = rstd::move(other.commands_);
             state_    = rstd::move(other.state_);
             valid_    = rstd::exchange(other.valid_, false);
         }
         return *this;
     }
+    ~Submission() { cancel(); }
     bool valid() const { return valid_; }
     auto receipt() const -> SubmissionReceipt { return SubmissionReceipt(state_.clone()); }
     auto commands() -> mut_ref<dyn<TextureCommands>> { return commands_.deref_mut(); }
@@ -570,7 +629,12 @@ public:
         commands_->Retain(Box<dyn<rstd::any::Any>>::make(rstd::move(value)));
     }
 };
-inline void BackendAccess::Submitted(Submission& work) { work.state_->submitted = true; }
+inline void BackendAccess::Submitted(Submission& work) {
+    work.state_->status = SubmissionStatus::Submitted;
+}
+inline void BackendAccess::Uncertain(Submission& work) {
+    work.state_->status = SubmissionStatus::Uncertain;
+}
 struct SubmissionQueue {
     using Trait                  = SubmissionQueue;
     static constexpr bool direct = false;

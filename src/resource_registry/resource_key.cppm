@@ -44,6 +44,7 @@ struct PipelineResourceRequest {
     VkAttachmentLoadOp  color_load_op { VK_ATTACHMENT_LOAD_OP_DONT_CARE };
     VkAttachmentLoadOp  depth_load_op { VK_ATTACHMENT_LOAD_OP_DONT_CARE };
     VkAttachmentStoreOp depth_store_op { VK_ATTACHMENT_STORE_OP_STORE };
+    VkImageLayout       depth_initial_layout { VK_IMAGE_LAYOUT_UNDEFINED };
     VkImageLayout       depth_final_layout { VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
     bool                has_color_attachment { true };
     bool                has_depth_attachment { false };
@@ -496,6 +497,7 @@ inline RenderPassResourceDesc MakeRenderPassResourceDesc(const PipelineResourceR
         .color_final_layout     = request.color_final_layout,
         .color_load_op          = request.color_load_op,
         .resolve_final_layout   = request.color_final_layout,
+        .depth_initial_layout   = request.depth_initial_layout,
         .depth_final_layout     = request.depth_final_layout,
         .depth_load_op          = request.depth_load_op,
         .depth_store_op         = request.depth_store_op,
@@ -504,15 +506,19 @@ inline RenderPassResourceDesc MakeRenderPassResourceDesc(const PipelineResourceR
                                   request.multisample.rasterizationSamples != VK_SAMPLE_COUNT_1_BIT,
         .has_depth_attachment   = request.has_depth_attachment,
     };
-    if (request.color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) {
+    if (request.color_initial_layout == VK_IMAGE_LAYOUT_UNDEFINED &&
+        request.color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) {
         desc.color_initial_layout =
             request.multisample.rasterizationSamples != VK_SAMPLE_COUNT_1_BIT
                 ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
                 : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
-    if (request.depth_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) {
+    if (request.depth_initial_layout == VK_IMAGE_LAYOUT_UNDEFINED &&
+        request.depth_load_op == VK_ATTACHMENT_LOAD_OP_LOAD) {
         desc.depth_initial_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     }
+    if (request.color_initial_layout != VK_IMAGE_LAYOUT_UNDEFINED)
+        desc.resolve_initial_layout = request.color_initial_layout;
     return desc;
 }
 

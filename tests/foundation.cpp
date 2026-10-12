@@ -273,32 +273,6 @@ void CheckImageDataLifetime() {
 }
 
 void CheckPendingImageLifetime() {
-    Device             device;
-    ImageUploadManager uploads(device);
-    rstd_assert(uploads.init());
-    ImageSlots slots;
-    slots.slots.push(AllocatedImageParameters {});
-    auto allocation = rstd::sync::Arc<TextureAllocation>::make(rstd::move(slots));
-    auto weak       = allocation.downgrade();
-    rstd_assert(uploads.QueueTransparentClear(allocation.clone()).is_some());
-    allocation.reset();
-    rstd_assert(! weak.expired() && uploads.HasPendingUploads());
-    uploads.Trim();
-    rstd_assert(! weak.expired());
-    uploads.DiscardPendingUploads();
-    rstd_assert(weak.expired() && ! uploads.HasPendingUploads());
-    ImageSlots invalid_slots;
-    invalid_slots.slots.push(AllocatedImageParameters {});
-    auto  invalid      = rstd::sync::Arc<TextureAllocation>::make(rstd::move(invalid_slots));
-    auto  invalid_weak = invalid.downgrade();
-    Image image;
-    image.slots.push(Image::Slot {});
-    rstd_assert(uploads.QueueWrite(invalid.clone(), image).is_none());
-    invalid.reset();
-    rstd_assert(invalid_weak.expired() && ! uploads.HasPendingUploads());
-    uploads.DiscardPendingUploads();
-    uploads.destroy();
-
     RecordedBufferUploads  buffers;
     RecordedImageUploads   images;
     BufferUploadBatchLease buffer_lease;
@@ -316,27 +290,9 @@ void CheckPendingImageLifetime() {
 TEST(Foundation, Resources) {
     CheckImageDataLifetime();
     CheckPendingImageLifetime();
-    TextureKey key { .width        = i32(32),
-                     .height       = i32(16),
-                     .usage        = VK_IMAGE_USAGE_SAMPLED_BIT,
-                     .format       = TextureFormat::RGBA8,
-                     .sample       = {},
-                     .mipmap_level = 1,
-                     .samples      = VK_SAMPLE_COUNT_1_BIT };
-    auto       hash = TextureKey::HashValue(key);
-    rstd_assert(hash == TextureKey::HashValue(key));
-    auto changed                  = key;
-    changed.sample.compare_enable = true;
-    rstd_assert(hash != TextureKey::HashValue(changed));
-    changed                     = key;
-    changed.sample.border_color = TextureBorderColor::TransparentBlack;
-    rstd_assert(hash != TextureKey::HashValue(changed));
     rstd_assert(ToVkType(TextureFormat::D32F) == VK_FORMAT_D32_SFLOAT);
     rstd_assert(ToVkType(TextureFormat::RGBA8_SRGB) == VK_FORMAT_R8G8B8A8_SRGB);
     rstd_assert(ToVkType(TextureFormat::RGBA32F) == VK_FORMAT_R32G32B32A32_SFLOAT);
-    changed                  = key;
-    changed.sample.mipFilter = TextureMipmapFilter::Nearest;
-    rstd_assert(hash != TextureKey::HashValue(changed));
     resource::TextureDefinition original, mip_filtered;
     mip_filtered.sample.mipFilter = TextureMipmapFilter::None;
     rstd_assert(! (original == mip_filtered));

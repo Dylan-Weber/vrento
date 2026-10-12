@@ -22,19 +22,19 @@ using namespace rstd::prelude;
 using namespace rstd::literals;
 
 struct PreparedTexture {
-    resource::TextureUseHandle     use;
-    resource::TextureHandle        resource;
-    resource::TextureRequest       request;
-    Arc<vulkan::TextureAllocation> physical;
-    vulkan::ImageSlotsRef          image;
-    u64                            physical_generation { 0 };
-    resource::ReadyToken           ready;
+    resource::TextureUseHandle use;
+    resource::TextureHandle    resource;
+    resource::TextureRequest   request;
+    Arc<TextureAllocation>     physical;
+    vulkan::ImageSlotsRef      image;
+    u64                        physical_generation { 0 };
+    texture::SubmissionToken   completion;
 };
 
 struct PreparedTextureLease {
-    resource::TextureHandle        resource;
-    Arc<vulkan::TextureAllocation> physical;
-    u64                            physical_generation { 0 };
+    resource::TextureHandle resource;
+    Arc<TextureAllocation>  physical;
+    u64                     physical_generation { 0 };
 };
 
 struct PreparedBufferUse {
@@ -333,7 +333,7 @@ public:
                 .physical            = texture.physical.clone(),
                 .image               = texture.image,
                 .physical_generation = texture.physical_generation,
-                .ready               = texture.ready,
+                .completion          = texture.completion,
             });
         }
 
@@ -561,11 +561,11 @@ private:
 
 class ResourcePrepareService {
 public:
-    ResourcePrepareService(resource::TextureRegistry&                        textures,
-                           Option<mut_ref<dyn<vulkan::ImagePrepareBackend>>> textures_backend,
-                           BufferRegistry&                                   buffers,
-                           mut_ref<dyn<vulkan::BufferBackend>>               buffer_backend,
-                           ShaderRegistry&                                   shaders)
+    ResourcePrepareService(resource::TextureRegistry&                  textures,
+                           Option<mut_ref<dyn<TexturePrepareBackend>>> textures_backend,
+                           BufferRegistry&                             buffers,
+                           mut_ref<dyn<vulkan::BufferBackend>>         buffer_backend,
+                           ShaderRegistry&                             shaders)
         : m_textures(textures),
           m_textures_backend(textures_backend),
           m_buffers(buffers),
@@ -846,16 +846,10 @@ public:
                 auto playback = session.m_pending[item.index].playback.is_some()
                                     ? Some(session.m_pending[item.index].playback->clone())
                                     : None<Arc<rstd::dyn<VideoPlayback>>>();
-                auto created  = (*m_textures_backend)
-                                    ->CreateImportedTexture(image.deref(), rstd::move(playback));
-                if (created.is_none()) {
-                    return Err(resource::ResourceError {
-                        .kind    = resource::ResourceErrorKind::BackendFailure,
-                        .message = rstd::format("create imported texture {} failed",
-                                                session.m_pending[item.index].key.as_str()),
-                    });
-                }
-                auto prepared   = rstd::move(*created);
+                auto created = (*m_textures_backend)
+                                   ->CreateImportedTexture(rstd::move(image), rstd::move(playback));
+                if (created.is_err()) return Err(rstd::move(created).unwrap_err_unchecked());
+                auto prepared   = rstd::move(created).unwrap_unchecked();
                 auto allocation = rstd::move(prepared.allocation);
                 for (auto& use : session.m_pending[item.index].uses) {
                     auto published = PublishPrepared(use.use,
@@ -919,7 +913,7 @@ private:
     }
 
     auto AllocateTexture(const resource::TextureRequest& request)
-        -> Result<Arc<vulkan::TextureAllocation>, resource::ResourceError> {
+        -> Result<Arc<TextureAllocation>, resource::ResourceError> {
         if (m_textures_backend.is_none()) {
             return Err(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::BackendFailure,
@@ -932,18 +926,13 @@ private:
                 .message = rstd::format("texture definition {} unavailable", request.name.as_str()),
             });
         }
-        auto image = (*m_textures_backend)->AllocateTexture(ToTextureKey(*request.definition));
-        if (image.is_none()) {
-            return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::BackendFailure,
-                .message = rstd::format("create texture {} failed", request.name.as_str()),
-            });
-        }
-        return Ok(rstd::move(*image));
+        auto image = (*m_textures_backend)->AllocateTexture(*request.definition, false);
+        if (image.is_err()) return Err(rstd::move(image).unwrap_err_unchecked());
+        return Ok(rstd::move(image).unwrap_unchecked().allocation);
     }
 
     auto AllocateTransparentTexture(const resource::TextureRequest& request)
-        -> Result<vulkan::PreparedImageAllocation, resource::ResourceError> {
+        -> Result<PreparedImageAllocation, resource::ResourceError> {
         if (m_textures_backend.is_none()) {
             return Err(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::BackendFailure,
@@ -956,31 +945,17 @@ private:
                 .message = rstd::format("texture definition {} unavailable", request.name.as_str()),
             });
         }
-        auto image =
-            (*m_textures_backend)->AllocateTransparentTexture(ToTextureKey(*request.definition));
-        if (image.is_none()) {
-            return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::BackendFailure,
-                .message = rstd::format("initialize texture {} failed", request.name.as_str()),
-            });
-        }
-        return Ok(rstd::move(*image));
+        return (*m_textures_backend)->AllocateTexture(*request.definition, true);
     }
 
     auto PublishPrepared(resource::TextureUseHandle use, resource::TextureHandle handle,
-                         resource::TextureRequest          request,
-                         Arc<vulkan::TextureAllocation>    allocation,
+                         resource::TextureRequest request, Arc<TextureAllocation> allocation,
                          Option<vulkan::ImageUploadTicket> upload, PreparedResourceTable& table)
         -> Result<empty, resource::ResourceError> {
         auto physical = m_textures.ResolveCurrent(handle);
         if (physical.is_none()) {
             auto prepared_allocation = allocation.clone();
-            auto view                = allocation->View();
-            auto ready               = resource::ReadyToken {};
-            if (upload.is_none()) {
-                ready.value = view.slots.is_empty() ? u64(1) : u64(view.getActive().generation);
-            }
-            auto published = m_textures.Publish(handle, rstd::move(allocation), ready, upload);
+            auto published           = m_textures.Publish(handle, rstd::move(allocation), upload);
             if (published.is_none()) {
                 return Err(resource::ResourceError {
                     .kind    = resource::ResourceErrorKind::BackendFailure,
@@ -993,7 +968,6 @@ private:
                                       rstd::move(request),
                                       rstd::move(prepared_allocation),
                                       *published,
-                                      ready,
                                       table);
             }
             physical = m_textures.ResolveCurrent(handle);
@@ -1017,16 +991,15 @@ private:
                               rstd::move(request),
                               physical.allocation.clone(),
                               physical.generation,
-                              physical.ready,
                               table);
     }
 
     static auto InsertPrepared(resource::TextureUseHandle use, resource::TextureHandle handle,
-                               resource::TextureRequest       request,
-                               Arc<vulkan::TextureAllocation> allocation, u64 physical_generation,
-                               resource::ReadyToken ready, PreparedResourceTable& table)
+                               resource::TextureRequest request, Arc<TextureAllocation> allocation,
+                               u64 physical_generation, PreparedResourceTable& table)
         -> Result<empty, resource::ResourceError> {
-        auto image = allocation->View();
+        auto image      = allocation->View();
+        auto completion = allocation->Completion();
         if (! table.Insert(PreparedTexture {
                 .use                 = use,
                 .resource            = handle,
@@ -1034,7 +1007,7 @@ private:
                 .physical            = rstd::move(allocation),
                 .image               = rstd::move(image),
                 .physical_generation = physical_generation,
-                .ready               = ready,
+                .completion          = completion,
             })) {
             return Err(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::BackendFailure,
@@ -1044,50 +1017,11 @@ private:
         return Ok(empty {});
     }
 
-    static auto ToTextureKey(const resource::TextureDefinition& definition) -> vulkan::TextureKey {
-        return vulkan::TextureKey {
-            .width        = definition.width,
-            .height       = definition.height,
-            .usage        = ToVkImageUsage(definition.usage),
-            .format       = definition.format,
-            .sample       = definition.sample,
-            .mipmap_level = definition.mip_levels.to_primitive(),
-            .samples      = TextureSampleCount(definition.samples),
-        };
-    }
-
-    static auto ToVkImageUsage(resource::TextureUsage usage) -> VkImageUsageFlags {
-        VkImageUsageFlags flags {};
-        if (resource::HasTextureUsage(usage, resource::TextureUsage::Sampled))
-            flags |= VK_IMAGE_USAGE_SAMPLED_BIT;
-        if (resource::HasTextureUsage(usage, resource::TextureUsage::ColorAttachment))
-            flags |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        if (resource::HasTextureUsage(usage, resource::TextureUsage::DepthAttachment))
-            flags |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-        if (resource::HasTextureUsage(usage, resource::TextureUsage::TransferSource))
-            flags |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        if (resource::HasTextureUsage(usage, resource::TextureUsage::TransferDestination))
-            flags |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        return flags;
-    }
-
-    static auto TextureSampleCount(u32 sample_count) -> VkSampleCountFlagBits {
-        switch (sample_count.to_primitive()) {
-        case 2: return VK_SAMPLE_COUNT_2_BIT;
-        case 4: return VK_SAMPLE_COUNT_4_BIT;
-        case 8: return VK_SAMPLE_COUNT_8_BIT;
-        case 16: return VK_SAMPLE_COUNT_16_BIT;
-        case 32: return VK_SAMPLE_COUNT_32_BIT;
-        case 64: return VK_SAMPLE_COUNT_64_BIT;
-        default: return VK_SAMPLE_COUNT_1_BIT;
-        }
-    }
-
-    resource::TextureRegistry&                        m_textures;
-    Option<mut_ref<dyn<vulkan::ImagePrepareBackend>>> m_textures_backend;
-    BufferRegistry&                                   m_buffers;
-    mut_ref<dyn<vulkan::BufferBackend>>               m_buffer_backend;
-    ShaderRegistry&                                   m_shaders;
+    resource::TextureRegistry&                  m_textures;
+    Option<mut_ref<dyn<TexturePrepareBackend>>> m_textures_backend;
+    BufferRegistry&                             m_buffers;
+    mut_ref<dyn<vulkan::BufferBackend>>         m_buffer_backend;
+    ShaderRegistry&                             m_shaders;
 };
 
 inline auto ResourcePlanPrepareVisitor::VisitTexture(const resource::TexturePlanEntry& entry)

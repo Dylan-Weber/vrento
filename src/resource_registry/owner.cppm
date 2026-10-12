@@ -7,7 +7,6 @@ import :resource_registry.buffer_registry;
 import :resource_registry.shader_registry;
 import :resource_registry.descriptor;
 import :resource_registry.lifetime;
-import :resource_registry.state;
 import :resource_registry.policy;
 import :resource_registry.external;
 import :resource_registry.graphics;
@@ -19,29 +18,36 @@ using namespace rstd::prelude;
 
 class ResourceRegistries {
 public:
-    ResourceRegistries()                                     = default;
+    ResourceRegistries() = default;
+    ~ResourceRegistries() { Reset(); }
     ResourceRegistries(const ResourceRegistries&)            = delete;
     ResourceRegistries& operator=(const ResourceRegistries&) = delete;
     ResourceRegistries(ResourceRegistries&&)                 = delete;
     ResourceRegistries& operator=(ResourceRegistries&&)      = delete;
 
-    bool Initialize(const vulkan::Device& device) {
-        if (Ready()) return true;
+    bool Initialize(vulkan::DeviceSession session) {
+        if (! session.valid() || session.lost()) return false;
+        if (Ready()) return Textures().Context().session().epoch() == session.epoch();
 
-        auto buffer_manager = Box<vulkan::BufferManager>::make(device);
-        if (! buffer_manager.get()->init()) return false;
-        auto image_uploads = Box<vulkan::ImageUploadManager>::make(device);
-        if (! image_uploads.get()->init()) return false;
+        auto texture_context = vulkan::TextureContext::create(session);
+        if (texture_context.is_err()) return false;
+        auto buffer_manager = rstd::sync::Arc<RegistryBufferOwner>::make(session);
+        if (! buffer_manager->manager.init()) return false;
 
-        m_textures       = Some(Box<vulkan::TextureCache>::make(device));
+        m_textures =
+            Some(Box<RegistryTextureContext>::make(rstd::move(texture_context).unwrap_unchecked()));
         m_buffer_manager = Some(rstd::move(buffer_manager));
-        m_image_uploads  = Some(rstd::move(image_uploads));
+        Textures().SetUploadPublisher(
+            dyn<TextureUploadPublisher>::from_ref(m_texture_entries).as_mut_ref());
         return true;
     }
 
     void Reset() {
-        m_submissions.Reset();
-        m_uploads.Reset();
+        if (m_textures.is_some()) {
+            (void)Textures().DrainProducers(u64(5'000'000'000));
+            (void)Textures().Context().session().wait_idle();
+            (void)Textures().Poll();
+        }
         m_pipeline_cache.Reset();
         m_framebuffer_cache.Reset();
         m_descriptor_system.Reset();
@@ -50,33 +56,24 @@ public:
         m_render_pass_cache.Reset();
         m_buffer_entries.Reset();
         m_texture_entries.Reset();
-        if (m_buffer_manager.is_some()) m_buffer_manager->get()->destroy();
-        if (m_image_uploads.is_some()) m_image_uploads->get()->destroy();
-        m_buffer_manager = None();
-        m_image_uploads  = None();
         m_textures       = None();
+        m_buffer_manager = None();
         m_shader_entries.Reset();
-        m_states.Reset();
         m_memory.Reset();
         m_pipeline_diagnostics.Reset();
         m_framebuffer_diagnostics.Reset();
     }
 
-    bool Ready() const noexcept {
-        return m_textures.is_some() && m_buffer_manager.is_some() && m_image_uploads.is_some();
-    }
+    bool Ready() const noexcept { return m_textures.is_some() && m_buffer_manager.is_some(); }
 
-    auto Textures() -> vulkan::TextureCache& { return *m_textures->get(); }
-    auto Textures() const -> const vulkan::TextureCache& {
+    auto Textures() -> RegistryTextureContext& { return *m_textures->get(); }
+    auto Textures() const -> const RegistryTextureContext& {
         return *m_textures->as_ptr().as_raw_ptr();
     }
-    auto BufferManager() -> vulkan::BufferManager& { return *m_buffer_manager->get(); }
+    auto BufferOwner() -> rstd::sync::Arc<RegistryBufferOwner> { return m_buffer_manager->clone(); }
+    auto BufferManager() -> vulkan::BufferManager& { return (*m_buffer_manager)->manager; }
     auto BufferManager() const -> const vulkan::BufferManager& {
-        return *m_buffer_manager->as_ptr().as_raw_ptr();
-    }
-    auto ImageUploads() -> vulkan::ImageUploadManager& { return *m_image_uploads->get(); }
-    auto ImageUploads() const -> const vulkan::ImageUploadManager& {
-        return *m_image_uploads->as_ptr().as_raw_ptr();
+        return (*m_buffer_manager)->manager;
     }
 
     auto TextureEntries() -> resource::TextureRegistry& { return m_texture_entries; }
@@ -85,9 +82,6 @@ public:
     auto DescriptorLayouts() -> DescriptorLayoutRegistry& { return m_descriptor_layouts; }
     auto PipelineLayouts() -> PipelineLayoutRegistry& { return m_pipeline_layouts; }
     auto Descriptors() -> DescriptorSystem& { return m_descriptor_system; }
-    auto Uploads() -> UploadScheduler& { return m_uploads; }
-    auto Submissions() -> SubmissionTracker& { return m_submissions; }
-    auto States() -> ResourceStateTracker& { return m_states; }
     auto Memory() -> MemoryBudgetPolicy& { return m_memory; }
     auto External() -> ExternalResourceBridge& { return m_external; }
     auto Pipelines() -> PipelineRegistry& { return m_pipeline_cache; }
@@ -102,25 +96,21 @@ public:
     }
 
 private:
-    Option<Box<vulkan::TextureCache>>       m_textures;
-    Option<Box<vulkan::BufferManager>>      m_buffer_manager;
-    Option<Box<vulkan::ImageUploadManager>> m_image_uploads;
-    resource::TextureRegistry               m_texture_entries;
-    BufferRegistry                          m_buffer_entries;
-    ShaderRegistry                          m_shader_entries;
-    DescriptorLayoutRegistry                m_descriptor_layouts;
-    PipelineLayoutRegistry                  m_pipeline_layouts;
-    DescriptorSystem                        m_descriptor_system;
-    UploadScheduler                         m_uploads;
-    SubmissionTracker                       m_submissions;
-    ResourceStateTracker                    m_states;
-    MemoryBudgetPolicy                      m_memory;
-    ExternalResourceBridge                  m_external;
-    PipelineRegistry                        m_pipeline_cache;
-    RenderPassRegistry                      m_render_pass_cache;
-    FramebufferRegistry                     m_framebuffer_cache;
-    PipelineCacheDiagnostics                m_pipeline_diagnostics;
-    FramebufferCacheDiagnostics             m_framebuffer_diagnostics;
+    Option<Box<RegistryTextureContext>>          m_textures;
+    Option<rstd::sync::Arc<RegistryBufferOwner>> m_buffer_manager;
+    resource::TextureRegistry                    m_texture_entries;
+    BufferRegistry                               m_buffer_entries;
+    ShaderRegistry                               m_shader_entries;
+    DescriptorLayoutRegistry                     m_descriptor_layouts;
+    PipelineLayoutRegistry                       m_pipeline_layouts;
+    DescriptorSystem                             m_descriptor_system;
+    MemoryBudgetPolicy                           m_memory;
+    ExternalResourceBridge                       m_external;
+    PipelineRegistry                             m_pipeline_cache;
+    RenderPassRegistry                           m_render_pass_cache;
+    FramebufferRegistry                          m_framebuffer_cache;
+    PipelineCacheDiagnostics                     m_pipeline_diagnostics;
+    FramebufferCacheDiagnostics                  m_framebuffer_diagnostics;
 };
 
 } // namespace vrento::resource_registry
