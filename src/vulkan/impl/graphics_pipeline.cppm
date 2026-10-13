@@ -193,7 +193,7 @@ GraphicsPipeline& GraphicsPipeline::setSampleCount(VkSampleCountFlagBits s) {
 }
 
 bool GraphicsPipeline::create(const Device& device, VkRenderPass pass, VkPipelineLayout layout,
-                              PipelineParameters& pipeline) {
+                              PipelineParameters& pipeline, VkPipelineCache cache) {
     VkPipelineDynamicStateCreateInfo dynamic_info {
         .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
         .pNext             = nullptr,
@@ -219,7 +219,8 @@ bool GraphicsPipeline::create(const Device& device, VkRenderPass pass, VkPipelin
         if (auto opt = CreateShaderModule(device.handle(), *spv); opt.is_some()) {
             shader_modules.push(rstd::move(opt).unwrap());
             info.module = *shader_modules.last().unwrap().get();
-        }
+        } else
+            return false;
 
         shaderStages.push(rstd::move(info));
     }
@@ -268,6 +269,6 @@ bool GraphicsPipeline::create(const Device& device, VkRenderPass pass, VkPipelin
         .renderPass          = pass,
         .subpass             = m_subpass,
     };
-    VVK_CHECK_BOOL_RE(device.handle().CreateGraphicsPipeline(create, pipeline.handle));
+    VVK_CHECK_BOOL_RE(device.handle().CreateGraphicsPipeline(create, pipeline.handle, cache));
     return true;
 }

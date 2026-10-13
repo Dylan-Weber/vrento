@@ -465,6 +465,8 @@ private:
 struct QueueParameters {
     vvk::Queue     handle;
     rstd::uint32_t family_index;
+    VkQueueFlags   flags {};
+    rstd::uint32_t queue_index {};
 };
 
 struct AllocatedBufferParameters {
@@ -530,12 +532,12 @@ struct ImageSlotsRef {
     Vec<ImageParameters> slots;
 
     rstd::ptrdiff_t active { 0 };
-
-    auto& getActive() const {
-        if (active > 0 && active >= static_cast<rstd::ptrdiff_t>(slots.len().to_primitive()))
-            return slots[usize()];
-        return slots[usize(active)];
+    auto            active_slot() const -> usize {
+        return active < 0 || active >= static_cast<rstd::ptrdiff_t>(slots.len().to_primitive())
+                   ? usize()
+                   : usize(active);
     }
+    auto& getActive() const { return slots[active_slot()]; }
     ImageSlotsRef();
     ~ImageSlotsRef();
     ImageSlotsRef(const ImageSlotsRef& other): slots(other.slots.clone()), active(other.active) {}
@@ -736,6 +738,7 @@ public:
     void Destroy();
 
     const auto& graphics_queue() const { return m_graphics_queue; }
+    auto        queues() const -> slice<QueueParameters> { return m_queues.as_slice(); }
     const auto& present_queue() const { return m_present_queue; }
     const auto& device() const { return m_device; }
     const auto& handle() const { return m_device; }
@@ -793,8 +796,9 @@ private:
 
     vvk::CommandPool m_command_pool;
 
-    QueueParameters m_graphics_queue;
-    QueueParameters m_present_queue;
+    QueueParameters      m_graphics_queue;
+    QueueParameters      m_present_queue;
+    Vec<QueueParameters> m_queues;
 
     VkExtent2D m_extent { 1, 1 };
 };
@@ -825,6 +829,7 @@ inline bool CreateStagingBuffer(const vvk::MemoryAllocator& allocator, VkDeviceS
 
 // ---------- BufferManager.hpp ----------
 
+enum class BufferUploadClass;
 class BufferAllocation {
 public:
     BufferAllocation();
@@ -838,9 +843,13 @@ public:
 
     explicit operator bool() const noexcept;
 
-    VkBuffer     buffer() const noexcept;
-    VkDeviceSize offset() const noexcept;
-    VkDeviceSize size() const noexcept;
+    VkBuffer       buffer() const noexcept;
+    VkDeviceSize   offset() const noexcept;
+    VkDeviceSize   size() const noexcept;
+    rstd::uint64_t identity() const noexcept;
+    VkDevice       device() const noexcept;
+    auto           usage() const noexcept -> BufferUploadClass;
+    auto           clone() const -> BufferAllocation;
 
 private:
     struct State;
@@ -876,6 +885,10 @@ struct BufferUploadTicket {
 
 class BufferManager;
 
+struct BufferUploadWrite {
+    BufferAllocation allocation;
+    VkDeviceSize     offset {}, size {};
+};
 class RecordedBufferUploads {
 public:
     RecordedBufferUploads(const RecordedBufferUploads&)            = delete;
@@ -887,6 +900,7 @@ public:
     RecordedBufferUploads& operator=(RecordedBufferUploads&&) noexcept;
 
     bool Valid() const noexcept;
+    auto Writes() const -> Vec<BufferUploadWrite>;
 
 private:
     struct State;
@@ -920,6 +934,11 @@ private:
     Option<Arc<RecordedBufferUploads::State>> m_state;
 };
 
+struct BufferUploadStatistics {
+    rstd::uint64_t queued_copies[5] {}, queued_bytes[5] {};
+    rstd::uint64_t recorded_copies[5] {}, recorded_bytes[5] {};
+};
+
 class BufferManager {
 public:
     BufferManager(const BufferManager&)            = delete;
@@ -937,6 +956,9 @@ public:
                                           VkDeviceSize destination_offset = 0);
 
     bool HasPendingUploads() const noexcept;
+    auto statistics() const -> BufferUploadStatistics;
+    bool PreparePendingUploads(RecordedBufferUploads& prepared);
+    bool RecordUploads(vvk::CommandBuffer& cmd, RecordedBufferUploads& prepared);
     bool RecordPendingUploads(vvk::CommandBuffer& cmd, RecordedBufferUploads& recorded);
     Option<BufferUploadBatchLease> CommitRecordedUploads(RecordedBufferUploads&& recorded);
     bool                           RestoreUploads(BufferUploadBatchLease uploads);
@@ -1007,7 +1029,8 @@ public:
     ~GraphicsPipeline();
 
     void toDefault();
-    bool create(const Device&, VkRenderPass, VkPipelineLayout, PipelineParameters&);
+    bool create(const Device&, VkRenderPass, VkPipelineLayout, PipelineParameters&,
+                VkPipelineCache cache = VK_NULL_HANDLE);
 
     VkPipelineMultisampleStateCreateInfo   multisample {};
     VkPipelineRasterizationStateCreateInfo raster {};
@@ -1195,10 +1218,8 @@ private:
         }
         m_surface_pending  = false;
         m_pending_identity = {};
-        if (acquire_sync_fd >= 0) {
-            int old = m_last_sync_fd.exchange(acquire_sync_fd, Ordering::AcqRel);
-            if (old >= 0) ::close(old);
-        }
+        int old            = m_last_sync_fd.exchange(acquire_sync_fd, Ordering::AcqRel);
+        if (old >= 0) ::close(old);
         this->renderFrame();
         return { .status   = ::vrento::FrameSurfaceCompletionStatus::Submitted,
                  .identity = identity };

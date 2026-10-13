@@ -48,6 +48,42 @@ struct PipelineResourceRequest {
     VkImageLayout       depth_final_layout { VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
     bool                has_color_attachment { true };
     bool                has_depth_attachment { false };
+    auto                clone() const -> PipelineResourceRequest {
+        PipelineResourceRequest result {
+            .pipeline_layout          = pipeline_layout,
+            .vertex_bindings          = vertex_bindings.clone(),
+            .vertex_attrs             = vertex_attrs.clone(),
+            .color_blend              = color_blend,
+            .color_blend_flags        = color_blend_flags,
+            .blend_constants          = blend_constants,
+            .depth                    = depth,
+            .raster                   = raster,
+            .depth_clip               = depth_clip,
+            .multisample              = multisample,
+            .create_flags             = create_flags,
+            .topology                 = topology,
+            .subpass                  = subpass,
+            .primitive_restart_enable = primitive_restart_enable,
+            .viewport_count           = viewport_count,
+            .scissor_count            = scissor_count,
+            .logic_op_enable          = logic_op_enable,
+            .logic_op                 = logic_op,
+            .dynamic_states           = dynamic_states.clone(),
+            .color_format             = color_format,
+            .color_initial_layout     = color_initial_layout,
+            .color_final_layout       = color_final_layout,
+            .color_load_op            = color_load_op,
+            .depth_load_op            = depth_load_op,
+            .depth_store_op           = depth_store_op,
+            .depth_initial_layout     = depth_initial_layout,
+            .depth_final_layout       = depth_final_layout,
+            .has_color_attachment     = has_color_attachment,
+            .has_depth_attachment     = has_depth_attachment,
+        };
+        for (const auto& stage : shader_stages)
+            result.shader_stages.push(Box<ShaderSpv>::make(stage->clone()));
+        return result;
+    }
 };
 
 struct PipelineCacheKey {
@@ -171,6 +207,32 @@ struct PipelineResourceDesc {
         rstd::array<VkDynamicState, 2> { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR }
             .as_slice());
     RenderPassResourceDesc render_pass;
+    auto                   clone() const -> PipelineResourceDesc {
+        PipelineResourceDesc result {
+            .pipeline_layout          = pipeline_layout,
+            .vertex_bindings          = vertex_bindings.clone(),
+            .vertex_attrs             = vertex_attrs.clone(),
+            .color_blend              = color_blend,
+            .color_blend_flags        = color_blend_flags,
+            .blend_constants          = blend_constants,
+            .depth                    = depth,
+            .raster                   = raster,
+            .depth_clip               = depth_clip,
+            .multisample              = multisample,
+            .create_flags             = create_flags,
+            .topology                 = topology,
+            .subpass                  = subpass,
+            .primitive_restart_enable = primitive_restart_enable,
+            .viewport_count           = viewport_count,
+            .scissor_count            = scissor_count,
+            .logic_op_enable          = logic_op_enable,
+            .logic_op                 = logic_op,
+            .dynamic_states           = dynamic_states.clone(),
+            .render_pass              = render_pass,
+        };
+        for (const auto& stage : shader_stages) result.shader_stages.push(stage.clone());
+        return result;
+    }
 };
 
 struct FramebufferResourceDesc {
@@ -620,12 +682,11 @@ inline FramebufferAttachmentIdentity ToFramebufferAttachmentIdentity(CanonicalCa
 
 inline RenderPassCacheKey MakeRenderPassCacheKey(const RenderPassResourceDesc& desc);
 
-inline PipelineCacheKey MakePipelineCacheKey(const PipelineResourceDesc& desc) {
+inline PipelineCacheKey MakePipelineStateKey(const PipelineResourceDesc& desc) {
     PipelineKeyWriter writer;
-    writer.writeString("pipeline-v2"_str);
+    writer.writeString("pipeline-state-v1"_str);
     writer.writeU32(desc.create_flags);
     writer.writeU32(desc.subpass);
-    WriteCacheKey(writer, MakeRenderPassCacheKey(desc.render_pass));
     WritePipelineShaderStages(writer, desc.shader_stages.as_slice());
     writer.writeU64(desc.pipeline_layout.index.to_primitive());
     writer.writeU64(desc.pipeline_layout.generation.to_primitive());
@@ -640,6 +701,25 @@ inline PipelineCacheKey MakePipelineCacheKey(const PipelineResourceDesc& desc) {
     WritePipelineMultisample(writer, desc.multisample);
     WritePipelineDynamicStates(writer, desc.dynamic_states.as_slice());
     return ToPipelineCacheKey(rstd::move(writer).finish());
+}
+
+inline PipelineCacheKey MakePipelineVariantKey(const PipelineCacheKey&       state,
+                                               const RenderPassResourceDesc& render_pass) {
+    PipelineKeyWriter writer;
+    writer.writeString("pipeline-v4"_str);
+    writer.writeU64(static_cast<rstd::uint64_t>(state.value));
+    writer.writeBytes(state.bytes.as_slice());
+    writer.writeBool(render_pass.has_color_attachment);
+    if (render_pass.has_color_attachment) WritePipelineScalar(writer, render_pass.color_format);
+    writer.writeBool(render_pass.has_depth_attachment);
+    if (render_pass.has_depth_attachment) WritePipelineScalar(writer, render_pass.depth_format);
+    writer.writeBool(render_pass.has_resolve_attachment);
+    WritePipelineScalar(writer, render_pass.samples);
+    return ToPipelineCacheKey(rstd::move(writer).finish());
+}
+
+inline PipelineCacheKey MakePipelineCacheKey(const PipelineResourceDesc& desc) {
+    return MakePipelineVariantKey(MakePipelineStateKey(desc), desc.render_pass);
 }
 
 inline PipelineCacheKey MakePipelineCacheKey(const PipelineResourceRequest& request) {

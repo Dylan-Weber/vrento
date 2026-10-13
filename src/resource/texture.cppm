@@ -3,10 +3,10 @@ import rstd;
 import :types.texture;
 import :resource.handle;
 
+using namespace rstd::prelude;
+
 export namespace vrento::resource
 {
-
-using namespace rstd::prelude;
 
 struct TextureDefinitionId {
     u32 index { u32::MAX };
@@ -114,8 +114,8 @@ struct TextureDefinition {
                lhs.sample.compare_enable == rhs.sample.compare_enable &&
                lhs.sample.compare_op == rhs.sample.compare_op &&
                lhs.sample.border_color == rhs.sample.border_color &&
-               lhs.sample.mipFilter == rhs.sample.mipFilter &&
-               lhs.mip_levels == rhs.mip_levels && lhs.samples == rhs.samples;
+               lhs.sample.mipFilter == rhs.sample.mipFilter && lhs.mip_levels == rhs.mip_levels &&
+               lhs.samples == rhs.samples;
     }
 };
 
@@ -208,5 +208,7 @@ inline bool SetTextureRequestIfChanged(Option<TextureRequest>& target,
 inline bool SetTextureRequestIfChanged(Option<TextureRequest>& target, TextureRequest request) {
     return SetTextureRequestIfChanged(target, Some(rstd::move(request)));
 }
+
+using TextureResourceRef = ResourceReference<TextureRequest, TextureResourceTag>;
 
 } // namespace vrento::resource

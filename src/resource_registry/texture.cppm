@@ -32,6 +32,16 @@ struct TextureProducer {
     using Funcs = TraitFuncs<&T::Pump>;
 };
 
+enum class ImageReadiness
+{
+    Allocated,
+    Pending,
+    Recorded,
+    Submitted,
+    Complete,
+    Uncertain
+};
+
 class TextureAllocation {
 public:
     explicit TextureAllocation(Vec<TextureSlot> slots, vulkan::ImageSlotsRef native,
@@ -61,7 +71,34 @@ public:
         return m_completion;
     }
     auto UploadCompletion() const -> texture::SubmissionToken { return m_completion; }
+    void MarkPending() { m_pending = true; }
+    void MarkRecording(const texture::SubmissionReceipt& receipt) {
+        if (m_pending) {
+            m_receipt  = Some(texture::SubmissionReceipt(receipt));
+            m_recorded = false;
+        }
+    }
+    void MarkRecorded() {
+        if (m_pending) m_recorded = true;
+    }
+    auto InitialReadiness(Option<texture::SubmissionReceipt> work = None()) const
+        -> Result<ImageReadiness, texture::Error> {
+        if (m_receipt && m_receipt->uncertain()) return Ok(ImageReadiness::Uncertain);
+        if (m_pending) {
+            if (m_recorded && m_receipt && m_receipt->submitted())
+                return Ok(ImageReadiness::Submitted);
+            if (m_recorded && m_receipt && ! m_receipt->submitted() && ! m_receipt->cancelled() &&
+                work && m_receipt->same(*work))
+                return Ok(ImageReadiness::Recorded);
+            return Ok(ImageReadiness::Pending);
+        }
+        if (! m_completion.valid()) return Ok(ImageReadiness::Allocated);
+        auto polled = m_completion.poll();
+        if (polled.is_err()) return Err(polled.unwrap_err());
+        return Ok(polled.unwrap() ? ImageReadiness::Complete : ImageReadiness::Submitted);
+    }
     void MarkSubmitted(texture::SubmissionToken completion) {
+        m_pending    = false;
         m_completion = rstd::move(completion);
     }
     auto Pump(vulkan::TextureContext& context, double seconds) -> Result<empty, texture::Error> {
@@ -69,10 +106,118 @@ public:
     }
 
 private:
-    Vec<TextureSlot>                  m_slots;
-    vulkan::ImageSlotsRef             m_native;
-    Option<Arc<dyn<TextureProducer>>> m_producer;
-    texture::SubmissionToken          m_completion;
+    Vec<TextureSlot>                   m_slots;
+    vulkan::ImageSlotsRef              m_native;
+    Option<Arc<dyn<TextureProducer>>>  m_producer;
+    texture::SubmissionToken           m_completion;
+    bool                               m_pending {}, m_recorded {};
+    Option<texture::SubmissionReceipt> m_receipt;
+};
+
+struct TextureUpdateState {
+    Option<texture::SubmissionReceipt> receipt;
+    bool                               recorded {};
+};
+struct PreparedTextureUpdate {
+    Arc<TextureAllocation>      allocation;
+    Vec<texture::TextureUpload> uploads;
+    bool                        transparent {}, sampled {};
+    Arc<TextureUpdateState>     state { Arc<TextureUpdateState>::make() };
+    auto                        Readiness(Option<texture::SubmissionReceipt> work = None()) const
+        -> Result<ImageReadiness, texture::Error> {
+        if (! state->receipt || state->receipt->cancelled()) return Ok(ImageReadiness::Pending);
+        if (state->receipt->uncertain()) return Ok(ImageReadiness::Uncertain);
+        if (! state->receipt->submitted())
+            return Ok(state->recorded && work && state->receipt->same(*work)
+                          ? ImageReadiness::Recorded
+                          : ImageReadiness::Pending);
+        if (! state->recorded) return Err(texture::Error { texture::ErrorKind::Invalid });
+        bool complete = true;
+        for (usize slot {}; slot < allocation->Slots().len(); ++slot) {
+            auto token = allocation->Completion(slot);
+            if (! token.valid()) return Err(texture::Error { texture::ErrorKind::Invalid });
+            auto polled = token.poll();
+            if (polled.is_err()) return Err(polled.unwrap_err());
+            complete &= polled.unwrap();
+        }
+        return Ok(complete ? ImageReadiness::Complete : ImageReadiness::Submitted);
+    }
+    auto clone() const -> PreparedTextureUpdate {
+        Vec<texture::TextureUpload> copy;
+        for (const auto& upload : uploads) copy.push(upload.clone());
+        return { allocation.clone(), rstd::move(copy), transparent, sampled, state.clone() };
+    }
+    auto Writes() const -> Vec<texture::TextureAccess> {
+        Vec<texture::TextureAccess> writes;
+        if (transparent)
+            for (const auto& slot : allocation->Slots())
+                writes.push({ slot.view,
+                              texture::Access::TransferDestination,
+                              texture::Stages::Transfer,
+                              true });
+        for (const auto& upload : uploads)
+            writes.push({ upload.target,
+                          texture::Access::TransferDestination,
+                          texture::Stages::Transfer,
+                          false,
+                          Some(texture::Range { upload.target.description().range.aspect,
+                                                upload.mip,
+                                                1,
+                                                upload.layer,
+                                                1 }) });
+        return writes;
+    }
+    auto Record(texture::Submission& work, const vulkan::DeviceSession& session) const
+        -> Result<empty, texture::Error> {
+        if (state->receipt && ! state->receipt->cancelled())
+            return Err(texture::Error { texture::ErrorKind::Busy });
+        state->recorded = false;
+        state->receipt  = Some(work.receipt());
+        allocation->MarkRecording(work.receipt());
+        work.retain(allocation.clone());
+        auto commands = work.commands();
+        for (const auto& upload : uploads) {
+            auto result = commands->Upload(upload.clone());
+            if (result.is_err()) return result;
+        }
+        if (transparent)
+            for (const auto& slot : allocation->Slots()) {
+                auto used = commands->UseTexture({ slot.view,
+                                                   texture::Access::TransferDestination,
+                                                   texture::Stages::Transfer,
+                                                   true });
+                if (used.is_err()) return used;
+                auto command = vulkan::native_recording(work, session);
+                auto image   = vulkan::native_texture(slot.view.texture());
+                if (command.is_err()) return Err(command.unwrap_err());
+                if (image.is_err()) return Err(image.unwrap_err());
+                auto                    range = slot.view.description().range;
+                VkImageSubresourceRange native { VK_IMAGE_ASPECT_COLOR_BIT,
+                                                 range.first_mip,
+                                                 range.mip_count,
+                                                 range.first_layer,
+                                                 range.layer_count };
+                VkClearColorValue       color {};
+                session.device().handle().Dispatch().vkCmdClearColorImage(
+                    command.unwrap(),
+                    image.unwrap(),
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    &color,
+                    1,
+                    &native);
+            }
+        if (sampled)
+            for (const auto& slot : allocation->Slots())
+                if (texture::has(slot.view.texture().description().usage,
+                                 texture::Usage::Sampled)) {
+                    auto used = commands->UseSampledView(
+                        slot.view, slot.sampler, texture::Stages::Fragment);
+                    if (used.is_err()) return used;
+                }
+        state->recorded = true;
+        allocation->MarkRecorded();
+        return Ok(empty {});
+    }
 };
 
 struct PreparedImageAllocation {
@@ -156,8 +301,14 @@ struct Impl<vrento::resource_registry::TextureProducer,
 export namespace vrento::resource_registry
 {
 
+struct TexturePreparationStatistics {
+    u64 image_preparations {}, image_reuses {}, target_allocations {};
+};
 class RegistryTextureContext {
+    TexturePreparationStatistics statistics_;
+
 public:
+    auto Statistics() const -> TexturePreparationStatistics { return statistics_; }
     static constexpr usize MaxPendingContents { 4 };
     static constexpr usize MaxUploadBatches { 3 };
     explicit RegistryTextureContext(vulkan::TextureContext context)
@@ -179,6 +330,7 @@ public:
         return m_media.Drain(timeout);
     }
 
+    // Pixel contents are immutable; publish a new Image for a new revision.
     auto CreateImportedTexture(Arc<Image> image, Option<Arc<dyn<VideoPlayback>>> playback)
         -> Result<PreparedImageAllocation, resource::ResourceError> {
         if (image->header.kind == ImageKind::Video) {
@@ -202,6 +354,19 @@ public:
             return Queue(
                 rstd::move(slots), rstd::move(media.uploads), false, Some(rstd::move(producer)));
         }
+        m_images.retain([](const CachedImage& cached) {
+            return cached.source.strong_count() != usize();
+        });
+        for (const auto& cached : m_images) {
+            auto source = cached.source.upgrade();
+            if (source && Arc<Image>::ptr_eq(source, image)) {
+                ++statistics_.image_reuses;
+                return Ok(PreparedImageAllocation { cached.allocation.clone(),
+                                                    cached.allocation->UploadCompletion().valid()
+                                                        ? None<vulkan::ImageUploadTicket>()
+                                                        : cached.ticket });
+            }
+        }
         auto window = MakeRoom();
         if (window.is_err()) return Failure("texture upload window failed");
         auto                         device = dyn<texture::TextureDevice>::from_ref(m_context);
@@ -209,6 +374,7 @@ public:
         auto content = dyn<texture::TextureContentPreparer>::from_ref(preparer);
         auto result  = content->PrepareImage(*image);
         if (result.is_err()) return Failure("prepare texture pixels failed");
+        ++statistics_.image_preparations;
         auto                        prepared = rstd::move(result).unwrap_unchecked();
         Vec<TextureSlot>            slots;
         Vec<texture::TextureUpload> uploads;
@@ -216,7 +382,28 @@ public:
             slots.push({ rstd::move(item.view), rstd::move(item.sampler) });
             for (auto& upload : item.uploads) uploads.push(rstd::move(upload));
         }
-        return Queue(rstd::move(slots), rstd::move(uploads), false);
+        auto queued = Queue(rstd::move(slots), rstd::move(uploads), false);
+        if (queued.is_ok())
+            m_images.push({ image.downgrade(), queued->allocation.clone(), queued->upload });
+        return queued;
+    }
+
+    auto TryPrepareImage(Arc<Image> image) -> Result<bool, resource::ResourceError> {
+        if (image->header.kind != ImageKind::Pixels) return Ok(false);
+        if (m_recording && ! m_recording->cancelled()) return Ok(false);
+        auto polled = Poll();
+        if (polled.is_err())
+            return Err(
+                resource::ResourceError { .message = rstd::format("poll image uploads failed") });
+        if (m_in_flight.len() >= MaxUploadBatches || m_pending.len() >= MaxPendingContents)
+            return Ok(false);
+        auto prepared = CreateImportedTexture(rstd::move(image), None());
+        if (prepared.is_err()) return Err(prepared.unwrap_err());
+        auto flushed = Flush();
+        if (flushed.is_err())
+            return Err(
+                resource::ResourceError { .message = rstd::format("submit image uploads failed") });
+        return Ok(true);
     }
 
     auto AllocateTexture(const resource::TextureDefinition& definition, bool transparent)
@@ -250,6 +437,7 @@ public:
         if (support.is_err()) return Failure("texture definition unsupported");
         auto allocated = m_context.CreateTexture(desc);
         if (allocated.is_err()) return Failure("allocate texture failed");
+        ++statistics_.target_allocations;
         auto storage = rstd::move(allocated).unwrap_unchecked();
         auto view    = m_context.CreateView(
             storage, { texture::Dimension::D2, { texture::format_layout(desc.format).aspect } });
@@ -277,80 +465,70 @@ public:
     auto PendingCount() const -> usize { return m_pending.len(); }
     auto InFlightCount() const -> usize { return m_in_flight.len(); }
 
-    bool RecordPendingUploads(texture::Submission& work) {
-        if (m_recording.is_some()) return false;
+    auto PreparePendingUploads(texture::Submission& work)
+        -> Result<Vec<PreparedTextureUpdate>, texture::Error> {
+        if (m_recording || ! work.valid()) return Err(texture::Error { texture::ErrorKind::Busy });
         m_in_flight.reserve(m_in_flight.len() + usize(1));
-        if (m_publisher.is_some()) (*m_publisher)->Reserve();
+        if (m_publisher) (*m_publisher)->Reserve();
         m_recorded_tickets.clear();
         m_recorded_tickets.reserve(m_pending.len());
-        auto commands = work.commands();
-        for (auto& pending : m_pending) {
+        Vec<PreparedTextureUpdate> updates;
+        for (const auto& pending : m_pending) {
             m_recorded_tickets.push(vulkan::ImageUploadTicket(pending.ticket));
-            work.retain(pending.allocation.clone());
-            for (const auto& upload : pending.uploads) {
-                if (commands->Upload(upload.clone()).is_err()) return false;
-            }
-            if (pending.transparent) {
-                for (const auto& slot : pending.allocation->Slots()) {
-                    if (commands
-                            ->UseTexture({ slot.view,
-                                           texture::Access::TransferDestination,
-                                           texture::Stages::Transfer,
-                                           true })
-                            .is_err())
-                        return false;
-                    auto command = vulkan::native_recording(work, m_context.session());
-                    auto image   = vulkan::native_texture(slot.view.texture());
-                    if (command.is_err() || image.is_err()) return false;
-                    const auto&             range = slot.view.description().range;
-                    VkImageSubresourceRange native { VK_IMAGE_ASPECT_COLOR_BIT,
-                                                     range.first_mip,
-                                                     range.mip_count,
-                                                     range.first_layer,
-                                                     range.layer_count };
-                    VkClearColorValue       color {};
-                    m_context.session().device().handle().Dispatch().vkCmdClearColorImage(
-                        command.unwrap_unchecked(),
-                        image.unwrap_unchecked(),
-                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                        &color,
-                        1,
-                        &native);
-                }
-            }
-            for (const auto& slot : pending.allocation->Slots()) {
-                if (texture::has(slot.view.texture().description().usage,
-                                 texture::Usage::Sampled) &&
-                    commands->UseSampledView(slot.view, slot.sampler, texture::Stages::Fragment)
-                        .is_err())
-                    return false;
-            }
+            PreparedTextureUpdate update {
+                pending.allocation.clone(), {}, pending.transparent, true
+            };
+            for (const auto& upload : pending.uploads) update.uploads.push(upload.clone());
+            updates.push(rstd::move(update));
         }
         m_recording = Some(work.receipt());
+        return Ok(rstd::move(updates));
+    }
+    bool RecordPendingUploads(texture::Submission& work) {
+        auto updates = PreparePendingUploads(work);
+        if (updates.is_err()) return false;
+        for (const auto& update : updates.unwrap())
+            if (update.Record(work, m_context.session()).is_err()) return false;
         return true;
     }
 
     bool ConfirmSubmitted(const texture::SubmissionReceipt& receipt,
                           const texture::SubmissionToken&   token) {
-        if (! receipt.submitted() || ! token.valid()) return false;
-        for (auto& pending : m_pending) pending.allocation->MarkSubmitted(token);
+        if (! m_recording || ! m_recording->same(receipt) || ! receipt.submitted() ||
+            ! token.valid())
+            return false;
+        m_pending.retain([&](const Pending& pending) {
+            for (const auto& ticket : m_recorded_tickets)
+                if (ticket.value == pending.ticket.value) {
+                    pending.allocation->MarkSubmitted(token);
+                    return false;
+                }
+            return true;
+        });
         if (m_publisher.is_some()) (*m_publisher)->Submitted(m_recorded_tickets.as_slice(), token);
-        m_pending.clear();
         m_recorded_tickets.clear();
         m_recording = None();
         m_in_flight.push(texture::SubmissionToken(token));
         return true;
     }
     void CancelRecording() {
+        if (m_recording && m_recording->uncertain()) return;
         m_recording = None();
         m_recorded_tickets.clear();
     }
     void DiscardPendingUploads() {
+        if (m_recording && m_recording->uncertain()) return;
+        m_images.retain([](const CachedImage& cached) {
+            return cached.allocation->UploadCompletion().valid();
+        });
         m_pending.clear();
         CancelRecording();
     }
 
     auto Poll() -> Result<empty, texture::Error> {
+        m_images.retain([](const CachedImage& cached) {
+            return cached.source.strong_count() != usize();
+        });
         auto polled = m_context.Poll();
         if (polled.is_err()) return polled;
         for (usize index {}; index < m_in_flight.len();) {
@@ -404,6 +582,12 @@ public:
     }
 
 private:
+    struct CachedImage {
+        rstd::sync::Weak<Image>           source;
+        Arc<TextureAllocation>            allocation;
+        Option<vulkan::ImageUploadTicket> ticket;
+    };
+    Vec<CachedImage> m_images;
     struct Pending {
         vulkan::ImageUploadTicket   ticket;
         Arc<TextureAllocation>      allocation;
@@ -474,6 +658,7 @@ private:
             ++m_next_ticket;
             if (m_next_ticket == u64()) ++m_next_ticket;
             ticket = Some(vulkan::ImageUploadTicket { .value = m_next_ticket });
+            allocation->MarkPending();
             m_pending.push({ *ticket, allocation.clone(), rstd::move(uploads), transparent });
         }
         return Ok(PreparedImageAllocation { rstd::move(allocation), ticket });

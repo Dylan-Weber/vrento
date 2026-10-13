@@ -10,16 +10,17 @@ import :vulkan.api;
 using rstd::collections::HashMap;
 using rstd::sync::Arc;
 
+using namespace rstd::prelude;
+
 export namespace vrento::resource_registry
 {
 
-using namespace rstd::prelude;
-
 struct BufferEntry {
-    resource::BufferHandle  handle;
-    resource::BufferRequest request;
-    u64                     definition_version { 1 };
-    u64                     content_version { 1 };
+    resource::BufferHandle      handle;
+    resource::BufferResourceRef definition;
+    auto request() const -> const resource::BufferRequest& { return definition.definition(); }
+    u64  definition_version { 1 };
+    u64  content_version { 1 };
 };
 
 struct BufferPhysical {
@@ -43,13 +44,15 @@ struct PendingBufferUpload {
 };
 
 struct PreparedBuffer {
-    resource::BufferHandle resource;
-    Arc<BufferPhysical>    physical;
+    resource::BufferHandle      resource;
+    Arc<BufferPhysical>         physical;
+    resource::BufferResourceRef definition;
 
     auto clone() const -> PreparedBuffer {
         return PreparedBuffer {
-            .resource = resource,
-            .physical = physical.clone(),
+            .resource   = resource,
+            .physical   = physical.clone(),
+            .definition = definition.clone(),
         };
     }
 };
@@ -57,13 +60,22 @@ struct PreparedBuffer {
 class BufferRegistry {
 public:
     auto Declare(resource::BufferRequest request) -> resource::BufferHandle {
-        return Register(rstd::move(request));
+        return Register(resource::BufferResourceRef(rstd::move(request)));
     }
 
     auto Ensure(resource::BufferRequest request, slice<u8> content,
                 mut_ref<dyn<vulkan::BufferBackend>> backend)
         -> Result<PreparedBuffer, resource::ResourceError> {
-        auto handle = Register(request.clone());
+        return Ensure(resource::BufferResourceRef(rstd::move(request)), content, backend);
+    }
+    auto Ensure(resource::BufferResourceRef definition, slice<u8> content,
+                mut_ref<dyn<vulkan::BufferBackend>> backend)
+        -> Result<PreparedBuffer, resource::ResourceError> {
+        if (! definition.valid())
+            return Err(
+                resource::ResourceError { .kind = resource::ResourceErrorKind::MissingDefinition });
+        const auto& request = definition.definition();
+        auto        handle  = Register(definition.clone());
         if (! handle.Valid()) {
             return Err(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::MissingDefinition,
@@ -82,7 +94,7 @@ public:
         auto existing = m_resources.get(handle);
         if (existing.is_some() &&
             (**existing)->definition_generation == (**entry).definition_version) {
-            if ((**entry).request.lifetime != resource::BufferLifetimeClass::Dynamic) {
+            if ((**entry).request().lifetime != resource::BufferLifetimeClass::Dynamic) {
                 auto queued = QueueWrite((**existing).clone(),
                                          content,
                                          request.content_version,
@@ -91,8 +103,9 @@ public:
                 if (queued.is_err()) return Err(rstd::move(queued).unwrap_err_unchecked());
             }
             return Ok(PreparedBuffer {
-                .resource = handle,
-                .physical = (**existing).clone(),
+                .resource   = handle,
+                .physical   = (**existing).clone(),
+                .definition = definition.clone(),
             });
         }
 
@@ -108,6 +121,7 @@ public:
             });
         }
 
+        ++m_allocations;
         u64  physical_generation = existing.is_some() ? (**existing)->generation + u64(1) : u64(1);
         auto physical            = Arc<BufferPhysical>::make(
             rstd::move(*allocated), physical_generation, (**entry).definition_version);
@@ -116,8 +130,9 @@ public:
         if (queued.is_err()) return Err(rstd::move(queued).unwrap_err_unchecked());
         (void)m_resources.insert(handle, physical.clone());
         return Ok(PreparedBuffer {
-            .resource = handle,
-            .physical = rstd::move(physical),
+            .resource   = handle,
+            .physical   = rstd::move(physical),
+            .definition = definition.clone(),
         });
     }
 
@@ -136,11 +151,10 @@ public:
         -> Result<empty, resource::ResourceError> {
         auto entry    = m_entries.get_mut(handle);
         auto physical = m_resources.get_mut(handle);
-        if (entry.is_none() || physical.is_none() ||
-            (**entry).request.lifetime != resource::BufferLifetimeClass::Dynamic) {
+        if (entry.is_none() || physical.is_none()) {
             return Err(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::MissingDefinition,
-                .message = rstd::format("dynamic buffer is unavailable"),
+                .message = rstd::format("buffer is unavailable"),
             });
         }
         auto source_generation = (**physical)->source_generation + u64(1);
@@ -173,6 +187,7 @@ public:
     }
 
     void Reset() {
+        m_allocations = u64();
         m_resources.clear();
         m_pending_uploads.clear();
         m_entries.clear();
@@ -182,9 +197,11 @@ public:
         if (m_generation == u64()) ++m_generation;
     }
 
+    auto Allocations() const -> u64 { return m_allocations; }
     auto Size() const noexcept -> usize { return m_entries.len(); }
 
 private:
+    u64  m_allocations {};
     auto QueueWrite(Arc<BufferPhysical> physical, slice<u8> content, u64 source_generation,
                     mut_ref<dyn<vulkan::BufferBackend>> backend, u64 source_identity)
         -> Result<empty, resource::ResourceError> {
@@ -227,20 +244,21 @@ private:
         return vulkan::BufferUploadClass::Vertex;
     }
 
-    auto Register(resource::BufferRequest request) -> resource::BufferHandle {
+    auto Register(resource::BufferResourceRef definition) -> resource::BufferHandle {
+        const auto& request = definition.definition();
         if (request.name.is_empty() || request.definition.size == usize()) return {};
         auto existing = m_names.get(request.name);
         if (existing.is_some()) {
             auto entry = m_entries.get_mut(**existing);
             if (entry.is_none()) return {};
-            if ((**entry).request.definition != request.definition) {
+            if ((**entry).request().definition != request.definition) {
                 ++(**entry).definition_version;
             }
-            if ((**entry).request.content_version != request.content_version ||
-                (**entry).request.content_identity != request.content_identity) {
+            if ((**entry).request().content_version != request.content_version ||
+                (**entry).request().content_identity != request.content_identity) {
                 ++(**entry).content_version;
             }
-            (**entry).request = rstd::move(request);
+            (**entry).definition = rstd::move(definition);
             return (**entry).handle;
         }
 
@@ -251,8 +269,8 @@ private:
         auto name = request.name.clone();
         (void)m_entries.insert(handle,
                                BufferEntry {
-                                   .handle  = handle,
-                                   .request = rstd::move(request),
+                                   .handle     = handle,
+                                   .definition = rstd::move(definition),
                                });
         (void)m_names.insert(rstd::move(name), handle);
         return handle;

@@ -33,6 +33,8 @@ public:
         if (texture_context.is_err()) return false;
         auto buffer_manager = rstd::sync::Arc<RegistryBufferOwner>::make(session);
         if (! buffer_manager->manager.init()) return false;
+        m_shared_graphics = Some(mut_ref<vulkan::GraphicsResources>::from_raw_parts(
+            rstd::addressof(session.graphics_resources())));
 
         m_textures =
             Some(Box<RegistryTextureContext>::make(rstd::move(texture_context).unwrap_unchecked()));
@@ -54,6 +56,7 @@ public:
         m_pipeline_layouts.Reset();
         m_descriptor_layouts.Reset();
         m_render_pass_cache.Reset();
+        m_shared_graphics = None();
         m_buffer_entries.Reset();
         m_texture_entries.Reset();
         m_textures       = None();
@@ -78,16 +81,25 @@ public:
 
     auto TextureEntries() -> resource::TextureRegistry& { return m_texture_entries; }
     auto Buffers() -> BufferRegistry& { return m_buffer_entries; }
+    auto Buffers() const -> const BufferRegistry& { return m_buffer_entries; }
     auto Shaders() -> ShaderRegistry& { return m_shader_entries; }
-    auto DescriptorLayouts() -> DescriptorLayoutRegistry& { return m_descriptor_layouts; }
-    auto PipelineLayouts() -> PipelineLayoutRegistry& { return m_pipeline_layouts; }
+    auto DescriptorLayouts() -> DescriptorLayoutRegistry& {
+        return m_shared_graphics ? (*m_shared_graphics)->descriptors : m_descriptor_layouts;
+    }
+    auto PipelineLayouts() -> PipelineLayoutRegistry& {
+        return m_shared_graphics ? (*m_shared_graphics)->layouts : m_pipeline_layouts;
+    }
     auto Descriptors() -> DescriptorSystem& { return m_descriptor_system; }
     auto Memory() -> MemoryBudgetPolicy& { return m_memory; }
     auto External() -> ExternalResourceBridge& { return m_external; }
-    auto Pipelines() -> PipelineRegistry& { return m_pipeline_cache; }
-    auto PipelineCache() -> PipelineRegistry& { return m_pipeline_cache; }
-    auto RenderPasses() -> RenderPassRegistry& { return m_render_pass_cache; }
-    auto RenderPassCache() -> RenderPassRegistry& { return m_render_pass_cache; }
+    auto Pipelines() -> PipelineRegistry& {
+        return m_shared_graphics ? (*m_shared_graphics)->pipelines : m_pipeline_cache;
+    }
+    auto PipelineCache() -> PipelineRegistry& { return Pipelines(); }
+    auto RenderPasses() -> RenderPassRegistry& {
+        return m_shared_graphics ? (*m_shared_graphics)->passes : m_render_pass_cache;
+    }
+    auto RenderPassCache() -> RenderPassRegistry& { return RenderPasses(); }
     auto Framebuffers() -> FramebufferRegistry& { return m_framebuffer_cache; }
     auto FramebufferCache() -> FramebufferRegistry& { return m_framebuffer_cache; }
     auto PipelineDiagnostics() -> PipelineCacheDiagnostics& { return m_pipeline_diagnostics; }
@@ -97,6 +109,7 @@ public:
 
 private:
     Option<Box<RegistryTextureContext>>          m_textures;
+    Option<mut_ref<vulkan::GraphicsResources>>   m_shared_graphics;
     Option<rstd::sync::Arc<RegistryBufferOwner>> m_buffer_manager;
     resource::TextureRegistry                    m_texture_entries;
     BufferRegistry                               m_buffer_entries;

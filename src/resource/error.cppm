@@ -11,6 +11,7 @@ enum class ResourceErrorKind
     MissingDefinition,
     MissingContent,
     BackendFailure,
+    Pending,
 };
 
 struct ResourceError {

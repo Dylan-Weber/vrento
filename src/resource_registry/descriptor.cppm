@@ -9,11 +9,10 @@ import :vulkan.api;
 
 using rstd::collections::HashMap;
 using rstd::sync::Arc;
+using namespace rstd::prelude;
 
 export namespace vrento::resource_registry
 {
-
-using namespace rstd::prelude;
 
 struct DescriptorBindingSchema {
     rstd::uint32_t binding { 0 };
@@ -226,11 +225,19 @@ struct DescriptorImageBinding {
     VkImageLayout           layout { VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
 };
 
+struct DescriptorTextureBinding {
+    rstd::uint32_t             binding {};
+    resource::TextureUseHandle texture;
+    usize                      slot {};
+    friend bool                operator==(const DescriptorTextureBinding&,
+                                          const DescriptorTextureBinding&) = default;
+};
+
 struct DescriptorBufferBinding {
-    rstd::uint32_t binding { 0 };
-    VkBuffer       buffer { VK_NULL_HANDLE };
-    VkDeviceSize   offset { 0 };
-    VkDeviceSize   size { 0 };
+    rstd::uint32_t   binding { 0 };
+    VkBuffer         buffer { VK_NULL_HANDLE };
+    VkDeviceSize     offset { 0 };
+    VkDeviceSize     size { 0 };
     VkDescriptorType type { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
 };
 
@@ -299,6 +306,13 @@ export namespace vrento::resource_registry
 {
 
 struct DescriptorBindingRecordState {
+    VkPipelineBindPoint bind_point { VK_PIPELINE_BIND_POINT_GRAPHICS };
+    void                UseBindPoint(VkPipelineBindPoint point) {
+        if (point != bind_point) {
+            InvalidateFrom(0);
+            bind_point = point;
+        }
+    }
     struct BoundSet {
         rstd::uint32_t                   set_index { 0 };
         resource::DescriptorLayoutHandle layout;
@@ -422,6 +436,19 @@ struct PreparedDescriptorBinding {
         };
     }
 
+    auto MatchesImages(slice<DescriptorImageBinding> next) const -> bool {
+        if (images.len() != next.len()) return false;
+        for (const auto& current : images) {
+            bool found {};
+            for (const auto& value : next)
+                if (current.binding == value.binding && current.image.view == value.image.view &&
+                    current.image.sampler == value.image.sampler && current.layout == value.layout)
+                    found = true;
+            if (! found) return false;
+        }
+        return true;
+    }
+
     auto UpdateImages(slice<DescriptorImageBinding> next)
         -> Result<empty, resource::ResourceError> {
         if (images.len() != next.len()) {
@@ -481,13 +508,15 @@ struct PreparedDescriptorBinding {
     }
 
     void Record(vvk::CommandBuffer& command, VkPipelineLayout pipeline_layout,
-                DescriptorBindingRecordState& state) const {
+                DescriptorBindingRecordState& state,
+                VkPipelineBindPoint           point = VK_PIPELINE_BIND_POINT_GRAPHICS) const {
+        state.UseBindPoint(point);
         if (backend == DescriptorBindingBackend::Set) {
             if (set.is_none() || ! set->valid()) return;
             auto descriptor_set = set->handle;
             if (! state.BindRequired(set_index, layout, descriptor_set)) return;
             command.BindDescriptorSets(
-                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                point,
                 pipeline_layout,
                 set_index,
                 slice<VkDescriptorSet>::from_raw_parts(&descriptor_set, usize(1)),
@@ -510,8 +539,7 @@ struct PreparedDescriptorBinding {
                 .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                 .pImageInfo      = &image,
             };
-            command.PushDescriptorSetKHR(
-                VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, set_index, write);
+            command.PushDescriptorSetKHR(point, pipeline_layout, set_index, write);
         }
         for (const auto& buffer : buffers) {
             VkDescriptorBufferInfo info {
@@ -528,14 +556,66 @@ struct PreparedDescriptorBinding {
                 .descriptorType  = buffer.type,
                 .pBufferInfo     = &info,
             };
-            command.PushDescriptorSetKHR(
-                VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, set_index, write);
+            command.PushDescriptorSetKHR(point, pipeline_layout, set_index, write);
         }
     }
 };
 
 class DescriptorSystem {
 public:
+    auto ReplaceImages(const vulkan::Device& device, const PreparedDescriptorBinding& source,
+                       slice<DescriptorImageBinding>   images,
+                       const DescriptorLayoutRegistry& layouts)
+        -> Result<PreparedDescriptorBinding, resource::ResourceError> {
+        if (images.len() != source.images.len())
+            return Err(resource::ResourceError {
+                .message = rstd::format("descriptor image binding count changed") });
+        for (const auto& current : source.images) {
+            usize matches {};
+            for (const auto& image : images)
+                if (image.binding == current.binding) ++matches;
+            if (matches != usize(1))
+                return Err(resource::ResourceError {
+                    .message = rstd::format("descriptor image bindings changed") });
+        }
+        if (source.MatchesImages(images)) return Ok(source.clone());
+        if (source.backend == DescriptorBindingBackend::Push) {
+            auto replacement   = PreparePush(source.set_index, images, source.buffers.as_slice());
+            replacement.handle = source.handle;
+            replacement.layout = source.layout;
+            return Ok(rstd::move(replacement));
+        }
+        auto layout = layouts.Resolve(source.layout);
+        if (! layout)
+            return Err(resource::ResourceError {
+                .message = rstd::format("descriptor replacement layout unavailable") });
+        auto replacement = Prepare(device,
+                                   source.set_index,
+                                   **layout,
+                                   images,
+                                   source.buffers.as_slice(),
+                                   DescriptorBindingReuse::Exclusive);
+        if (replacement.is_err()) return Err(replacement.unwrap_err());
+        replacement->handle = source.handle;
+        return replacement;
+    }
+    auto Snapshot(const vulkan::Device& device, const PreparedDescriptorBinding& source,
+                  const DescriptorLayoutRegistry& layouts)
+        -> Result<PreparedDescriptorBinding, resource::ResourceError> {
+        if (source.backend == DescriptorBindingBackend::Push) return Ok(source.clone());
+        auto layout = layouts.Resolve(source.layout);
+        if (layout.is_none())
+            return Err(resource::ResourceError {
+                .kind    = resource::ResourceErrorKind::MissingDefinition,
+                .message = rstd::format("descriptor snapshot layout unavailable"),
+            });
+        return Prepare(device,
+                       source.set_index,
+                       **layout,
+                       source.images.as_slice(),
+                       source.buffers.as_slice(),
+                       DescriptorBindingReuse::Exclusive);
+    }
     auto PreparePush(rstd::uint32_t set_index, rstd::slice<DescriptorImageBinding> images,
                      rstd::slice<DescriptorBufferBinding> buffers) -> PreparedDescriptorBinding {
         auto prepared_images = Vec<DescriptorImageBinding>::from(images);

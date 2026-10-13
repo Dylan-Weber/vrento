@@ -208,6 +208,11 @@ TEST(TextureVulkan, Resources) {
     desc.usage = tex::Usage::Sampled | tex::Usage::TransferDestination | tex::Usage::TransferSource;
     auto storage = factory->CreateTexture(desc).unwrap();
     auto all     = factory->CreateView(storage, {}).unwrap();
+    rstd_assert(vk::validate_sampled_texture(session, all, tex::Stages::Geometry).is_ok());
+    rstd_assert(vk::validate_sampled_texture(session, all, tex::Stages::Shaders).is_ok());
+    rstd_assert(
+        vk::validate_sampled_texture(session, all, tex::Stages::Geometry | tex::Stages::Color)
+            .is_err());
     auto mip =
         factory->CreateView(storage, { tex::Dimension::D2, { tex::Aspect::Color, 1, 1, 0, 1 } })
             .unwrap();
@@ -511,32 +516,38 @@ TEST(TextureVulkan, MultisampleResolveAndDepthLayout) {
     framebuffer.layers                     = 1;
     rstd_assert(session.device().handle().CreateFramebuffer(framebuffer, pass.framebuffer) ==
                 VK_SUCCESS);
-    auto work = context.Begin().unwrap();
-    work.commands()
-        ->UseTexture({ ms_view, tex::Access::ColorAttachment, tex::Stages::Color, true })
-        .unwrap();
-    work.commands()
-        ->UseTexture({ resolved, tex::Access::ColorAttachment, tex::Stages::Color, true })
-        .unwrap();
-    VkClearValue clear {};
-    clear.color.float32[0] = 1;
-    clear.color.float32[3] = 1;
+    auto                  work = context.Begin().unwrap();
+    VkClearValue          clear {};
     VkRenderPassBeginInfo begin { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
-    begin.renderPass        = *pass.pass;
-    begin.framebuffer       = *pass.framebuffer;
-    begin.renderArea.extent = { 4, 4 };
-    begin.clearValueCount   = 1;
-    begin.pClearValues      = &clear;
-    auto command            = vk::native_recording(work, session).unwrap();
-    session.device().handle().Dispatch().vkCmdBeginRenderPass(
-        command, &begin, VK_SUBPASS_CONTENTS_INLINE);
-    session.device().handle().Dispatch().vkCmdEndRenderPass(command);
-    work.commands()->UseTexture({ resolved, tex::Access::Sampled, tex::Stages::Fragment }).unwrap();
+    auto                  command = vk::native_recording(work, session).unwrap();
+    for (unsigned repeat {}; repeat < 2; ++repeat) {
+        work.commands()
+            ->UseTexture({ ms_view, tex::Access::ColorAttachment, tex::Stages::Color, true })
+            .unwrap();
+        work.commands()
+            ->UseTexture({ resolved, tex::Access::ColorAttachment, tex::Stages::Color, true })
+            .unwrap();
+        clear                               = {};
+        clear.color.float32[repeat ? 2 : 0] = 1;
+        clear.color.float32[3]              = 1;
+        begin.renderPass                    = *pass.pass;
+        begin.framebuffer                   = *pass.framebuffer;
+        begin.renderArea.extent             = { 4, 4 };
+        begin.clearValueCount               = 1;
+        begin.pClearValues                  = &clear;
+        session.device().handle().Dispatch().vkCmdBeginRenderPass(
+            command, &begin, VK_SUBPASS_CONTENTS_INLINE);
+        session.device().handle().Dispatch().vkCmdEndRenderPass(command);
+        work.commands()
+            ->UseTexture({ resolved, tex::Access::Sampled, tex::Stages::Fragment })
+            .unwrap();
+    }
     work.retain(rstd::move(pass));
     context.wait(context.Submit(rstd::move(work)).unwrap()).unwrap();
     auto pixels = read(context, resolved);
     for (unsigned i = 0; i < 16; ++i) {
-        rstd_assert(pixels[usize(i * 4)] == u8(255));
+        rstd_assert(pixels[usize(i * 4)] == u8(0));
+        rstd_assert(pixels[usize(i * 4 + 2)] == u8(255));
         rstd_assert(pixels[usize(i * 4 + 1)] == u8(0));
         rstd_assert(pixels[usize(i * 4 + 3)] == u8(255));
     }

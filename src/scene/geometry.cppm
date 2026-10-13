@@ -20,6 +20,53 @@ struct GeometryView {
     bool                       dynamic { false };
 };
 
+class GeometrySnapshot {
+    struct Buffer {
+        Vec<u8> bytes;
+        usize   capacity {}, stride {}, count {};
+        u64     data_generation {}, storage_generation {};
+        auto    view() const -> GeometryBufferView {
+            return {
+                bytes.as_slice(), capacity, stride, count, data_generation, storage_generation
+            };
+        }
+        auto clone() const -> Buffer {
+            return { bytes.clone(), capacity, stride, count, data_generation, storage_generation };
+        }
+    };
+    Vec<Buffer>    vertices_;
+    Option<Buffer> index_;
+    bool           dynamic_ {};
+
+public:
+    static auto capture(const GeometryView& source) -> GeometrySnapshot {
+        GeometrySnapshot result;
+        result.dynamic_ = source.dynamic;
+        auto buffer     = [](const GeometryBufferView& view) {
+            return Buffer {
+                Vec<u8>::from(view.bytes), view.capacity,          view.stride, view.count,
+                view.data_generation,      view.storage_generation
+            };
+        };
+        for (const auto& view : source.vertices) result.vertices_.push(buffer(view));
+        if (source.index) result.index_ = Some(buffer(*source.index));
+        return result;
+    }
+    auto view() const -> GeometryView {
+        GeometryView result { .dynamic = dynamic_ };
+        for (const auto& buffer : vertices_) result.vertices.push(buffer.view());
+        if (index_) result.index = Some(index_->view());
+        return result;
+    }
+    auto clone() const -> GeometrySnapshot {
+        GeometrySnapshot result;
+        result.dynamic_ = dynamic_;
+        for (const auto& buffer : vertices_) result.vertices_.push(buffer.clone());
+        if (index_) result.index_ = Some(index_->clone());
+        return result;
+    }
+};
+
 class IndexArray {
     constexpr static usize Unit_Byte_Size { sizeof(uint32_t) };
 

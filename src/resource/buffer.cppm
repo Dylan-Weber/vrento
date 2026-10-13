@@ -2,10 +2,10 @@ export module vrento:resource.buffer;
 import rstd;
 import :resource.handle;
 
+using namespace rstd::prelude;
+
 export namespace vrento::resource
 {
-
-using namespace rstd::prelude;
 
 struct BufferDefinitionId {
     u32 index { u32::MAX };
@@ -60,5 +60,7 @@ struct BufferRequest {
         };
     }
 };
+
+using BufferResourceRef = ResourceReference<BufferRequest, BufferResourceTag>;
 
 } // namespace vrento::resource

@@ -286,6 +286,21 @@ TEST(Texture, PublicApi) {
         rstd::as<TextureContentPreparer>(preparer).PrepareImage(oversized).unwrap_err().kind ==
         ErrorKind::Invalid);
 }
+TEST(Texture, ShaderAccessStages) {
+    FakeDevice  device;
+    TextureDesc desc;
+    desc.extent = { 8, 8 };
+    desc.usage  = Usage::Sampled | Usage::Storage;
+    auto   view = device.CreateView(device.CreateTexture(desc).unwrap(), {}).unwrap();
+    Access accesses[] { Access::Sampled, Access::StorageRead, Access::StorageWrite };
+    for (auto access : accesses) {
+        rstd_assert(validate_access({ view, access, Stages::Geometry }).is_ok());
+        rstd_assert(validate_access({ view, access, Stages::Shaders }).is_ok());
+        rstd_assert(
+            validate_access({ view, access, Stages::Geometry | Stages::Transfer }).is_err());
+        rstd_assert(validate_access({ view, access, Stages::None }).is_err());
+    }
+}
 TEST(Texture, MultisampleValidation) {
     TextureDesc desc;
     desc.extent  = { 8, 8 };

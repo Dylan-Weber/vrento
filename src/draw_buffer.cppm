@@ -70,8 +70,8 @@ public:
     explicit RenderBufferResolver(const resource_registry::PreparedResourceTable& resources)
         : m_resources(resources) {}
     auto        prepareDrawBuffers(const DrawBufferRequest&) -> Option<DrawBufferRefs>;
-    static auto updateDynamicDrawBuffers(const DrawBufferRequest&, DrawBufferRefs&,
-                                         mut_ref<dyn<resource::BufferContentWriter>>)
+    static auto updateDrawBuffers(const DrawBufferRequest&, DrawBufferRefs&,
+                                  mut_ref<dyn<resource::BufferContentWriter>>)
         -> Result<empty, DrawBufferUpdateError>;
 
 private:

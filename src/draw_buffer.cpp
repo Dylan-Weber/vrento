@@ -103,9 +103,10 @@ auto RenderBufferResolver::prepareDrawBuffers(const DrawBufferRequest& request)
     return Some(rstd::move(out));
 }
 
-auto RenderBufferResolver::updateDynamicDrawBuffers(
-    const DrawBufferRequest& request, DrawBufferRefs& buffers,
-    mut_ref<dyn<resource::BufferContentWriter>> writer) -> Result<empty, DrawBufferUpdateError> {
+auto RenderBufferResolver::updateDrawBuffers(const DrawBufferRequest&                    request,
+                                             DrawBufferRefs&                             buffers,
+                                             mut_ref<dyn<resource::BufferContentWriter>> writer)
+    -> Result<empty, DrawBufferUpdateError> {
     const auto& geometry = request.geometry;
     auto        count    = DrawCount(geometry);
     if (count.is_none())
@@ -137,7 +138,6 @@ auto RenderBufferResolver::updateDynamicDrawBuffers(
         if (buffers.content_confirmed &&
             buffers.vertex_keys[i].data_generation == view.data_generation)
             continue;
-        if (! buffers.dynamic) return reprepare();
         auto updated = writer->UpdateBuffer(buffers.vertices[i], view.bytes);
         if (updated.is_err())
             return Err(
@@ -147,7 +147,6 @@ auto RenderBufferResolver::updateDynamicDrawBuffers(
     if (geometry.index.is_some() &&
         (! buffers.content_confirmed ||
          buffers.index_key->data_generation != geometry.index->data_generation)) {
-        if (! buffers.dynamic) return reprepare();
         auto updated = writer->UpdateBuffer(*buffers.index, geometry.index->bytes);
         if (updated.is_err())
             return Err(

@@ -7,6 +7,8 @@ import vrento;
 using namespace rstd::prelude;
 using namespace rstd::literals;
 using rstd::sync::Arc;
+import vrento.tests.pass_set;
+
 namespace tex      = vrento::texture;
 namespace vk       = vrento::vulkan;
 namespace registry = vrento::resource_registry;
@@ -48,6 +50,57 @@ struct Impl<vrento::VideoPlayback, Arc<vrento_test::texture_registry::Playback>>
 
 namespace vrento_test::texture_registry
 {
+TEST(RenderResourceSystem, OwnsPreparationAndRejectsStaleCommitOrCancel) {
+    auto created = vk::DeviceSession::create({ .validation = true });
+    if (created.is_err()) GTEST_SKIP() << "Vulkan unavailable";
+    registry::RenderResourceSystem resources;
+    ASSERT_TRUE(resources.Initialize(created.unwrap()));
+    auto begin = [&](u64 generation) {
+        vrento::resource::ResourcePlan temporary { .generation = generation };
+        return resources.BeginPreparePlan(temporary, {});
+    };
+    auto first = begin(u64(31)).unwrap();
+    EXPECT_EQ(resources.PrepareStatus().state, registry::ResourcePrepareState::Preparing);
+    EXPECT_TRUE(begin(u64(32)).is_err());
+    EXPECT_EQ(resources.PrepareStatus().id, first);
+    EXPECT_TRUE(resources.CommitPreparePlan(first).is_err());
+    EXPECT_EQ(resources.ContinuePreparePlan(first).unwrap(),
+              registry::ResourcePrepareProgress::Complete);
+    EXPECT_EQ(resources.PrepareStatus().state, registry::ResourcePrepareState::Prepared);
+    EXPECT_TRUE(resources.ContinuePreparePlan(first).is_err());
+    resources.CommitPreparePlan(first).unwrap();
+    EXPECT_EQ(resources.PrepareStatus().state, registry::ResourcePrepareState::Committed);
+    EXPECT_EQ(resources.Prepared().Generation(), u64(31));
+
+    auto second = begin(u64(32)).unwrap();
+    EXPECT_NE(second, first);
+    EXPECT_FALSE(resources.CancelPreparePlan(first));
+    EXPECT_TRUE(resources.ContinuePreparePlan(first).is_err());
+    EXPECT_TRUE(resources.CommitPreparePlan(first).is_err());
+    EXPECT_EQ(resources.PrepareStatus().id, second);
+    resources.ContinuePreparePlan(second).unwrap();
+    EXPECT_EQ(resources.Prepared().Generation(), u64(32));
+    EXPECT_TRUE(resources.CancelPreparePlan(second));
+    EXPECT_EQ(resources.PrepareStatus().state, registry::ResourcePrepareState::Cancelled);
+    EXPECT_EQ(resources.Prepared().Generation(), u64(31));
+    EXPECT_TRUE(resources.CommitPreparePlan(second).is_err());
+
+    vrento::resource::ResourcePlan invalid { .generation = u64(33) };
+    invalid.DeclareTexture({ .kind = vrento::resource::TextureRequestKind::RenderTarget,
+                             .name = "missing-definition"_Str },
+                           vrento::resource::ResourceAccess::Write);
+    EXPECT_TRUE(resources.BeginPreparePlan(invalid, {}).is_err());
+    EXPECT_EQ(resources.PrepareStatus().state, registry::ResourcePrepareState::Failed);
+    EXPECT_TRUE(resources.PrepareStatus().error);
+    EXPECT_EQ(resources.Prepared().Generation(), u64(31));
+    auto retry = begin(u64(34)).unwrap();
+    resources.ContinuePreparePlan(retry).unwrap();
+    resources.CommitPreparePlan(retry).unwrap();
+    EXPECT_EQ(resources.Prepared().Generation(), u64(34));
+    resources.Reset();
+    EXPECT_EQ(resources.PrepareStatus().state, registry::ResourcePrepareState::Idle);
+}
+
 TEST(RegistryTextureContext, SlowGpuBoundsPendingUploads) {
     auto                      session = vk::DeviceSession::create({ .validation = true }).unwrap();
     auto                      context = vk::TextureContext::create(session).unwrap();
@@ -107,6 +160,190 @@ TEST(RegistryTextureContext, SlowGpuBoundsPendingUploads) {
     textures.Flush().unwrap();
     textures.WaitForUploads(5'000'000'000).unwrap();
     rstd_assert(textures.InFlightCount() == usize());
+    rstd_assert(session.validation_errors() == 0);
+}
+
+auto PixelImage() -> Arc<vrento::Image> {
+    auto image           = Arc<vrento::Image>::make();
+    image->header.format = vrento::TextureFormat::RGBA8;
+    vrento::Image::Slot slot;
+    slot.width = slot.height = 2;
+    slot.mipmaps.push(vrento::ImageData {
+        2, 2, isize(16), vrento::ImageDataPtr(new rstd::uint8_t[16] {}, [](rstd::uint8_t* data) {
+            delete[] data;
+        }) });
+    image->slots.push(rstd::move(slot));
+    return image;
+}
+
+TEST(RegistryTextureContext, ImageIdentityReusesPreparedAllocationAndCancelledUpload) {
+    auto created = vk::DeviceSession::create({ .validation = true });
+    if (created.is_err()) GTEST_SKIP() << "Vulkan unavailable";
+    auto                             session = created.unwrap();
+    registry::RegistryTextureContext textures(vk::TextureContext::create(session).unwrap());
+    auto                             preload = PixelImage();
+    ASSERT_TRUE(textures.TryPrepareImage(preload.clone()).unwrap());
+    auto adopted = textures.CreateImportedTexture(preload.clone(), None()).unwrap();
+    EXPECT_FALSE(adopted.upload);
+    EXPECT_EQ(textures.PendingCount(), usize());
+    auto image  = PixelImage();
+    auto first  = textures.CreateImportedTexture(image.clone(), None()).unwrap();
+    auto reused = textures.CreateImportedTexture(image.clone(), None()).unwrap();
+    EXPECT_TRUE(Arc<registry::TextureAllocation>::ptr_eq(first.allocation, reused.allocation));
+    EXPECT_EQ(textures.PendingCount(), usize(1));
+    EXPECT_EQ(first.allocation->InitialReadiness().unwrap(), registry::ImageReadiness::Pending);
+    {
+        auto cancelled = textures.Context().Begin().unwrap();
+        auto updates   = textures.PreparePendingUploads(cancelled).unwrap();
+        ASSERT_EQ(updates.len(), usize(1));
+        EXPECT_EQ(updates[usize()].Readiness().unwrap(), registry::ImageReadiness::Pending);
+        updates[usize()].Record(cancelled, session).unwrap();
+        EXPECT_EQ(updates[usize()].Readiness(Some(cancelled.receipt())).unwrap(),
+                  registry::ImageReadiness::Recorded);
+        EXPECT_TRUE(updates[usize()].clone().Record(cancelled, session).is_err());
+        auto foreign         = textures.Context().Begin().unwrap();
+        auto foreign_receipt = foreign.receipt();
+        auto token           = textures.Context().Submit(rstd::move(foreign)).unwrap();
+        EXPECT_FALSE(textures.ConfirmSubmitted(foreign_receipt, token));
+        EXPECT_EQ(textures.PendingCount(), usize(1));
+        EXPECT_EQ(first.allocation->InitialReadiness(Some(cancelled.receipt())).unwrap(),
+                  registry::ImageReadiness::Recorded);
+    }
+    EXPECT_EQ(first.allocation->InitialReadiness().unwrap(), registry::ImageReadiness::Pending);
+    textures.CancelRecording();
+    textures.Flush().unwrap();
+    auto again = textures.CreateImportedTexture(image.clone(), None()).unwrap();
+    EXPECT_TRUE(Arc<registry::TextureAllocation>::ptr_eq(first.allocation, again.allocation));
+    EXPECT_FALSE(again.upload);
+    auto revision = textures.CreateImportedTexture(PixelImage(), None()).unwrap();
+    EXPECT_FALSE(Arc<registry::TextureAllocation>::ptr_eq(first.allocation, revision.allocation));
+    textures.Flush().unwrap();
+    textures.WaitForUploads(5'000'000'000).unwrap();
+    EXPECT_EQ(first.allocation->InitialReadiness().unwrap(), registry::ImageReadiness::Complete);
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
+
+TEST(RegistryTextureContext, UploadBeforeGraphKeepsDescriptionsAndRequiresSameSubmission) {
+    namespace fg = vrento::fg;
+    auto created = vk::DeviceSession::create({ .validation = true });
+    if (created.is_err()) GTEST_SKIP() << "Vulkan unavailable";
+    auto                                session = created.unwrap();
+    registry::RegistryTextureContext    textures(vk::TextureContext::create(session).unwrap());
+    vrento::resource::TextureDefinition source_desc;
+    source_desc.width = source_desc.height = i32(2);
+    source_desc.usage                      = vrento::resource::TextureUsage::Sampled |
+                                             vrento::resource::TextureUsage::TransferSource |
+                                             vrento::resource::TextureUsage::TransferDestination;
+    auto source                            = textures.AllocateTexture(source_desc, true).unwrap();
+    vrento::resource::TextureDefinition target_desc;
+    target_desc.width = target_desc.height = i32(2);
+    target_desc.usage                      = vrento::resource::TextureUsage::Sampled |
+                                             vrento::resource::TextureUsage::TransferDestination;
+    auto                  target           = textures.AllocateTexture(target_desc, false).unwrap();
+    fg::FrameGraphBuilder builder(91);
+    auto input    = builder.import_resource({ .id = { 1, 91 }, .spec = 1, .storage = 1 }).unwrap();
+    auto output   = builder.import_resource({ .id = { 2, 91 }, .spec = 2, .storage = 2 }).unwrap();
+    auto copy     = vk::declare_texture_copy(builder, { 1 }, input, output).unwrap();
+    auto revision = copy.description.revision();
+    auto graph    = rstd::move(builder).finish().unwrap();
+    vk::Renderer renderer(session);
+    vk::register_texture_factories(renderer).unwrap();
+    Vec<vk::PassInput> descriptions;
+    descriptions.push(copy.description.clone());
+    renderer.compile(graph, rstd::move(descriptions)).unwrap();
+    vk::GraphBindings bindings(graph.scope());
+    bindings
+        .bind_version(input,
+                      Arc<dyn<vk::GraphBinding>>::make(
+                          vk::GraphTextureBinding(source.allocation->Slots()[usize()].view)))
+        .unwrap();
+    bindings
+        .bind_version(copy.output,
+                      Arc<dyn<vk::GraphBinding>>::make(
+                          vk::GraphTextureBinding(target.allocation->Slots()[usize()].view)))
+        .unwrap();
+    auto work = textures.Context().Begin().unwrap();
+    ASSERT_TRUE(textures.RecordPendingUploads(work));
+    auto frame =
+        renderer.compiled()
+            ->instantiate(bindings,
+                          {},
+                          Box<dyn<vk::GraphicsScopeBackend>>::make(vk::GraphicsScopeCache {}),
+                          true,
+                          &work)
+            .unwrap();
+    {
+        auto unrelated = textures.Context().Begin().unwrap();
+        EXPECT_EQ(frame.record(unrelated).unwrap_err().stage, vk::GraphExecutionStage::Binding);
+    }
+    frame.record(work).unwrap();
+    auto receipt = work.receipt();
+    auto token   = textures.Context().Submit(rstd::move(work)).unwrap();
+    ASSERT_TRUE(textures.ConfirmSubmitted(receipt, token));
+    EXPECT_EQ(graph.passes().len(), usize(1));
+    EXPECT_EQ(copy.description.revision(), revision);
+    EXPECT_EQ(renderer.statistics().graph_compiles, 1u);
+    textures.Context().wait(token).unwrap();
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
+
+TEST(RenderResourceSystem, PreparedUploadsRequireTheirFrame) {
+    auto session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    registry::RenderResourceSystem resources;
+    rstd_assert(resources.Initialize(session));
+    auto foreign   = vk::TextureContext::create(session).unwrap();
+    auto first     = resources.BeginFrame().unwrap();
+    auto unrelated = foreign.Begin().unwrap();
+    rstd_assert(resources.PreparePendingUploads(unrelated).unwrap_err().kind ==
+                tex::ErrorKind::Invalid);
+    auto cancelled = resources.PreparePendingUploads(first).unwrap();
+    rstd_assert(cancelled.Record(unrelated).unwrap_err().kind == tex::ErrorKind::Invalid);
+    first.discard();
+    auto retry = resources.BeginFrame().unwrap();
+    rstd_assert(cancelled.Record(retry).unwrap_err().kind == tex::ErrorKind::Invalid);
+    auto omitted = resources.PreparePendingUploads(retry).unwrap();
+    rstd_assert(resources.SubmitFrame(rstd::move(retry)).unwrap_err().kind ==
+                tex::ErrorKind::Invalid);
+    auto final = resources.BeginFrame().unwrap();
+    auto ready = resources.PreparePendingUploads(final).unwrap();
+    ready.Record(final).unwrap();
+    rstd_assert(ready.Record(final).unwrap_err().kind == tex::ErrorKind::Invalid);
+    resources.TextureContext().wait(resources.SubmitFrame(rstd::move(final)).unwrap()).unwrap();
+    resources.Reset();
+    rstd_assert(session.validation_errors() == 0);
+}
+
+TEST(RenderResourceSystem, BufferUploadSnapshotMergesWritesAndCancelsReservation) {
+    auto              session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    vk::BufferManager buffers(session.device());
+    rstd_assert(buffers.init());
+    auto allocation = buffers.Allocate({ 32, 4, vk::BufferUploadClass::Vertex }).unwrap();
+    array<rstd::uint8_t, 16> bytes {};
+    buffers.QueueWrite(allocation, bytes.as_slice()).unwrap();
+    buffers.QueueWrite(allocation, bytes.as_slice(), 8).unwrap();
+    {
+        vk::RecordedBufferUploads prepared;
+        rstd_assert(buffers.PreparePendingUploads(prepared));
+        auto writes = prepared.Writes();
+        ASSERT_EQ(writes.len(), usize(1));
+        EXPECT_EQ(writes[usize()].offset, 0u);
+        EXPECT_EQ(writes[usize()].size, 24u);
+        EXPECT_EQ(buffers.statistics().recorded_copies[unsigned(vk::BufferUploadClass::Vertex)],
+                  0u);
+        EXPECT_FALSE(buffers.QueueWrite(allocation, bytes.as_slice()));
+    }
+    rstd_assert(buffers.QueueWrite(allocation, bytes.as_slice(), 16));
+    auto                      queue   = vk::TextureContext::create(session).unwrap();
+    auto                      work    = queue.Begin().unwrap();
+    auto                      command = vk::native_command_recording(work, session).unwrap();
+    vk::RecordedBufferUploads prepared;
+    rstd_assert(buffers.PreparePendingUploads(prepared));
+    auto writes = prepared.Writes();
+    ASSERT_EQ(writes.len(), usize(1));
+    EXPECT_EQ(writes[usize()].size, 32u);
+    rstd_assert(buffers.RecordUploads(command, prepared));
+    work.retain(buffers.CommitRecordedUploads(rstd::move(prepared)).unwrap());
+    queue.wait(queue.Submit(rstd::move(work)).unwrap()).unwrap();
     rstd_assert(session.validation_errors() == 0);
 }
 
@@ -283,10 +520,22 @@ TEST(MediaRegistry, ContinuousPlaybackKeepsStableTexture) {
     rstd_assert(prepared.producer->SourceKind() == expected);
     auto tick = [&] {
         prepared.producer->Pump(context, 1.0 / 30.0).unwrap();
-        auto sampled = context.Begin().unwrap();
-        sampled.commands()
-            ->UseSampledView(prepared.view, prepared.sampler, tex::Stages::Fragment)
+        vrento::vulkan::VulkanPassData data { .scope = 1 };
+        data.resources.push({ .id = { 1, 1 }, .imported = true });
+        data.passes.push(vrento_test::texture_sampled_pass({ 1 }, { 1, 1 }, 0));
+        vk::GraphBindings bindings(1);
+        bindings
+            .bind({ 1, 1 },
+                  Arc<dyn<vk::GraphBinding>>::make(vk::GraphTextureBinding(prepared.view)))
             .unwrap();
+        vk::VulkanPassBackends backends;
+        vk::register_texture_passes(backends).unwrap();
+        auto graph =
+            vk::PreparedGraphProgram::prepare(
+                session, vrento_test::make_pass_set(rstd::move(data)).unwrap(), bindings, backends)
+                .unwrap();
+        auto sampled = context.Begin().unwrap();
+        graph.record(sampled).unwrap();
         context.wait(context.Submit(rstd::move(sampled)).unwrap()).unwrap();
         context.Poll().unwrap();
         rstd_assert(prepared.view.texture().identity() == identity);
@@ -312,5 +561,162 @@ TEST(MediaRegistry, ContinuousPlaybackKeepsStableTexture) {
     media.Drain(u64(5'000'000'000)).unwrap();
     media.Clear();
     rstd_assert(session.validation_errors() == 0);
+}
+} // namespace vrento_test::texture_registry
+
+namespace vrento_test::texture_registry
+{
+TEST(PreparedResourceTable, DescriptorTextureDependenciesSurviveCloneAndRemoveOldEdges) {
+    namespace resource = vrento::resource;
+    registry::DescriptorSystem       descriptors;
+    registry::PreparedResourceTable  table;
+    registry::DescriptorImageBinding image { .binding = 3 };
+    auto                             packet = [&] {
+        return descriptors.PreparePush(
+            0, slice<registry::DescriptorImageBinding>::from_raw_parts(&image, usize(1)), {});
+    };
+    auto first = packet(), second = packet(), unrelated = packet();
+    auto a = first.handle, b = second.handle, c = unrelated.handle;
+    table.Insert(rstd::move(first));
+    table.Insert(rstd::move(second));
+    table.Insert(rstd::move(unrelated));
+    resource::TextureUseHandle         one { u64(1), u64(9) }, two { u64(2), u64(9) };
+    registry::DescriptorTextureBinding source { 3, one, usize(2) };
+    ASSERT_TRUE(table.TrackDescriptorTextures(
+        a, slice<registry::DescriptorTextureBinding>::from_raw_parts(&source, usize(1))));
+    ASSERT_TRUE(table.TrackDescriptorTextures(
+        b, slice<registry::DescriptorTextureBinding>::from_raw_parts(&source, usize(1))));
+    source.texture = two;
+    ASSERT_TRUE(table.TrackDescriptorTextures(
+        c, slice<registry::DescriptorTextureBinding>::from_raw_parts(&source, usize(1))));
+    const resource::TextureUseHandle changed[] { one, one };
+    EXPECT_EQ(table
+                  .AffectedTextureDescriptors(
+                      slice<resource::TextureUseHandle>::from_raw_parts(changed, usize(2)))
+                  .len(),
+              usize(2));
+    auto previous = table.clone();
+    ASSERT_TRUE(table.TrackDescriptorTextures(
+        a, slice<registry::DescriptorTextureBinding>::from_raw_parts(&source, usize(1))));
+    EXPECT_EQ(table
+                  .AffectedTextureDescriptors(
+                      slice<resource::TextureUseHandle>::from_raw_parts(&one, usize(1)))
+                  .len(),
+              usize(1));
+    EXPECT_EQ(previous
+                  .AffectedTextureDescriptors(
+                      slice<resource::TextureUseHandle>::from_raw_parts(&one, usize(1)))
+                  .len(),
+              usize(2));
+    table.Remove(b);
+    EXPECT_TRUE(table
+                    .AffectedTextureDescriptors(
+                        slice<resource::TextureUseHandle>::from_raw_parts(&one, usize(1)))
+                    .is_empty());
+    registry::PreparedResourceTable next;
+    next.CarryForward(rstd::move(table), resource::ResourcePlanTextures);
+    EXPECT_EQ(next.AffectedTextureDescriptors(
+                      slice<resource::TextureUseHandle>::from_raw_parts(&two, usize(1)))
+                  .len(),
+              usize(2));
+    EXPECT_EQ(next.DescriptorTextures(a)[usize()].texture, two);
+    next.ClearPreparedState();
+    EXPECT_TRUE(next.AffectedTextureDescriptors(
+                        slice<resource::TextureUseHandle>::from_raw_parts(&two, usize(1)))
+                    .is_empty());
+}
+
+TEST(RenderResourceSystem, RefreshesOnlyDependentDescriptorsAndRollsBackReplacementSets) {
+    namespace resource = vrento::resource;
+    auto created       = vk::DeviceSession::create({ .validation = true });
+    if (created.is_err()) GTEST_SKIP() << "Vulkan unavailable";
+    auto                           session = created.unwrap();
+    registry::RenderResourceSystem resources;
+    ASSERT_TRUE(resources.Initialize(session));
+    resource::ResourcePlan plan { .generation = u64(91) };
+    auto                   declare = [&](ref<str> name) {
+        return plan.DeclareTexture(
+            { .kind       = resource::TextureRequestKind::RenderTarget,
+              .name       = String::make(name),
+              .definition = Some(resource::TextureDefinition {
+                  .width  = i32(8),
+                  .height = i32(8),
+                  .usage  = resource::TextureUsage::Color | resource::TextureUsage::Sampled }),
+              .lifetime   = resource::TextureLifetimeClass::Retained },
+            resource::ResourceAccess::ReadWrite);
+    };
+    auto first = declare("first"_str), second = declare("second"_str);
+    resources.PreparePlan(plan, {}).unwrap();
+    registry::PipelineLayoutRequest layout_request;
+    vk::DescriptorSetInfo           set;
+    set.bindings.push(
+        { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr });
+    layout_request.descriptor_sets.push(rstd::move(set));
+    auto layout  = resources.PreparePipelineLayout(session.device(), layout_request).unwrap();
+    auto prepare = [&](resource::TextureUseHandle use) {
+        registry::DescriptorTextureBinding source { 0, use, usize() };
+        return resources
+            .PrepareTextureDescriptor(
+                session.device(),
+                layout,
+                u32(),
+                slice<registry::DescriptorTextureBinding>::from_raw_parts(&source, usize(1)),
+                {})
+            .unwrap();
+    };
+    auto a = prepare(first), shared = prepare(first), b = prepare(second);
+    auto retained        = resources.Prepared().clone();
+    auto original        = (**retained.Resolve(a)).clone();
+    auto original_shared = (**retained.Resolve(shared)).clone();
+    auto unrelated       = (**retained.Resolve(b)).clone();
+    ASSERT_EQ(original.backend, registry::DescriptorBindingBackend::Set);
+    resources.PreparePlan(plan, {}, resource::ResourcePlanTextures).unwrap();
+    EXPECT_EQ((*resources.Prepared().Resolve(a))->set->handle, original.set->handle);
+    auto next_request              = plan.textures[usize()].definition.definition().clone();
+    next_request.definition->width = i32(16);
+    plan.textures[usize()].definition =
+        plan.textures[usize()].definition.with_definition(rstd::move(next_request));
+    auto transaction =
+        resources.BeginPreparePlan(plan, {}, resource::ResourcePlanTextures).unwrap();
+    while (resources.ContinuePreparePlan(transaction).unwrap() !=
+           registry::ResourcePrepareProgress::Complete) {
+    }
+    auto replaced = (**resources.Prepared().Resolve(a)).clone();
+    EXPECT_NE(replaced.set->handle, original.set->handle);
+    EXPECT_NE((*resources.Prepared().Resolve(shared))->set->handle, original_shared.set->handle);
+    EXPECT_EQ((*resources.Prepared().Resolve(b))->set->handle, unrelated.set->handle);
+    EXPECT_NE(replaced.images[usize()].image.view, original.images[usize()].image.view);
+    EXPECT_EQ((*retained.Resolve(a))->set->handle, original.set->handle);
+    EXPECT_TRUE(resources.CancelPreparePlan(transaction));
+    EXPECT_EQ((*resources.Prepared().Resolve(a))->set->handle, original.set->handle);
+    EXPECT_EQ(resources.Prepared()
+                  .AffectedTextureDescriptors(
+                      slice<resource::TextureUseHandle>::from_raw_parts(&first, usize(1)))
+                  .len(),
+              usize(2));
+    resources.PreparePlan(plan, {}, resource::ResourcePlanTextures).unwrap();
+    auto committed = (**resources.Prepared().Resolve(a)).clone();
+    EXPECT_NE(committed.set->handle, original.set->handle);
+    EXPECT_EQ((*resources.Prepared().Resolve(b))->set->handle, unrelated.set->handle);
+    registry::DescriptorTextureBinding invalid { 0, first, usize(99) };
+    EXPECT_TRUE(
+        resources
+            .UpdateDescriptorTextures(
+                a, slice<registry::DescriptorTextureBinding>::from_raw_parts(&invalid, usize(1)))
+            .is_err());
+    EXPECT_EQ((*resources.Prepared().Resolve(a))->set->handle, committed.set->handle);
+    auto missing = plan.clone();
+    missing.textures.remove(usize());
+    EXPECT_TRUE(resources.PreparePlan(missing, {}, resource::ResourcePlanTextures).is_err());
+    EXPECT_EQ(resources.PrepareStatus().state, registry::ResourcePrepareState::Failed);
+    EXPECT_EQ((*resources.Prepared().Resolve(a))->set->handle, committed.set->handle);
+    resources.UpdateDescriptorImages(a, committed.images.as_slice()).unwrap();
+    EXPECT_TRUE(resources.Prepared().DescriptorTextures(a).is_empty());
+    EXPECT_EQ(resources.Prepared()
+                  .AffectedTextureDescriptors(
+                      slice<resource::TextureUseHandle>::from_raw_parts(&first, usize(1)))
+                  .len(),
+              usize(1));
+    EXPECT_EQ(session.validation_errors(), 0u);
 }
 } // namespace vrento_test::texture_registry

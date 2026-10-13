@@ -5,6 +5,25 @@ import rstd;
 
 export namespace vrento::texture
 {
+inline auto describe_image(const vrento::Image& image) -> Result<Vec<TextureDesc>, Error> {
+    if (image.slots.is_empty()) return Err(Error { ErrorKind::Invalid });
+    Vec<TextureDesc> result;
+    for (const auto& slot : image.slots) {
+        if (slot.width <= 0 || slot.height <= 0 || slot.mipmaps.is_empty() ||
+            slot.mipmaps.len().to_primitive() > 32)
+            return Err(Error { ErrorKind::Invalid });
+        TextureDesc desc;
+        desc.extent = { Count(slot.width), Count(slot.height) };
+        desc.mip_levels =
+            image.header.kind == ImageKind::Video ? 1 : Count(slot.mipmaps.len().to_primitive());
+        desc.format =
+            image.header.kind == ImageKind::Video ? TextureFormat::RGBA8 : image.header.format;
+        auto checked = validate(desc);
+        if (checked.is_err()) return Err(checked.unwrap_err());
+        result.push(rstd::move(desc));
+    }
+    return Ok(rstd::move(result));
+}
 struct PreparedImage {
     TextureViewRef     view;
     SamplerRef         sampler;
@@ -18,18 +37,13 @@ public:
     auto PrepareImage(const vrento::Image& image) -> Result<Vec<PreparedImage>, Error> {
         if (image.header.kind != ImageKind::Pixels || image.slots.is_empty())
             return Err(Error { ErrorKind::Unsupported });
+        auto descriptions = describe_image(image);
+        if (descriptions.is_err()) return Err(descriptions.unwrap_err());
         Vec<PreparedImage> result;
-        for (const auto& slot : image.slots) {
-            if (slot.width <= 0 || slot.height <= 0 || slot.mipmaps.is_empty() ||
-                slot.mipmaps.len().to_primitive() > 32)
-                return Err(Error { ErrorKind::Invalid });
-            TextureDesc desc;
-            desc.extent     = { Count(slot.width), Count(slot.height) };
-            desc.mip_levels = Count(slot.mipmaps.len().to_primitive());
-            desc.format     = image.header.format;
-            auto checked    = validate(desc);
-            if (checked.is_err()) return Err(checked.unwrap_err());
-            auto layout = format_layout(desc.format);
+        for (usize index {}; index < image.slots.len(); ++index) {
+            const auto& slot   = image.slots[index];
+            const auto& desc   = (*descriptions)[index];
+            auto        layout = format_layout(desc.format);
             for (Count mip = 0; mip < desc.mip_levels; ++mip) {
                 auto&  source = slot.mipmaps[usize(mip)];
                 auto   extent = mip_extent(desc, mip);

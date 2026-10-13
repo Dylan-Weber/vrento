@@ -31,6 +31,13 @@ struct PipelineLayoutRequirement {
     resource::PipelineUseHandle       pipeline;
     Vec<PipelineLayoutSetRequirement> descriptor_sets;
     Vec<VkPushConstantRange>          push_constants;
+    auto                              clone() const -> PipelineLayoutRequirement {
+        PipelineLayoutRequirement result { .pipeline       = pipeline,
+                                           .push_constants = push_constants.clone() };
+        for (const auto& set : descriptor_sets)
+            result.descriptor_sets.push({ set.set, set.push_descriptor, set.bindings.clone() });
+        return result;
+    }
 };
 
 struct PlannedPipelineLayoutFamily {

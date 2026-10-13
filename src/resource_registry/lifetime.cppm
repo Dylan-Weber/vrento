@@ -25,7 +25,7 @@ struct FrameSubmissionLease {
     texture::SubmissionReceipt             receipt;
     vulkan::RecordedBufferUploads          recorded_buffers;
     Option<vulkan::BufferUploadBatchLease> buffer_uploads;
-    bool                                   uploads_recorded {};
+    bool                                   uploads_prepared {}, uploads_recorded {};
 
     FrameSubmissionLease(rstd::sync::Arc<RegistryBufferOwner> owner,
                          PreparedResourceLeases prepared, texture::SubmissionReceipt submitted)

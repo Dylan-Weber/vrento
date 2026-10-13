@@ -15,20 +15,27 @@ import :resource_registry.external;
 using rstd::collections::HashMap;
 using rstd::sync::Arc;
 
-export namespace vrento::resource_registry
-{
-
 using namespace rstd::prelude;
 using namespace rstd::literals;
 
+export namespace vrento::resource_registry
+{
+
 struct PreparedTexture {
-    resource::TextureUseHandle use;
-    resource::TextureHandle    resource;
-    resource::TextureRequest   request;
-    Arc<TextureAllocation>     physical;
-    vulkan::ImageSlotsRef      image;
-    u64                        physical_generation { 0 };
-    texture::SubmissionToken   completion;
+    resource::TextureUseHandle   use;
+    resource::TextureHandle      resource;
+    resource::TextureResourceRef definition;
+    auto request() const -> const resource::TextureRequest& { return definition.definition(); }
+    Arc<TextureAllocation>   physical;
+    vulkan::ImageSlotsRef    image;
+    u64                      physical_generation { 0 };
+    texture::SubmissionToken completion;
+    auto                     ActiveTexture() const -> Result<TextureSlot, texture::Error> {
+        auto slots = physical->Slots();
+        auto slot  = image.active_slot();
+        if (slot >= slots.len()) return Err(texture::Error { texture::ErrorKind::Invalid });
+        return Ok(TextureSlot(slots[slot]));
+    }
 };
 
 struct PreparedTextureLease {
@@ -130,6 +137,97 @@ public:
         return m_textures.get(use);
     }
 
+    auto ChangedTextureBindings(const PreparedResourceTable& previous) const
+        -> Vec<resource::TextureUseHandle> {
+        Vec<resource::TextureUseHandle> changed;
+        for (const auto& [use, texture] : m_textures.iter()) {
+            auto old = previous.Resolve(*use);
+            if (! old || ! Arc<TextureAllocation>::ptr_eq(texture->physical, (*old)->physical))
+                changed.push(resource::TextureUseHandle(*use));
+        }
+        for (const auto& [use, texture] : previous.m_textures.iter())
+            if (! Resolve(*use)) changed.push(resource::TextureUseHandle(*use));
+        return changed;
+    }
+
+    auto DescriptorTextures(resource::DescriptorBindingHandle handle) const
+        -> slice<DescriptorTextureBinding> {
+        auto found = m_descriptor_textures.get(handle);
+        return found ? (**found).as_slice() : slice<DescriptorTextureBinding>();
+    }
+    void ForgetDescriptorTextures(resource::DescriptorBindingHandle handle) {
+        auto previous = m_descriptor_textures.remove(handle);
+        if (! previous) return;
+        for (const auto& source : *previous) {
+            auto uses = m_texture_descriptors.get_mut(source.texture);
+            if (! uses) continue;
+            for (usize i {}; i < (**uses).len();)
+                if ((**uses)[i] == handle)
+                    (**uses).remove(i);
+                else
+                    ++i;
+            if ((**uses).is_empty()) (void)m_texture_descriptors.remove(source.texture);
+        }
+    }
+    auto TrackDescriptorTextures(resource::DescriptorBindingHandle handle,
+                                 slice<DescriptorTextureBinding>   sources) -> bool {
+        auto descriptor = Resolve(handle);
+        if (! descriptor || (*descriptor)->images.len() != sources.len()) return false;
+        for (const auto& image : (*descriptor)->images) {
+            usize matches {};
+            for (const auto& source : sources)
+                if (source.binding == image.binding) ++matches;
+            if (matches != usize(1)) return false;
+        }
+        auto previous = DescriptorTextures(handle);
+        bool same     = previous.len() == sources.len();
+        if (same)
+            for (usize i {}; i < sources.len(); ++i) same &= previous[i] == sources[i];
+        if (same) return true;
+        auto owned = Vec<DescriptorTextureBinding>::from(sources);
+        ForgetDescriptorTextures(handle);
+        if (owned.is_empty()) return true;
+        for (const auto& source : owned) {
+            if (! m_texture_descriptors.get(source.texture))
+                (void)m_texture_descriptors.insert(source.texture,
+                                                   Vec<resource::DescriptorBindingHandle>());
+            auto& uses = **m_texture_descriptors.get_mut(source.texture);
+            bool  found {};
+            for (auto existing : uses) found |= existing == handle;
+            if (! found) uses.push(resource::DescriptorBindingHandle(handle));
+        }
+        (void)m_descriptor_textures.insert(handle, rstd::move(owned));
+        return true;
+    }
+    auto AffectedTextureDescriptors(slice<resource::TextureUseHandle> textures) const
+        -> Vec<resource::DescriptorBindingHandle> {
+        Vec<resource::DescriptorBindingHandle>           result;
+        HashMap<resource::DescriptorBindingHandle, bool> seen;
+        for (auto texture : textures)
+            if (auto uses = m_texture_descriptors.get(texture))
+                for (auto descriptor : **uses)
+                    if (! seen.insert(descriptor, true)) result.push(rstd::move(descriptor));
+        return result;
+    }
+
+    auto TextureUses(texture::TextureViewRef view) const -> Vec<resource::TextureUseHandle> {
+        Vec<resource::TextureUseHandle> result;
+        for (const auto& [use, prepared] : m_textures.iter())
+            for (const auto& slot : prepared->physical->Slots())
+                if (slot.view.texture().identity() == view.texture().identity()) {
+                    result.push(resource::TextureUseHandle(*use));
+                    break;
+                }
+        return result;
+    }
+    auto BufferUses(const vulkan::BufferAllocation& allocation) const
+        -> Vec<resource::BufferUseHandle> {
+        Vec<resource::BufferUseHandle> result;
+        for (const auto& [use, prepared] : m_buffers.iter())
+            if (prepared->buffer.physical->buffer.identity() == allocation.identity())
+                result.push(resource::BufferUseHandle(*use));
+        return result;
+    }
     bool Insert(PreparedBufferUse buffer) {
         return m_buffers.insert(buffer.use, rstd::move(buffer)).is_none();
     }
@@ -152,6 +250,11 @@ public:
 
     auto Resolve(resource::PipelineUseHandle use) const -> Option<ref<PreparedPipeline>> {
         return m_pipelines.get(use);
+    }
+
+    void PublishPipeline(PreparedPipeline pipeline, PreparedRenderPass render_pass) {
+        (void)m_render_passes.insert(render_pass.use, rstd::move(render_pass));
+        (void)m_pipelines.insert(pipeline.use, rstd::move(pipeline));
     }
 
     bool Insert(PreparedRenderPass render_pass) {
@@ -313,11 +416,13 @@ public:
         if (! resource::ResourcePlanIncludes(prepared_sections, resource::ResourcePlanShaders)) {
             m_shaders = rstd::move(previous.m_shaders);
         }
-        m_pipelines     = rstd::move(previous.m_pipelines);
-        m_render_passes = rstd::move(previous.m_render_passes);
-        m_framebuffers  = rstd::move(previous.m_framebuffers);
-        m_descriptors   = rstd::move(previous.m_descriptors);
-        m_externals     = rstd::move(previous.m_externals);
+        m_pipelines           = rstd::move(previous.m_pipelines);
+        m_render_passes       = rstd::move(previous.m_render_passes);
+        m_framebuffers        = rstd::move(previous.m_framebuffers);
+        m_descriptors         = rstd::move(previous.m_descriptors);
+        m_descriptor_textures = rstd::move(previous.m_descriptor_textures);
+        m_texture_descriptors = rstd::move(previous.m_texture_descriptors);
+        m_externals           = rstd::move(previous.m_externals);
     }
 
     auto clone() const -> PreparedResourceTable {
@@ -329,7 +434,7 @@ public:
             (void)cloned.Insert(PreparedTexture {
                 .use                 = texture.use,
                 .resource            = texture.resource,
-                .request             = texture.request.clone(),
+                .definition          = texture.definition.clone(),
                 .physical            = texture.physical.clone(),
                 .image               = texture.image,
                 .physical_generation = texture.physical_generation,
@@ -392,6 +497,9 @@ public:
             (void)cloned.Insert((**value).clone());
         }
 
+        for (const auto& [handle, sources] : m_descriptor_textures.iter())
+            (void)cloned.TrackDescriptorTextures(*handle, sources->as_slice());
+
         auto externals = m_externals.values();
         for (auto value = externals.next(); value.is_some(); value = externals.next()) {
             const auto& external = **value;
@@ -408,13 +516,18 @@ public:
         m_render_passes.clear();
         m_framebuffers.clear();
         m_descriptors.clear();
+        m_descriptor_textures.clear();
+        m_texture_descriptors.clear();
         m_externals.clear();
     }
 
     void Remove(resource::PipelineUseHandle use) { (void)m_pipelines.remove(use); }
     void Remove(resource::RenderPassUseHandle use) { (void)m_render_passes.remove(use); }
     void Remove(resource::FramebufferUseHandle use) { (void)m_framebuffers.remove(use); }
-    void Remove(resource::DescriptorBindingHandle use) { (void)m_descriptors.remove(use); }
+    void Remove(resource::DescriptorBindingHandle use) {
+        ForgetDescriptorTextures(use);
+        (void)m_descriptors.remove(use);
+    }
     void Remove(resource::ExternalUseHandle use) { (void)m_externals.remove(use); }
 
 private:
@@ -427,15 +540,18 @@ private:
     using FramebufferMap = HashMap<resource::FramebufferUseHandle, PreparedFramebuffer>;
     using ExternalMap    = HashMap<resource::ExternalUseHandle, PreparedExternalUse>;
 
-    u64            m_generation { 0 };
-    TextureMap     m_textures;
-    BufferMap      m_buffers;
-    ShaderMap      m_shaders;
-    PipelineMap    m_pipelines;
-    RenderPassMap  m_render_passes;
-    FramebufferMap m_framebuffers;
-    DescriptorMap  m_descriptors;
-    ExternalMap    m_externals;
+    u64                                                                       m_generation { 0 };
+    TextureMap                                                                m_textures;
+    BufferMap                                                                 m_buffers;
+    ShaderMap                                                                 m_shaders;
+    PipelineMap                                                               m_pipelines;
+    RenderPassMap                                                             m_render_passes;
+    FramebufferMap                                                            m_framebuffers;
+    DescriptorMap                                                             m_descriptors;
+    HashMap<resource::DescriptorBindingHandle, Vec<DescriptorTextureBinding>> m_descriptor_textures;
+    HashMap<resource::TextureUseHandle, Vec<resource::DescriptorBindingHandle>>
+                m_texture_descriptors;
+    ExternalMap m_externals;
 };
 
 class ResourcePrepareService;
@@ -504,7 +620,7 @@ public:
     ResourcePrepareSession(ResourcePrepareSession&&) noexcept                    = default;
     auto operator=(ResourcePrepareSession&&) noexcept -> ResourcePrepareSession& = delete;
 
-    auto Plan() const noexcept -> const resource::ResourcePlan& { return *m_plan; }
+    auto Plan() const noexcept -> const resource::ResourcePlan& { return m_plan; }
     auto Sections() const noexcept -> resource::ResourcePlanSections { return m_sections; }
     auto TakeTable() && -> PreparedResourceTable { return rstd::move(m_table); }
 
@@ -512,9 +628,9 @@ private:
     friend class ResourcePrepareService;
 
     struct PendingUse {
-        resource::TextureUseHandle use;
-        resource::TextureHandle    resource;
-        resource::TextureRequest   request;
+        resource::TextureUseHandle   use;
+        resource::TextureHandle      resource;
+        resource::TextureResourceRef definition;
     };
 
     struct PendingContent {
@@ -530,9 +646,9 @@ private:
 
     ResourcePrepareSession(const resource::ResourcePlan&  plan,
                            resource::ResourcePlanSections sections)
-        : m_plan(rstd::addressof(plan)), m_sections(sections), m_table(plan.generation) {}
+        : m_plan(plan.clone()), m_sections(sections), m_table(plan.generation) {}
 
-    const resource::ResourcePlan*                         m_plan;
+    resource::ResourcePlan                                m_plan;
     resource::ResourcePlanSections                        m_sections;
     PreparedResourceTable                                 m_table;
     Vec<PendingContent>                                   m_pending { Vec<PendingContent>::make() };
@@ -615,17 +731,20 @@ public:
     auto PrepareBuffer(const resource::BufferPlanEntry& entry, PreparedResourceTable& table,
                        Option<mut_ref<dyn<resource::BufferContentProvider>>> content)
         -> Result<empty, resource::ResourceError> {
+        if (! entry.definition.valid())
+            return Err(
+                resource::ResourceError { .kind = resource::ResourceErrorKind::MissingDefinition });
         if (content.is_none()) {
             return Err(resource::ResourceError {
                 .kind = resource::ResourceErrorKind::MissingContent,
                 .message =
-                    rstd::format("buffer content {} unavailable", entry.request.name.as_str()),
+                    rstd::format("buffer content {} unavailable", entry.request().name.as_str()),
             });
         }
-        auto loaded = (*content)->LoadBuffer(entry.request);
+        auto loaded = (*content)->LoadBuffer(entry.request());
         if (loaded.is_err()) return Err(rstd::move(loaded).unwrap_err_unchecked());
         auto prepared =
-            m_buffers.Ensure(entry.request.clone(), loaded.unwrap_unchecked(), m_buffer_backend);
+            m_buffers.Ensure(entry.definition.clone(), loaded.unwrap_unchecked(), m_buffer_backend);
         if (prepared.is_err()) return Err(rstd::move(prepared).unwrap_err_unchecked());
         if (! table.Insert(PreparedBufferUse {
                 .use    = entry.handle,
@@ -671,34 +790,39 @@ public:
         TexturePrepareTrace plan_trace(observer, TexturePrepareTrace::Kind::Plan);
 
         for (usize entry_index {}; entry_index < entries.len(); ++entry_index) {
-            const auto& entry              = entries[entry_index];
-            auto        imported_content   = None<resource::ImportedTextureContentIdentity>();
-            auto        allocation_request = entry.request.clone();
-            if (! entry.allocation_key.is_empty()) {
-                allocation_request.name = entry.allocation_key.clone();
-            }
+            const auto& entry            = entries[entry_index];
+            auto        imported_content = None<resource::ImportedTextureContentIdentity>();
+            if (! entry.definition.valid())
+                return Err(resource::ResourceError {
+                    .kind = resource::ResourceErrorKind::MissingDefinition });
             resource::TextureHandle handle;
-            if (entry.request.kind == resource::TextureRequestKind::Imported) {
+            if (entry.request().kind == resource::TextureRequestKind::Imported) {
                 if (content.is_none()) {
                     return Err(resource::ResourceError {
                         .kind    = resource::ResourceErrorKind::MissingContent,
                         .message = rstd::format("texture content {} unavailable",
-                                                entry.request.name.as_str()),
+                                                entry.request().name.as_str()),
                     });
                 }
-                auto resolved = (*content)->ResolveTextureContent(entry.request);
+                auto resolved = (*content)->ResolveTextureContent(entry.request());
                 if (resolved.is_err()) return Err(rstd::move(resolved).unwrap_err_unchecked());
                 imported_content = Some(rstd::move(resolved).unwrap_unchecked());
-                handle           = m_textures.RegisterImported(rstd::move(allocation_request),
-                                                               imported_content->clone());
+                handle = m_textures.RegisterImported(entry.definition.clone(),
+                                                     imported_content->clone(),
+                                                     entry.allocation_key.is_empty()
+                                                         ? None<ref<str>>()
+                                                         : Some(entry.allocation_key.as_str()));
             } else {
-                handle = m_textures.Register(allocation_request.clone());
+                handle = m_textures.Register(entry.definition.clone(),
+                                             entry.allocation_key.is_empty()
+                                                 ? None<ref<str>>()
+                                                 : Some(entry.allocation_key.as_str()));
             }
             if (! handle.Valid()) {
                 return Err(resource::ResourceError {
                     .kind = resource::ResourceErrorKind::MissingDefinition,
                     .message =
-                        rstd::format("invalid texture request {}", entry.request.name.as_str()),
+                        rstd::format("invalid texture request {}", entry.request().name.as_str()),
                 });
             }
 
@@ -706,14 +830,17 @@ public:
             if (physical.is_none()) physical = m_textures.ResolvePending(handle);
             if (physical.is_some()) {
                 auto inserted = InsertPrepared(
-                    entry.handle, handle, entry.request.clone(), **physical, session.m_table);
+                    entry.handle, handle, entry.definition.clone(), **physical, session.m_table);
                 if (inserted.is_err()) return inserted;
                 continue;
             }
 
-            if (entry.request.kind != resource::TextureRequestKind::Imported) {
+            if (entry.request().kind != resource::TextureRequestKind::Imported) {
+                auto allocation_request = entry.request().clone();
+                if (! entry.allocation_key.is_empty())
+                    allocation_request.name = entry.allocation_key.clone();
                 const bool initialize_transparent =
-                    (entry.request.content &
+                    (entry.request().content &
                      resource::TextureContentFlag(
                          resource::TextureContent::InitializeTransparent)) != u32();
                 if (initialize_transparent) {
@@ -724,7 +851,7 @@ public:
                     auto allocation = rstd::move(prepared).unwrap_unchecked();
                     auto published  = PublishPrepared(entry.handle,
                                                       handle,
-                                                      entry.request.clone(),
+                                                      entry.definition.clone(),
                                                       rstd::move(allocation.allocation),
                                                       allocation.upload,
                                                       session.m_table);
@@ -737,7 +864,7 @@ public:
                 if (allocated.is_err()) return Err(rstd::move(allocated).unwrap_err_unchecked());
                 auto published = PublishPrepared(entry.handle,
                                                  handle,
-                                                 entry.request.clone(),
+                                                 entry.definition.clone(),
                                                  rstd::move(allocated).unwrap_unchecked(),
                                                  None<vulkan::ImageUploadTicket>(),
                                                  session.m_table);
@@ -749,7 +876,7 @@ public:
 
             auto  identity = rstd::move(imported_content).unwrap_unchecked();
             auto  found    = pending_index.get(identity);
-            auto  playback = (*content)->ResolveVideoPlayback(entry.request);
+            auto  playback = (*content)->ResolveVideoPlayback(entry.request());
             usize index;
             if (found.is_some()) {
                 index = **found;
@@ -766,9 +893,9 @@ public:
                 });
             }
             session.m_pending[index].uses.push(ResourcePrepareSession::PendingUse {
-                .use      = entry.handle,
-                .resource = handle,
-                .request  = entry.request.clone(),
+                .use        = entry.handle,
+                .resource   = handle,
+                .definition = entry.definition.clone(),
             });
         }
         plan_trace.Finish();
@@ -854,7 +981,7 @@ public:
                 for (auto& use : session.m_pending[item.index].uses) {
                     auto published = PublishPrepared(use.use,
                                                      use.resource,
-                                                     rstd::move(use.request),
+                                                     rstd::move(use.definition),
                                                      allocation.clone(),
                                                      prepared.upload,
                                                      session.m_table);
@@ -949,7 +1076,7 @@ private:
     }
 
     auto PublishPrepared(resource::TextureUseHandle use, resource::TextureHandle handle,
-                         resource::TextureRequest request, Arc<TextureAllocation> allocation,
+                         resource::TextureResourceRef definition, Arc<TextureAllocation> allocation,
                          Option<vulkan::ImageUploadTicket> upload, PreparedResourceTable& table)
         -> Result<empty, resource::ResourceError> {
         auto physical = m_textures.ResolveCurrent(handle);
@@ -959,13 +1086,14 @@ private:
             if (published.is_none()) {
                 return Err(resource::ResourceError {
                     .kind    = resource::ResourceErrorKind::BackendFailure,
-                    .message = rstd::format("publish texture {} failed", request.name.as_str()),
+                    .message = rstd::format("publish texture {} failed",
+                                            definition.definition().name.as_str()),
                 });
             }
             if (upload.is_some()) {
                 return InsertPrepared(use,
                                       handle,
-                                      rstd::move(request),
+                                      rstd::move(definition),
                                       rstd::move(prepared_allocation),
                                       *published,
                                       table);
@@ -975,35 +1103,37 @@ private:
         if (physical.is_none()) {
             return Err(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::BackendFailure,
-                .message = rstd::format("resolve texture {} failed", request.name.as_str()),
+                .message = rstd::format("resolve texture {} failed",
+                                        definition.definition().name.as_str()),
             });
         }
-        return InsertPrepared(use, handle, rstd::move(request), **physical, table);
+        return InsertPrepared(use, handle, rstd::move(definition), **physical, table);
     }
 
     static auto InsertPrepared(resource::TextureUseHandle use, resource::TextureHandle handle,
-                               resource::TextureRequest         request,
+                               resource::TextureResourceRef     definition,
                                const resource::TexturePhysical& physical,
                                PreparedResourceTable&           table)
         -> Result<empty, resource::ResourceError> {
         return InsertPrepared(use,
                               handle,
-                              rstd::move(request),
+                              rstd::move(definition),
                               physical.allocation.clone(),
                               physical.generation,
                               table);
     }
 
     static auto InsertPrepared(resource::TextureUseHandle use, resource::TextureHandle handle,
-                               resource::TextureRequest request, Arc<TextureAllocation> allocation,
-                               u64 physical_generation, PreparedResourceTable& table)
+                               resource::TextureResourceRef definition,
+                               Arc<TextureAllocation> allocation, u64 physical_generation,
+                               PreparedResourceTable& table)
         -> Result<empty, resource::ResourceError> {
         auto image      = allocation->View();
         auto completion = allocation->Completion();
         if (! table.Insert(PreparedTexture {
                 .use                 = use,
                 .resource            = handle,
-                .request             = rstd::move(request),
+                .definition          = rstd::move(definition),
                 .physical            = rstd::move(allocation),
                 .image               = rstd::move(image),
                 .physical_generation = physical_generation,

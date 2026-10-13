@@ -73,12 +73,14 @@ bool Device::CheckGPU(vvk::PhysicalDevice gpu, slice<Extension> exts, VkSurfaceK
     };
     VkPhysicalDeviceFeatures2KHR features2 {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR,
-        .pNext = requires_timeline_semaphore ? static_cast<void*>(&timeline_features)
-                 : (requires_maintenance ? &maintenance_features : nullptr),
+        .pNext = requires_timeline_semaphore
+                     ? static_cast<void*>(&timeline_features)
+                     : (requires_maintenance ? &maintenance_features : nullptr),
     };
-    if (requires_timeline_semaphore && requires_maintenance) timeline_features.pNext = &maintenance_features;
+    if (requires_timeline_semaphore && requires_maintenance)
+        timeline_features.pNext = &maintenance_features;
     gpu.GetFeatures2KHR(features2);
-    if (requires_maintenance && !maintenance_features.swapchainMaintenance1) return false;
+    if (requires_maintenance && ! maintenance_features.swapchainMaintenance1) return false;
 #if ! __is_target_os(macos)
     if (! features2.features.geometryShader) return false;
 #endif
@@ -97,9 +99,10 @@ Vec<VkDeviceQueueCreateInfo> Device::ChooseDeviceQueue(VkSurfaceKHR surface) {
         if (prop.queueFlags & VK_QUEUE_GRAPHICS_BIT) graphic_indexs.emplace_back(index);
         index++;
     }
-    m_graphics_queue.family_index           = graphic_indexs[usize()];
-    const static float defaultQueuePriority = 0.0f;
-    m_present_queue.family_index            = graphic_indexs[usize()];
+    m_graphics_queue.family_index = graphic_indexs[usize()];
+    m_graphics_queue.flags        = props[usize(m_graphics_queue.family_index)].queueFlags;
+    const static float defaultQueuePriorities[] = { 0.0f, 0.0f };
+    m_present_queue.family_index                = graphic_indexs[usize()];
     if (surface) {
         index = 0;
         for (auto& prop : props) {
@@ -120,8 +123,8 @@ Vec<VkDeviceQueueCreateInfo> Device::ChooseDeviceQueue(VkSurfaceKHR surface) {
         VkDeviceQueueCreateInfo info {
             .sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
             .queueFamilyIndex = i,
-            .queueCount       = 1,
-            .pQueuePriorities = &defaultQueuePriority,
+            .queueCount       = rstd::cmp::min(props[usize(i)].queueCount, rstd::uint32_t(2)),
+            .pQueuePriorities = defaultQueuePriorities,
         };
         queues.push(rstd::move(info));
     }
@@ -179,7 +182,7 @@ bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, De
     };
     if (maintenance) supported_ycbcr.pNext = &supported_maintenance;
     supported_maintenance.pNext = &supported_sync2;
-    supported_timeline.pNext = &supported_ycbcr;
+    supported_timeline.pNext    = &supported_ycbcr;
     VkPhysicalDeviceFeatures2KHR supported2 {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR,
         .pNext = &supported_timeline,
@@ -246,7 +249,7 @@ bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, De
         .swapchainMaintenance1 = VK_TRUE,
     };
     if (maintenance) {
-        if (!supported_maintenance.swapchainMaintenance1) return false;
+        if (! supported_maintenance.swapchainMaintenance1) return false;
         enabled_ycbcr.pNext = &enabled_maintenance;
     }
     enabled_timeline.pNext = &enabled_ycbcr;
@@ -275,6 +278,16 @@ bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, De
 
     device.m_graphics_queue.handle = device.m_device.GetQueue(device.m_graphics_queue.family_index);
     device.m_present_queue.handle  = device.m_device.GetQueue(device.m_present_queue.family_index);
+    auto queue_properties          = device.m_gpu.GetQueueFamilyProperties();
+    device.m_present_queue.flags =
+        queue_properties[usize(device.m_present_queue.family_index)].queueFlags;
+    device.m_queues.clear();
+    for (const auto& info : queue_create_infos)
+        for (rstd::uint32_t index {}; index < info.queueCount; ++index)
+            device.m_queues.push({ device.m_device.GetQueue(info.queueFamilyIndex, index),
+                                   info.queueFamilyIndex,
+                                   queue_properties[usize(info.queueFamilyIndex)].queueFlags,
+                                   index });
     rstd::uint32_t max_push_descriptors {};
     if (tested_exts.contains(
             CStr::from_ptr(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME).to_str().unwrap())) {
@@ -317,7 +330,8 @@ bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, De
     };
 
     if (rq_surface) {
-        if (! Swapchain::Create(device, *inst.surface(), extent, device.m_swapchain, swapchain_options)) {
+        if (! Swapchain::Create(
+                device, *inst.surface(), extent, device.m_swapchain, swapchain_options)) {
             rstd_error("create swapchain failed");
             return false;
         }
@@ -367,8 +381,10 @@ bool Device::supportExt(ref<str> name) const { return m_extensions.contains(name
 bool Device::recreateSwapchain(VkSurfaceKHR surface, VkExtent2D extent, SwapchainOptions options) {
     return recreateSwapchainResult(surface, extent, options) == VK_SUCCESS;
 }
-auto Device::recreateSwapchainResult(VkSurfaceKHR surface, VkExtent2D extent, SwapchainOptions options) -> VkResult {
-    auto result = observe_result(Swapchain::CreateResult(*this, surface, extent, m_swapchain, options));
+auto Device::recreateSwapchainResult(VkSurfaceKHR surface, VkExtent2D extent,
+                                     SwapchainOptions options) -> VkResult {
+    auto result =
+        observe_result(Swapchain::CreateResult(*this, surface, extent, m_swapchain, options));
     if (result == VK_SUCCESS) set_out_extent(m_swapchain.extent());
     return result;
 }

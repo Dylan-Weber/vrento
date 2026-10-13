@@ -48,14 +48,15 @@ VkAccessFlags DestinationAccess(BufferUploadClass usage) {
     return VK_ACCESS_MEMORY_READ_BIT;
 }
 
-VkPipelineStageFlags DestinationStages(BufferUploadClass usage) {
+VkPipelineStageFlags DestinationStages(BufferUploadClass usage, bool geometry, bool compute) {
     switch (usage) {
     case BufferUploadClass::Vertex:
     case BufferUploadClass::Index: return VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
     case BufferUploadClass::Uniform:
     case BufferUploadClass::Storage:
         return VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+               (compute ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VkPipelineStageFlags()) |
+               (geometry ? VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT : VkPipelineStageFlags());
     case BufferUploadClass::Transfer: return VK_PIPELINE_STAGE_TRANSFER_BIT;
     }
     return VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -82,6 +83,7 @@ public:
     void Release(alloc::RangeId allocation) { (void)m_ranges.deallocate(allocation); }
 
     VkBuffer     handle() const noexcept { return m_buffer.handle.handle(); }
+    VkDevice     device() const noexcept { return *m_device.handle(); }
     VkDeviceSize size() const noexcept { return m_size; }
     bool         empty() const noexcept { return m_ranges.counters().allocation_count == 0; }
 
@@ -207,6 +209,7 @@ struct ImageRegionOperation {
 } // namespace
 
 struct BufferAllocation::State {
+    rstd::uint64_t          identity {};
     Option<Arc<BufferPage>> page;
     alloc::RangeId          allocation {};
     VkDeviceSize            offset { 0 };
@@ -221,7 +224,7 @@ struct BufferAllocation::State {
 struct RecordedBufferUploads::State {
     BufferManager*           owner {};
     u64                      serial { 0 };
-    bool                     recorded { false };
+    bool                     reserved { false }, recorded { false };
     Vec<BufferCopyOperation> copies;
     Vec<Arc<UploadBlock>>    blocks;
     Vec<BufferUploadTicket>  tickets;
@@ -246,6 +249,7 @@ struct BufferManager::Impl {
     Vec<Arc<BufferPage>>                      pages;
     Vec<Arc<UploadBlock>>                     upload_blocks;
     Option<Arc<RecordedBufferUploads::State>> pending;
+    BufferUploadStatistics                    statistics;
 };
 
 struct ImageUploadManager::Impl {
@@ -308,7 +312,16 @@ VkBuffer BufferAllocation::buffer() const noexcept {
 
 VkDeviceSize BufferAllocation::offset() const noexcept { return m_state ? (*m_state)->offset : 0; }
 
-VkDeviceSize BufferAllocation::size() const noexcept { return m_state ? (*m_state)->size : 0; }
+VkDeviceSize   BufferAllocation::size() const noexcept { return m_state ? (*m_state)->size : 0; }
+rstd::uint64_t BufferAllocation::identity() const noexcept {
+    return m_state ? (*m_state)->identity : 0;
+}
+VkDevice BufferAllocation::device() const noexcept {
+    return m_state && (*m_state)->page ? (*(*m_state)->page)->device() : VK_NULL_HANDLE;
+}
+auto BufferAllocation::clone() const -> BufferAllocation {
+    return m_state ? BufferAllocation(m_state->clone()) : BufferAllocation {};
+}
 
 RecordedBufferUploads::RecordedBufferUploads(BufferManager* owner, Arc<State> state)
     : m_owner(owner), m_state(Some(rstd::move(state))) {}
@@ -404,7 +417,10 @@ Option<BufferAllocation> BufferManager::Allocate(const BufferAllocationRequest& 
             "new destination buffer page, size: {}, pages: {}", page_size, m_impl->pages.len());
     }
 
-    auto state        = Arc<BufferAllocation::State>::make();
+    auto                  state = Arc<BufferAllocation::State>::make();
+    static rstd::uint64_t next_identity { 1 };
+    state->identity = __atomic_fetch_add(&next_identity, rstd::uint64_t(1), __ATOMIC_RELAXED);
+    if (! state->identity) rstd::panic("buffer identity exhausted");
     state->page       = rstd::move(page);
     state->allocation = allocation;
     state->offset     = offset;
@@ -422,8 +438,8 @@ Option<BufferUploadTicket> BufferManager::QueueWrite(BufferAllocation&    alloca
         return None();
     }
     if (data.is_empty()) return Some(BufferUploadTicket {});
-    if (m_impl->pending && (*m_impl->pending)->recorded) {
-        rstd_error("queue buffer write while the pending upload batch is recorded");
+    if (m_impl->pending && (*m_impl->pending)->reserved) {
+        rstd_error("queue buffer write while the pending upload batch is reserved");
         return None();
     }
 
@@ -482,24 +498,81 @@ Option<BufferUploadTicket> BufferManager::QueueWrite(BufferAllocation&    alloca
             .usage              = (*allocation.m_state)->usage,
         });
     (*m_impl->pending)->tickets.push(decltype(ticket)(ticket));
+    auto category = unsigned((*allocation.m_state)->usage);
+    ++m_impl->statistics.queued_copies[category];
+    m_impl->statistics.queued_bytes[category] += data.len().to_primitive();
     return Some(ticket);
+}
+
+auto BufferManager::statistics() const -> BufferUploadStatistics { return m_impl->statistics; }
+auto BufferAllocation::usage() const noexcept -> BufferUploadClass {
+    return m_state ? (*m_state)->usage : BufferUploadClass::Vertex;
 }
 
 bool BufferManager::HasPendingUploads() const noexcept {
     return m_impl->pending && ! (*m_impl->pending)->copies.is_empty();
 }
 
-bool BufferManager::RecordPendingUploads(vvk::CommandBuffer& cmd, RecordedBufferUploads& recorded) {
-    recorded.Reset();
-    if (! HasPendingUploads()) return true;
-    if ((*m_impl->pending)->recorded) {
-        rstd_error("buffer upload batch is already recorded");
-        return false;
+auto RecordedBufferUploads::Writes() const -> Vec<BufferUploadWrite> {
+    Vec<BufferUploadWrite> pending;
+    if (! m_state) return pending;
+    for (const auto& copy : (*m_state)->copies)
+        pending.push({ copy.destination_lease.clone(),
+                       copy.destination_offset - copy.destination_lease.offset(),
+                       copy.size });
+    rstd::slice_::sort_unstable_by(
+        pending.as_mut_slice().as_mut_ref(), [](const auto& lhs, const auto& rhs) {
+            return lhs.allocation.identity() != rhs.allocation.identity()
+                       ? lhs.allocation.identity() < rhs.allocation.identity()
+                       : lhs.offset < rhs.offset;
+        });
+    Vec<BufferUploadWrite> result;
+    for (auto& write : pending) {
+        if (auto previous = result.last_mut();
+            previous && (*previous)->allocation.identity() == write.allocation.identity() &&
+            write.offset <= (*previous)->offset + (*previous)->size) {
+            (*previous)->size =
+                rstd::cmp::max((*previous)->offset + (*previous)->size, write.offset + write.size) -
+                (*previous)->offset;
+        } else
+            result.push(rstd::move(write));
     }
+    return result;
+}
+bool BufferManager::PreparePendingUploads(RecordedBufferUploads& prepared) {
+    prepared.Reset();
+    if (! HasPendingUploads()) return true;
+    if ((*m_impl->pending)->reserved) return false;
+    (*m_impl->pending)->reserved = true;
+    prepared                     = RecordedBufferUploads(this, m_impl->pending->clone());
+    return true;
+}
+bool BufferManager::RecordPendingUploads(vvk::CommandBuffer& cmd, RecordedBufferUploads& recorded) {
+    return PreparePendingUploads(recorded) && RecordUploads(cmd, recorded);
+}
+bool BufferManager::RecordUploads(vvk::CommandBuffer& cmd, RecordedBufferUploads& prepared) {
+    if (! prepared.Valid()) return ! HasPendingUploads();
+    if (prepared.m_owner != this || ! m_impl->pending ||
+        ! Arc<RecordedBufferUploads::State>::ptr_eq(*prepared.m_state, *m_impl->pending) ||
+        ! (*m_impl->pending)->reserved || (*m_impl->pending)->recorded)
+        return false;
     for (const auto& block : (*m_impl->pending)->blocks) {
         if (! block->Flush()) return false;
     }
-    for (const auto& copy : (*m_impl->pending)->copies) {
+    for (usize i {}; i < (*m_impl->pending)->copies.len(); ++i) {
+        const auto& copy = (*m_impl->pending)->copies[i];
+        // Uploads may overwrite ranges read by an earlier submission.
+        VkBufferMemoryBarrier overwrite { .sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                                          .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                                                           VK_ACCESS_MEMORY_WRITE_BIT,
+                                          .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                          .buffer              = copy.destination,
+                                          .offset              = copy.destination_offset,
+                                          .size                = copy.size };
+        cmd.PipelineBarrier(
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, overwrite);
         cmd.CopyBuffer(copy.source->handle(),
                        copy.destination,
                        VkBufferCopy {
@@ -507,6 +580,9 @@ bool BufferManager::RecordPendingUploads(vvk::CommandBuffer& cmd, RecordedBuffer
                            .dstOffset = copy.destination_offset,
                            .size      = copy.size,
                        });
+        auto category = unsigned(copy.usage);
+        ++m_impl->statistics.recorded_copies[category];
+        m_impl->statistics.recorded_bytes[category] += copy.size;
     }
     for (const auto& copy : (*m_impl->pending)->copies) {
         VkBufferMemoryBarrier barrier {
@@ -519,13 +595,15 @@ bool BufferManager::RecordPendingUploads(vvk::CommandBuffer& cmd, RecordedBuffer
             .offset              = copy.destination_offset,
             .size                = copy.size,
         };
-        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                            DestinationStages(copy.usage),
-                            VK_DEPENDENCY_BY_REGION_BIT,
-                            barrier);
+        cmd.PipelineBarrier(
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            DestinationStages(copy.usage,
+                              m_impl->device.capabilities().geometry_shader,
+                              m_impl->device.graphics_queue().flags & VK_QUEUE_COMPUTE_BIT),
+            VK_DEPENDENCY_BY_REGION_BIT,
+            barrier);
     }
     (*m_impl->pending)->recorded = true;
-    recorded                     = RecordedBufferUploads(this, m_impl->pending->clone());
     return true;
 }
 
@@ -538,14 +616,14 @@ BufferManager::CommitRecordedUploads(RecordedBufferUploads&& recorded) {
     }
     auto state       = recorded.m_state.take().unwrap();
     recorded.m_owner = nullptr;
-    state->recorded  = false;
-    m_impl->pending  = None();
+    state->reserved = state->recorded = false;
+    m_impl->pending                   = None();
     return Some(BufferUploadBatchLease(rstd::move(state)));
 }
 
 bool BufferManager::RestoreUploads(BufferUploadBatchLease uploads) {
     if (! m_impl->initialized || ! uploads.m_state || (*uploads.m_state)->owner != this ||
-        (m_impl->pending && (*m_impl->pending)->recorded))
+        (m_impl->pending && (*m_impl->pending)->reserved))
         return false;
     auto state = uploads.m_state.take().unwrap();
     if (! m_impl->pending) {
@@ -563,7 +641,7 @@ bool BufferManager::RestoreUploads(BufferUploadBatchLease uploads) {
 
 void BufferManager::CancelRecordedUploads(const Arc<RecordedBufferUploads::State>& state) {
     if (m_impl->pending && Arc<RecordedBufferUploads::State>::ptr_eq(state, *m_impl->pending))
-        state->recorded = false;
+        state->reserved = state->recorded = false;
 }
 
 void BufferManager::Trim() {

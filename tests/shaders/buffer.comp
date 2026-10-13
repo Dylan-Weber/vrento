@@ -1,0 +1,4 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) buffer Color { vec4 value; } output_color;
+void main() { output_color.value = vec4(1, 0, 0, 1); }

@@ -2,6 +2,7 @@ module;
 #include <vulkan/vk_platform.h>
 export module vrento:vulkan.device_session;
 export import :vulkan.api;
+export import :resource_registry.graphics;
 import rstd;
 
 export namespace vrento::vulkan
@@ -22,6 +23,13 @@ struct DeviceSessionError {
     VkResult           result { VK_ERROR_INITIALIZATION_FAILED };
 };
 using SurfaceLifetime = rstd::any::Any;
+struct GraphicsResources {
+    resource_registry::DescriptorLayoutRegistry descriptors;
+    resource_registry::DescriptorSystem         descriptor_snapshots;
+    resource_registry::PipelineLayoutRegistry   layouts;
+    resource_registry::RenderPassRegistry       passes;
+    resource_registry::PipelineRegistry         pipelines;
+};
 struct SessionSurface {
     VkSurfaceKHR handle { VK_NULL_HANDLE };
     // Instance owns the VkSurfaceKHR; this owner retains its native window.
@@ -51,6 +59,7 @@ struct DeviceSessionOptions {
     VkExtent2D           extent { 1, 1 };
     SwapchainOptions     swapchain {};
     bool                 validation {};
+    slice<u8>            pipeline_cache_data {};
 };
 
 class DeviceSession {
@@ -61,6 +70,7 @@ class DeviceSession {
         Instance                          instance;
         vvk::DebugUtilsMessenger          debug;
         Device                            device;
+        GraphicsResources                 graphics;
         ~State() {
             if (device.handle()) (void)device.handle().WaitIdle();
         }
@@ -140,6 +150,11 @@ public:
         static rstd::uint64_t next_epoch = 1;
         state->epoch                     = __atomic_fetch_add(&next_epoch, 1, __ATOMIC_RELAXED);
         if (! state->epoch) rstd::panic("device session identity exhausted");
+        auto cache = state->graphics.pipelines.driver_cache().initialize(
+            state->device, options.pipeline_cache_data);
+        if (cache.is_err())
+            return Err(
+                DeviceSessionError { DeviceSessionStage::Device, cache.unwrap_err().native });
         return Ok(DeviceSession(rstd::move(state)));
     }
     auto valid() const -> bool { return bool(state_); }
@@ -153,6 +168,7 @@ public:
         return observe_result(device().handle().WaitIdle());
     }
     auto device() const -> const Device& { return state_->device; }
+    auto graphics_resources() const -> GraphicsResources& { return state_->graphics; }
     auto instance_owner() const -> const Instance& { return state_->instance; }
     auto instance() const -> VkInstance { return *state_->instance.inst(); }
     auto epoch() const -> rstd::uint64_t { return state_->epoch; }
@@ -162,7 +178,7 @@ public:
         if (! valid()) return;
         state_->device.releaseSwapchain();
         state_->instance.setSurface(VK_NULL_HANDLE);
-        state_->native_surface = None();
+        // Shared sessions retain the native window after swapchain retirement.
     }
     auto validation_errors() const -> unsigned {
         return __atomic_load_n(&state_->errors, __ATOMIC_RELAXED);

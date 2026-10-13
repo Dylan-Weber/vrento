@@ -13,21 +13,79 @@ import :resource_registry.state;
 import :resource_registry.lifetime;
 import :resource_registry.local_output;
 import :vulkan.texture;
+import :vulkan.pipeline_prepare;
+import :vulkan.graph;
+
+using namespace rstd::prelude;
 
 export namespace vrento::resource_registry
 {
 
-using namespace rstd::prelude;
+class PreparedResourceUploads {
+    vulkan::DeviceSession                 session_;
+    rstd::sync::Arc<FrameSubmissionLease> frame_;
+    texture::Serial                       recording_;
+    Vec<PreparedTextureUpdate>            updates_;
+
+public:
+    PreparedResourceUploads(vulkan::DeviceSession                 session,
+                            rstd::sync::Arc<FrameSubmissionLease> frame, texture::Serial recording,
+                            Vec<PreparedTextureUpdate> updates)
+        : session_(rstd::move(session)),
+          frame_(rstd::move(frame)),
+          recording_(recording),
+          updates_(rstd::move(updates)) {}
+    auto BufferWrites() const -> Vec<vulkan::BufferUploadWrite> {
+        return frame_->recorded_buffers.Writes();
+    }
+    auto BufferBinding(const vulkan::BufferAllocation& allocation) const
+        -> rstd::sync::Arc<dyn<vulkan::GraphBinding>> {
+        Vec<vulkan::GraphRange> writes;
+        for (const auto& write : BufferWrites())
+            if (write.allocation.identity() == allocation.identity())
+                writes.push({ .offset = write.offset, .size = write.size });
+        return rstd::sync::Arc<dyn<vulkan::GraphBinding>>::make(vulkan::GraphUploadedBufferBinding(
+            session_, allocation.clone(), frame_->receipt, rstd::move(writes)));
+    }
+    auto Writes() const -> Vec<texture::TextureAccess> {
+        Vec<texture::TextureAccess> writes;
+        for (const auto& update : updates_)
+            for (auto write : update.Writes()) writes.push(rstd::move(write));
+        return writes;
+    }
+    auto Add(PreparedTextureUpdate update) -> Result<empty, texture::Error> {
+        if (frame_->uploads_recorded) return Err(texture::Error { texture::ErrorKind::Invalid });
+        updates_.push(rstd::move(update));
+        return Ok(empty {});
+    }
+    auto Record(texture::Submission& work) const -> Result<empty, texture::Error> {
+        auto recording = vulkan::texture_recording(work, session_);
+        if (recording.is_err()) return Err(recording.unwrap_err());
+        if (recording.unwrap()->identity != recording_ || frame_->uploads_recorded)
+            return Err(texture::Error { texture::ErrorKind::Invalid });
+        vvk::CommandBuffer command(recording.unwrap()->command,
+                                   session_.device().handle().Dispatch());
+        if (! frame_->buffer_owner->manager.RecordUploads(command, frame_->recorded_buffers))
+            return Err(texture::Error { texture::ErrorKind::Backend });
+        for (const auto& update : updates_) {
+            auto result = update.Record(work, session_);
+            if (result.is_err()) return result;
+        }
+        frame_->uploads_recorded = true;
+        return Ok(empty {});
+    }
+};
 
 struct PipelinePreparation {
-    resource::PipelineHandle   resource;
-    resource::RenderPassHandle render_pass;
-    vulkan::PipelineCacheKey   cache_key;
-    vulkan::RenderPassCacheKey render_pass_key;
-    bool                       cache_hit { false };
-    u64                        cache_observed_count { 0 };
-    bool                       render_pass_cache_hit { false };
-    u64                        render_pass_cache_observed_count { 0 };
+    resource::PipelineHandle               resource;
+    resource::RenderPassHandle             render_pass;
+    vulkan::PipelineCacheKey               cache_key;
+    vulkan::RenderPassCacheKey             render_pass_key;
+    bool                                   cache_hit { false };
+    u64                                    cache_observed_count { 0 };
+    bool                                   render_pass_cache_hit { false };
+    u64                                    render_pass_cache_observed_count { 0 };
+    rstd::sync::Arc<PipelineResourceEntry> physical;
 };
 
 struct FramebufferPreparation {
@@ -90,11 +148,24 @@ struct GraphicsResourcePreparer {
             -> Result<empty, resource::ResourceError> {
             return rstd::trait_call<4>(this, handle, images);
         }
+        auto PrepareTextureDescriptor(const vulkan::Device&          device,
+                                      resource::PipelineLayoutHandle layout, u32 set,
+                                      slice<DescriptorTextureBinding> textures,
+                                      slice<DescriptorBufferBinding>  buffers)
+            -> Result<resource::DescriptorBindingHandle, resource::ResourceError> {
+            return rstd::trait_call<5>(this, device, layout, set, textures, buffers);
+        }
+        auto UpdateDescriptorTextures(resource::DescriptorBindingHandle handle,
+                                      slice<DescriptorTextureBinding>   textures)
+            -> Result<empty, resource::ResourceError> {
+            return rstd::trait_call<6>(this, handle, textures);
+        }
     };
 
     template<typename T>
     using Funcs = TraitFuncs<&T::PreparePipeline, &T::PrepareFramebuffer, &T::PrepareRenderPass,
-                             &T::PrepareDescriptor, &T::UpdateDescriptorImages>;
+                             &T::PrepareDescriptor, &T::UpdateDescriptorImages,
+                             &T::PrepareTextureDescriptor, &T::UpdateDescriptorTextures>;
 };
 
 struct ExternalResourcePreparer {
@@ -130,8 +201,58 @@ enum class FontAtlasUploadStatus
     Failed
 };
 
+enum class ResourcePrepareState
+{
+    Idle,
+    Preparing,
+    Prepared,
+    Committed,
+    Failed,
+    Cancelled
+};
+struct ResourcePrepareStatus {
+    u64                             id {};
+    ResourcePrepareState            state { ResourcePrepareState::Idle };
+    resource::ResourcePlanSections  sections {};
+    Option<resource::ResourceError> error;
+    auto                            clone() const -> ResourcePrepareStatus {
+        return { id,
+                 state,
+                 sections,
+                 error ? Some(resource::ResourceError { error->kind, error->message.clone() })
+                       : None() };
+    }
+};
+
+struct ResourceStatistics {
+    u64                            buffer_allocations {};
+    vulkan::BufferUploadStatistics buffer_uploads;
+    TexturePreparationStatistics   textures;
+};
 class RenderResourceSystem {
 public:
+    auto Statistics() const -> ResourceStatistics {
+        if (! Ready()) return {};
+        return { m_registries.Buffers().Allocations(),
+                 m_registries.BufferManager().statistics(),
+                 m_registries.Textures().Statistics() };
+    }
+    ~RenderResourceSystem() {
+        m_prepare_session = None();
+        ClosePipelinePreparation();
+    }
+    auto SetPipelinePreparationMode(vulkan::PipelinePreparationMode mode)
+        -> Result<empty, resource::ResourceError> {
+        if (! Ready() || ! m_pipeline_recipes.is_empty())
+            return Err(resource::ResourceError { resource::ResourceErrorKind::BackendFailure,
+                                                 rstd::format("pipeline preparation is busy") });
+        auto created = vulkan::PipelinePreparationQueue::create(TextureContext().session(), mode);
+        if (created.is_err())
+            return Err(resource::ResourceError { resource::ResourceErrorKind::BackendFailure,
+                                                 rstd::format("pipeline worker unavailable") });
+        m_pipeline_preparation = Some(created.unwrap());
+        return Ok(empty {});
+    }
     bool Initialize(vulkan::DeviceSession session) {
         if (! m_registries.Initialize(rstd::move(session))) return false;
         auto options = m_video_options.take();
@@ -139,7 +260,36 @@ public:
         return true;
     }
 
+    auto TryPrepareImage(rstd::sync::Arc<Image> image) -> Result<bool, resource::ResourceError> {
+        if (! Ready()) return Ok(false);
+        return m_registries.Textures().TryPrepareImage(rstd::move(image));
+    }
     auto TextureContext() -> vulkan::TextureContext& { return m_registries.Textures().Context(); }
+    auto RenderedTarget(ref<str> name) -> Result<texture::TextureViewRef, resource::ResourceError> {
+        if (! Ready())
+            return Err(resource::ResourceError { resource::ResourceErrorKind::BackendFailure,
+                                                 rstd::format("resources are closed") });
+        auto handle =
+            m_registries.TextureEntries().Find(resource::TextureRequestKind::RenderTarget, name);
+        auto physical = handle ? m_registries.TextureEntries().ResolveCurrent(*handle) : None();
+        if (! physical || (**physical).allocation->Slots().is_empty())
+            return Err(resource::ResourceError { resource::ResourceErrorKind::MissingContent,
+                                                 rstd::format("rendered target unavailable") });
+        auto view = (**physical).allocation->Slots()[usize()].view;
+        if (view.texture().check().is_err())
+            return Err(resource::ResourceError { resource::ResourceErrorKind::BackendFailure,
+                                                 rstd::format("rendered target is invalid") });
+        if (! view.texture().ready().valid())
+            return Err(resource::ResourceError { resource::ResourceErrorKind::Pending,
+                                                 rstd::format("target has not been submitted") });
+        texture::ViewDesc selected;
+        selected.range = { view.description().range.aspect, 0, 1, 0, 1 };
+        auto result    = TextureContext().CreateView(view.texture(), selected);
+        if (result.is_err())
+            return Err(resource::ResourceError { resource::ResourceErrorKind::BackendFailure,
+                                                 rstd::format("rendered target view failed") });
+        return Ok(result.unwrap());
+    }
     auto Native() -> mut_ref<dyn<vulkan::NativeSubmission>> {
         return dyn<vulkan::NativeSubmission>::from_ref(TextureContext()).as_mut_ref();
     }
@@ -157,6 +307,9 @@ public:
     }
 
     void Reset() {
+        AbortPreparePlan();
+        m_prepare_status = {};
+        ClosePipelinePreparation();
         if (Ready()) {
             (void)TextureContext().session().wait_idle();
             (void)m_registries.Textures().Poll();
@@ -182,25 +335,32 @@ public:
             if (progress.is_err()) return Err(rstd::move(progress).unwrap_err_unchecked());
             if (progress.unwrap_unchecked() == ResourcePrepareProgress::Complete) break;
         }
-        CommitPreparePlan();
-        return Ok(empty {});
+        return CommitPreparePlan(session);
     }
 
     auto BeginPreparePlan(const resource::ResourcePlan& plan, ResourceContentProviders providers,
                           resource::ResourcePlanSections sections = resource::ResourcePlanAll,
                           Option<mut_ref<dyn<resource::TexturePrepareObserver>>> texture_observer =
-                              None()) -> Result<ResourcePrepareSession, resource::ResourceError> {
-        if (m_prepare_rollback.is_some()) {
+                              None()) -> Result<u64, resource::ResourceError> {
+        if (PrepareActive()) {
             return Err(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::BackendFailure,
                 .message = rstd::format("resource prepare transaction is already active"),
             });
         }
+        if (! Ready())
+            return Err(resource::ResourceError { .message = rstd::format("resources are closed") });
+        m_prepare_status = {
+            ++m_next_prepare_id, ResourcePrepareState::Preparing, sections, None()
+        };
         if (! m_registries.TextureEntries().BeginPrepareTransaction()) {
-            return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::BackendFailure,
-                .message = rstd::format("texture prepare transaction is already active"),
-            });
+            auto error = resource::ResourceError {
+                .message = rstd::format("texture prepare transaction is already active")
+            };
+            m_prepare_status.state = ResourcePrepareState::Failed;
+            m_prepare_status.error =
+                Some(resource::ResourceError { error.kind, error.message.clone() });
+            return Err(rstd::move(error));
         }
         auto image_backend  = dyn<TexturePrepareBackend>::from_ref(m_registries.Textures());
         auto buffer_backend = dyn<vulkan::BufferBackend>::from_ref(m_registries.BufferManager());
@@ -211,20 +371,27 @@ public:
                                        m_registries.Shaders());
         auto started = service.Begin(plan, rstd::move(providers), sections, texture_observer);
         if (started.is_err()) {
-            AbortPreparePlan();
-            return Err(rstd::move(started).unwrap_err_unchecked());
+            auto error = rstd::move(started).unwrap_err_unchecked();
+            FailPreparePlan(error);
+            return Err(rstd::move(error));
         }
-        return Ok(rstd::move(started).unwrap_unchecked());
+        m_prepare_session.insert(rstd::move(started).unwrap_unchecked());
+        return Ok(m_prepare_status.id);
     }
 
     auto ContinuePreparePlan(
-        ResourcePrepareSession&                                session,
-        Option<mut_ref<dyn<resource::TexturePrepareObserver>>> texture_observer = None())
+        u64 id, Option<mut_ref<dyn<resource::TexturePrepareObserver>>> texture_observer = None())
         -> Result<ResourcePrepareProgress, resource::ResourceError> {
-        if (! CommitUploads()) {
-            AbortPreparePlan();
+        if (id != m_prepare_status.id ||
+            m_prepare_status.state != ResourcePrepareState::Preparing || ! m_prepare_session)
             return Err(resource::ResourceError {
-                .message = rstd::format("submit texture prepare batch failed") });
+                .message = rstd::format("resource prepare transaction is not active") });
+        auto& session = *m_prepare_session;
+        if (! CommitUploads()) {
+            auto error = resource::ResourceError { .message = rstd::format(
+                                                       "submit texture prepare batch failed") };
+            FailPreparePlan(error);
+            return Err(rstd::move(error));
         }
         auto image_backend  = dyn<TexturePrepareBackend>::from_ref(m_registries.Textures());
         auto buffer_backend = dyn<vulkan::BufferBackend>::from_ref(m_registries.BufferManager());
@@ -235,8 +402,9 @@ public:
                                        m_registries.Shaders());
         auto                   progress = service.Continue(session, texture_observer);
         if (progress.is_err()) {
-            AbortPreparePlan();
-            return Err(rstd::move(progress).unwrap_err_unchecked());
+            auto error = rstd::move(progress).unwrap_err_unchecked();
+            FailPreparePlan(error);
+            return Err(rstd::move(error));
         }
         if (progress.unwrap_unchecked() == ResourcePrepareProgress::BatchReady) {
             return Ok(ResourcePrepareProgress::BatchReady);
@@ -245,16 +413,40 @@ public:
         const auto sections = session.Sections();
         auto       next     = rstd::move(session).TakeTable();
         auto       previous = m_prepared.clone();
+        auto       changed  = sections == resource::ResourcePlanTextures
+                                  ? next.ChangedTextureBindings(m_prepared)
+                                  : Vec<resource::TextureUseHandle>();
         next.CarryForward(rstd::move(m_prepared), sections);
-        m_prepared         = rstd::move(next);
-        m_prepare_rollback = Some(PrepareRollback {
+        m_prepared             = rstd::move(next);
+        m_prepare_rollback     = Some(PrepareRollback {
             .table = rstd::move(previous),
         });
+        m_prepare_session      = None();
+        m_prepare_status.state = ResourcePrepareState::Prepared;
+        auto refreshed         = RefreshTextureDescriptors(changed.as_slice());
+        if (refreshed.is_err()) {
+            auto error = refreshed.unwrap_err();
+            FailPreparePlan(error);
+            return Err(rstd::move(error));
+        }
         return Ok(ResourcePrepareProgress::Complete);
     }
 
+    auto PrepareStatus() const -> const ResourcePrepareStatus& { return m_prepare_status; }
+    auto PrepareActive() const -> bool {
+        return m_prepare_status.state == ResourcePrepareState::Preparing ||
+               m_prepare_status.state == ResourcePrepareState::Prepared;
+    }
+    auto CancelPreparePlan(u64 id) -> bool {
+        if (id != m_prepare_status.id || ! PrepareActive()) return false;
+        AbortPreparePlan();
+        return true;
+    }
     void AbortPreparePlan() {
-        m_registries.Textures().DiscardPendingUploads();
+        m_prepare_session = None();
+        if (PrepareActive()) m_prepare_status.state = ResourcePrepareState::Cancelled;
+        ReleasePipelineRecipes();
+        if (Ready()) m_registries.Textures().DiscardPendingUploads();
         m_registries.TextureEntries().DiscardPendingUploads();
         m_registries.TextureEntries().AbortPrepareTransaction();
         auto rollback = m_prepare_rollback.take();
@@ -262,11 +454,22 @@ public:
         m_prepared = rstd::move(rollback->table);
     }
 
-    void CommitPreparePlan() {
-        m_prepare_rollback = None();
+    auto CommitPreparePlan(u64 id) -> Result<empty, resource::ResourceError> {
+        if (id != m_prepare_status.id || m_prepare_status.state != ResourcePrepareState::Prepared)
+            return Err(resource::ResourceError {
+                .message = rstd::format("resource prepare transaction is not prepared") });
+        if (! CommitUploads()) {
+            auto error = resource::ResourceError { .message = rstd::format(
+                                                       "submit prepared uploads failed") };
+            FailPreparePlan(error);
+            return Err(rstd::move(error));
+        }
+        m_prepare_status.state = ResourcePrepareState::Committed;
+        m_prepare_rollback     = None();
         m_registries.TextureEntries().CommitPrepareTransaction();
         auto active = m_prepared.TextureResources();
         m_registries.TextureEntries().RetainActive(active.as_slice());
+        return Ok(empty {});
     }
 
     auto Prepared() const -> const PreparedResourceTable& { return m_prepared; }
@@ -307,34 +510,62 @@ public:
                          resource::RenderPassUseHandle render_pass_use,
                          const vulkan::Device& device, vulkan::PipelineResourceRequest request)
         -> Result<PipelinePreparation, resource::ResourceError> {
-        PipelineResourceSystem system(device,
-                                      m_registries.PipelineLayouts(),
-                                      m_registries.PipelineCache(),
-                                      m_registries.RenderPassCache());
-        auto                   result = system.CreateGraphicsPipeline(rstd::move(request));
+        Option<PipelineResourceResult> result;
+        if (m_pipeline_preparation) {
+            usize index {};
+            for (; index < m_pipeline_recipes.len(); ++index)
+                if (m_pipeline_recipes[index].use == pipeline_use) break;
+            if (index < m_pipeline_recipes.len() &&
+                ! m_registries.Pipelines().MatchesRecipe(m_pipeline_recipes[index].recipe,
+                                                         request)) {
+                m_registries.Pipelines().ReleaseRecipe(m_pipeline_recipes[index].recipe);
+                m_pipeline_recipes.remove(index);
+                index = m_pipeline_recipes.len();
+            }
+            if (index == m_pipeline_recipes.len()) {
+                auto signature = vulkan::MakeRenderPassResourceDesc(request);
+                auto recipe    = m_registries.Pipelines().RegisterRecipe(
+                    rstd::move(request), m_registries.PipelineLayouts());
+                if (recipe.is_none())
+                    return Err(
+                        resource::ResourceError { resource::ResourceErrorKind::BackendFailure,
+                                                  rstd::format("invalid pipeline recipe") });
+                m_pipeline_recipes.push({ pipeline_use, recipe.unwrap(), signature });
+            }
+            auto& entry    = m_pipeline_recipes[index];
+            auto  prepared = m_pipeline_preparation->prepare(entry.recipe, entry.signature);
+            if (prepared.is_err())
+                return Err(resource::ResourceError { resource::ResourceErrorKind::BackendFailure,
+                                                     rstd::format("pipeline task failed") });
+            auto value = prepared.unwrap();
+            if (value.status == PipelineReadiness::Pending)
+                return Err(resource::ResourceError { resource::ResourceErrorKind::Pending,
+                                                     rstd::format("pipeline is pending") });
+            result = value.pipeline.take();
+            m_registries.Pipelines().ReleaseRecipe(entry.recipe);
+            m_pipeline_recipes.remove(index);
+        } else {
+            PipelineResourceSystem system(device,
+                                          m_registries.PipelineLayouts(),
+                                          m_registries.PipelineCache(),
+                                          m_registries.RenderPassCache());
+            result = system.CreateGraphicsPipeline(rstd::move(request));
+        }
         if (result.is_none()) {
             return Err(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::BackendFailure,
                 .message = rstd::format("prepare graphics pipeline failed"),
             });
         }
-        if (! m_prepared.Insert(PreparedRenderPass {
-                .use       = render_pass_use,
-                .resource  = result->render_pass,
-                .cache_key = result->render_pass_key.clone(),
-                .physical  = result->render_pass_physical.clone(),
-            }) ||
-            ! m_prepared.Insert(PreparedPipeline {
-                .use         = pipeline_use,
-                .resource    = result->handle,
-                .render_pass = result->render_pass,
-                .physical    = result->pipeline.clone(),
-            })) {
-            return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::BackendFailure,
-                .message = rstd::format("duplicate prepared graphics use"),
-            });
-        }
+        m_prepared.PublishPipeline(
+            PreparedPipeline { .use         = pipeline_use,
+                               .resource    = result->handle,
+                               .render_pass = result->render_pass,
+                               .physical    = result->pipeline.clone() },
+            PreparedRenderPass { .use       = render_pass_use,
+                                 .resource  = result->render_pass,
+                                 .cache_key = result->render_pass_key.clone(),
+                                 .physical  = result->render_pass_physical.clone() });
         return Ok(PipelinePreparation {
             .resource                         = result->handle,
             .render_pass                      = result->render_pass,
@@ -344,6 +575,7 @@ public:
             .cache_observed_count             = result->cache_observed_count,
             .render_pass_cache_hit            = result->render_pass_cache_hit,
             .render_pass_cache_observed_count = result->render_pass_cache_observed_count,
+            .physical                         = result->pipeline.clone(),
         });
     }
 
@@ -458,15 +690,50 @@ public:
     auto UpdateDescriptorImages(resource::DescriptorBindingHandle handle,
                                 slice<DescriptorImageBinding>     images)
         -> Result<empty, resource::ResourceError> {
-        auto prepared = m_prepared.ResolveMut(handle);
-        if (prepared.is_none()) {
+        auto updated = ReplaceDescriptorImages(handle, images);
+        if (updated.is_err()) return updated;
+        m_prepared.ForgetDescriptorTextures(handle);
+        return Ok(empty {});
+    }
+    auto PrepareTextureDescriptor(const vulkan::Device&          device,
+                                  resource::PipelineLayoutHandle layout, u32 set,
+                                  slice<DescriptorTextureBinding> textures,
+                                  slice<DescriptorBufferBinding>  buffers)
+        -> Result<resource::DescriptorBindingHandle, resource::ResourceError> {
+        auto images = ResolveDescriptorTextures(textures);
+        if (images.is_err()) return Err(images.unwrap_err());
+        auto descriptor = PrepareDescriptor(
+            device, layout, set, images->as_slice(), buffers, DescriptorBindingReuse::Exclusive);
+        if (descriptor.is_err()) return descriptor;
+        if (! m_prepared.TrackDescriptorTextures(*descriptor, textures)) {
+            m_prepared.Remove(*descriptor);
             return Err(resource::ResourceError {
-                .kind = resource::ResourceErrorKind::MissingDefinition,
-                .message =
-                    rstd::format("prepared descriptor binding {} is unavailable", handle.index),
-            });
+                .message = rstd::format("descriptor texture bindings invalid") });
         }
-        return (**prepared).UpdateImages(images);
+        return descriptor;
+    }
+    auto UpdateDescriptorTextures(resource::DescriptorBindingHandle handle,
+                                  slice<DescriptorTextureBinding>   textures)
+        -> Result<empty, resource::ResourceError> {
+        auto sources = Vec<DescriptorTextureBinding>::from(textures);
+        auto images  = ResolveDescriptorTextures(sources.as_slice());
+        if (images.is_err()) return Err(images.unwrap_err());
+        auto updated = ReplaceDescriptorImages(handle, images->as_slice());
+        if (updated.is_err()) return updated;
+        if (! m_prepared.TrackDescriptorTextures(handle, sources.as_slice()))
+            return Err(resource::ResourceError {
+                .message = rstd::format("descriptor texture bindings invalid") });
+        return Ok(empty {});
+    }
+    auto RefreshTextureDescriptors(slice<resource::TextureUseHandle> changed)
+        -> Result<empty, resource::ResourceError> {
+        auto affected = m_prepared.AffectedTextureDescriptors(changed);
+        for (auto descriptor : affected) {
+            auto updated =
+                UpdateDescriptorTextures(descriptor, m_prepared.DescriptorTextures(descriptor));
+            if (updated.is_err()) return updated;
+        }
+        return Ok(empty {});
     }
 
     bool HasPendingUploads() const {
@@ -481,6 +748,8 @@ public:
                 return Err(texture::Error { texture::ErrorKind::Closed });
             if (! (*m_frame)->receipt.cancelled() && ! (*m_frame)->receipt.submitted())
                 return Err(texture::Error { texture::ErrorKind::Busy });
+            if ((*m_frame)->receipt.cancelled())
+                (*m_frame)->recorded_buffers = vulkan::RecordedBufferUploads {};
             m_frame = None();
             m_registries.Textures().CancelRecording();
         }
@@ -496,25 +765,33 @@ public:
         return Ok(rstd::move(work));
     }
 
-    bool RecordPendingUploads(texture::Submission& work) {
-        if (m_frame.is_none() || (*m_frame)->uploads_recorded) return false;
+    auto PreparePendingUploads(texture::Submission& work)
+        -> Result<PreparedResourceUploads, texture::Error> {
+        if (! m_frame || (*m_frame)->uploads_prepared || ! (*m_frame)->receipt.same(work.receipt()))
+            return Err(texture::Error { texture::ErrorKind::Invalid });
+        auto recording = vulkan::texture_recording(work, TextureContext().session());
+        if (recording.is_err()) return Err(recording.unwrap_err());
         m_registries.TextureEntries().ReservePublications();
-        if (! m_registries.Textures().RecordPendingUploads(work)) return false;
-        auto native = vulkan::native_recording(work, TextureContext().session());
-        if (native.is_err()) return false;
-        vvk::CommandBuffer command(native.unwrap_unchecked(),
-                                   TextureContext().session().device().handle().Dispatch());
-        if (! m_registries.BufferManager().RecordPendingUploads(command,
-                                                                (*m_frame)->recorded_buffers))
-            return false;
-        (*m_frame)->uploads_recorded = true;
-        return true;
+        auto updates = m_registries.Textures().PreparePendingUploads(work);
+        if (updates.is_err()) return Err(updates.unwrap_err());
+        if (! m_registries.BufferManager().PreparePendingUploads((*m_frame)->recorded_buffers))
+            return Err(texture::Error { texture::ErrorKind::Backend });
+        (*m_frame)->uploads_prepared = true;
+        return Ok(PreparedResourceUploads(TextureContext().session(),
+                                          m_frame->clone(),
+                                          recording.unwrap()->identity,
+                                          updates.unwrap()));
+    }
+    bool RecordPendingUploads(texture::Submission& work) {
+        auto prepared = PreparePendingUploads(work);
+        return prepared.is_ok() && prepared->Record(work).is_ok();
     }
 
     auto SubmitFrame(texture::Submission work) -> Result<texture::SubmissionToken, texture::Error> {
-        if (m_frame.is_none()) return Err(texture::Error { texture::ErrorKind::Invalid });
+        if (m_frame.is_none() || ! (*m_frame)->receipt.same(work.receipt()))
+            return Err(texture::Error { texture::ErrorKind::Invalid });
         auto frame = m_frame->clone();
-        if (! frame->uploads_recorded && HasPendingUploads())
+        if (! frame->uploads_recorded && (frame->uploads_prepared || HasPendingUploads()))
             return Err(texture::Error { texture::ErrorKind::Invalid });
         if (frame->recorded_buffers.Valid()) {
             auto committed = m_registries.BufferManager().CommitRecordedUploads(
@@ -578,63 +855,10 @@ public:
     bool GenerateMipmaps(texture::Submission& work, resource::TextureUseHandle use) {
         auto prepared = m_prepared.Resolve(use);
         if (prepared.is_none()) return false;
-        const auto slots = (**prepared).physical->Slots();
-        if (slots.is_empty()) return false;
-        const auto& selected = slots[usize()];
-        const auto& desc     = selected.view.texture().description();
-        const auto  range    = selected.view.description().range;
-        if (desc.samples != 1 || range.aspect != texture::Aspect::Color ||
-            ! texture::has(desc.usage, texture::Usage::TransferSource) ||
-            ! texture::has(desc.usage, texture::Usage::TransferDestination))
-            return false;
-        if (range.mip_count <= 1) return UseTexture(work, use, TextureStateKind::Sampled);
-        auto       features = TextureContext()
-                                  .session()
-                                  .device()
-                                  .gpu()
-                                  .GetFormatProperties(vulkan::ToVkType(desc.format))
-                                  .optimalTilingFeatures;
-        const auto required = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
-                              VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
-        if ((features & required) != required) return false;
-        auto image = vulkan::native_texture(selected.view.texture());
-        if (image.is_err()) return false;
-        for (texture::Count mip = range.first_mip + 1; mip < range.first_mip + range.mip_count;
-             ++mip) {
-            TextureSubresourceRange source { VK_IMAGE_ASPECT_COLOR_BIT,
-                                             u32(mip - 1),
-                                             u32(1),
-                                             u32(range.first_layer),
-                                             u32(range.layer_count) };
-            auto                    destination = source;
-            destination.base_mip_level          = u32(mip);
-            if (! UseTexture(work, use, TextureStateKind::TransferSource, source) ||
-                ! UseTexture(work, use, TextureStateKind::TransferDestination, destination, true))
-                return false;
-            auto command = vulkan::native_recording(work, TextureContext().session());
-            if (command.is_err()) return false;
-            const auto  from = texture::mip_extent(desc, mip - 1);
-            const auto  to   = texture::mip_extent(desc, mip);
-            VkImageBlit blit {};
-            blit.srcSubresource = {
-                VK_IMAGE_ASPECT_COLOR_BIT, mip - 1, range.first_layer, range.layer_count
-            };
-            blit.dstSubresource = {
-                VK_IMAGE_ASPECT_COLOR_BIT, mip, range.first_layer, range.layer_count
-            };
-            blit.srcOffsets[1] = { rstd::int32_t(from.width), rstd::int32_t(from.height), 1 };
-            blit.dstOffsets[1] = { rstd::int32_t(to.width), rstd::int32_t(to.height), 1 };
-            TextureContext().session().device().handle().Dispatch().vkCmdBlitImage(
-                command.unwrap_unchecked(),
-                image.unwrap_unchecked(),
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                image.unwrap_unchecked(),
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                1,
-                &blit,
-                VK_FILTER_LINEAR);
-        }
-        return UseTexture(work, use, TextureStateKind::Sampled);
+        auto selected = (**prepared).ActiveTexture();
+        if (selected.is_err()) return false;
+        return vulkan::generate_texture_mipmaps(work, TextureContext().session(), selected->view)
+            .is_ok();
     }
 
     auto UpdateBuffer(resource::BufferUseHandle use, slice<u8> content)
@@ -696,19 +920,36 @@ public:
         else
             m_video_options = Some(rstd::move(options));
     }
-    FontAtlasUploadStatus QueueRegion(texture::Submission& work, ref<str> key,
-                                      texture::TextureUpload upload, usize slot = usize()) {
+    auto PrepareRegion(ref<str> key, texture::TextureUpload upload, usize slot = usize())
+        -> Result<Option<PreparedTextureUpdate>, resource::ResourceError> {
         auto handle =
             m_registries.TextureEntries().Find(resource::TextureRequestKind::Imported, key);
-        if (handle.is_none()) return FontAtlasUploadStatus::NotResident;
+        if (! handle) return Ok(None());
         auto physical = m_registries.TextureEntries().ResolveCurrent(*handle);
-        if (physical.is_none()) return FontAtlasUploadStatus::NotResident;
-        const auto slots = (**physical).allocation->Slots();
-        if (! work.valid() || slot >= slots.len()) return FontAtlasUploadStatus::Failed;
+        if (! physical) return Ok(None());
+        auto       allocation = (**physical).allocation.clone();
+        const auto slots      = allocation->Slots();
+        if (slot >= slots.len())
+            return Err(resource::ResourceError { resource::ResourceErrorKind::BackendFailure,
+                                                 rstd::format("invalid texture slot") });
         upload.target = slots[slot].view;
-        work.retain((**physical).allocation.clone());
-        return work.commands()->Upload(rstd::move(upload)).is_ok() ? FontAtlasUploadStatus::Recorded
-                                                                   : FontAtlasUploadStatus::Failed;
+        if (texture::validate_upload(upload).is_err())
+            return Err(resource::ResourceError { resource::ResourceErrorKind::BackendFailure,
+                                                 rstd::format("invalid texture region") });
+        Vec<texture::TextureUpload> uploads;
+        uploads.push(rstd::move(upload));
+        return Ok(Some(PreparedTextureUpdate { rstd::move(allocation), rstd::move(uploads) }));
+    }
+    FontAtlasUploadStatus QueueRegion(texture::Submission& work, ref<str> key,
+                                      texture::TextureUpload upload, usize slot = usize()) {
+        if (! work.valid()) return FontAtlasUploadStatus::Failed;
+        auto prepared = PrepareRegion(key, rstd::move(upload), slot);
+        if (prepared.is_err()) return FontAtlasUploadStatus::Failed;
+        auto region = prepared.unwrap();
+        if (! region) return FontAtlasUploadStatus::NotResident;
+        return region->Record(work, TextureContext().session()).is_ok()
+                   ? FontAtlasUploadStatus::Recorded
+                   : FontAtlasUploadStatus::Failed;
     }
     auto CreateLocalSwapchain(const vulkan::Device& device, unsigned width, unsigned height,
                               VkImageTiling tiling) -> Option<ExSwapchainOwner> {
@@ -717,6 +958,8 @@ public:
         return CreateSessionLocalOutput(TextureContext(), width, height, tiling);
     }
     void ClearTextures() {
+        AbortPreparePlan();
+        m_prepare_status   = {};
         m_prepare_rollback = None();
         m_prepared         = PreparedResourceTable {};
         m_registries.Textures().DiscardPendingUploads();
@@ -735,11 +978,74 @@ public:
     }
 
 private:
+    auto ResolveDescriptorTextures(slice<DescriptorTextureBinding> textures) const
+        -> Result<Vec<DescriptorImageBinding>, resource::ResourceError> {
+        auto images = Vec<DescriptorImageBinding>::with_capacity(textures.len());
+        for (const auto& source : textures) {
+            auto prepared = m_prepared.Resolve(source.texture);
+            if (! prepared)
+                return Err(resource::ResourceError {
+                    .kind = resource::ResourceErrorKind::MissingDefinition,
+                    .message =
+                        rstd::format("descriptor texture {} unavailable", source.texture.index) });
+            auto sampled = (*prepared)->physical->SampledBinding(source.slot);
+            if (sampled.is_err())
+                return Err(resource::ResourceError {
+                    .message = rstd::format("descriptor texture slot unavailable") });
+            images.push({ source.binding, sampled->image, sampled->layout });
+        }
+        return Ok(rstd::move(images));
+    }
+    auto ReplaceDescriptorImages(resource::DescriptorBindingHandle handle,
+                                 slice<DescriptorImageBinding>     images)
+        -> Result<empty, resource::ResourceError> {
+        auto prepared = m_prepared.ResolveMut(handle);
+        if (! prepared)
+            return Err(resource::ResourceError {
+                .kind = resource::ResourceErrorKind::MissingDefinition,
+                .message =
+                    rstd::format("prepared descriptor binding {} unavailable", handle.index) });
+        if ((*prepared)->MatchesImages(images)) return Ok(empty {});
+        auto replacement =
+            m_registries.Descriptors().ReplaceImages(TextureContext().session().device(),
+                                                     **prepared,
+                                                     images,
+                                                     m_registries.DescriptorLayouts());
+        if (replacement.is_err()) return Err(replacement.unwrap_err());
+        **prepared = replacement.unwrap();
+        return Ok(empty {});
+    }
+    void FailPreparePlan(const resource::ResourceError& error) {
+        AbortPreparePlan();
+        m_prepare_status.state = ResourcePrepareState::Failed;
+        m_prepare_status.error =
+            Some(resource::ResourceError { error.kind, error.message.clone() });
+    }
+    struct PipelineRecipeEntry {
+        resource::PipelineUseHandle    use;
+        resource::PipelineRecipeHandle recipe;
+        vulkan::RenderPassResourceDesc signature;
+    };
+    void ReleasePipelineRecipes() {
+        for (const auto& entry : m_pipeline_recipes)
+            m_registries.Pipelines().ReleaseRecipe(entry.recipe);
+        m_pipeline_recipes.clear();
+    }
+    void ClosePipelinePreparation() {
+        if (m_pipeline_preparation) m_pipeline_preparation->close();
+        ReleasePipelineRecipes();
+        m_pipeline_preparation = None();
+    }
     struct PrepareRollback {
         PreparedResourceTable table;
     };
 
     ResourceRegistries                            m_registries;
+    u64                                           m_next_prepare_id {};
+    ResourcePrepareStatus                         m_prepare_status;
+    Option<ResourcePrepareSession>                m_prepare_session;
+    Vec<PipelineRecipeEntry>                      m_pipeline_recipes;
+    Option<vulkan::PipelinePreparationQueue>      m_pipeline_preparation;
     PreparedResourceTable                         m_prepared;
     Option<PrepareRollback>                       m_prepare_rollback;
     Option<rstd::sync::Arc<FrameSubmissionLease>> m_frame;
@@ -797,6 +1103,20 @@ struct Impl<vrento::resource_registry::GraphicsResourcePreparer,
                                 slice<vrento::resource_registry::DescriptorImageBinding> images)
         -> Result<empty, vrento::resource::ResourceError> {
         return this->self().UpdateDescriptorImages(handle, images);
+    }
+    auto
+    PrepareTextureDescriptor(const vrento::vulkan::Device&          device,
+                             vrento::resource::PipelineLayoutHandle layout, u32 set,
+                             slice<vrento::resource_registry::DescriptorTextureBinding> textures,
+                             slice<vrento::resource_registry::DescriptorBufferBinding>  buffers)
+        -> Result<vrento::resource::DescriptorBindingHandle, vrento::resource::ResourceError> {
+        return this->self().PrepareTextureDescriptor(device, layout, set, textures, buffers);
+    }
+    auto
+    UpdateDescriptorTextures(vrento::resource::DescriptorBindingHandle                  handle,
+                             slice<vrento::resource_registry::DescriptorTextureBinding> textures)
+        -> Result<empty, vrento::resource::ResourceError> {
+        return this->self().UpdateDescriptorTextures(handle, textures);
     }
 };
 

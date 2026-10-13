@@ -26,9 +26,8 @@ struct PreparedExternalFrame {
 
 class ExternalResourceBridge {
 public:
-    auto Prepare(const vulkan::DeviceCapabilities& capabilities, FrameSurfaceLease lease,
-                 rstd::uint32_t graphics_queue_family)
-        -> Result<PreparedExternalFrame, resource::ResourceError> {
+    static auto Validate(const vulkan::DeviceCapabilities& capabilities,
+                         const FrameSurfaceLease& lease) -> Result<empty, resource::ResourceError> {
         if (! lease.valid()) {
             return Err(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::MissingDefinition,
@@ -51,6 +50,13 @@ public:
             });
         }
 
+        return Ok(empty {});
+    }
+    auto Prepare(const vulkan::DeviceCapabilities& capabilities, FrameSurfaceLease lease,
+                 rstd::uint32_t graphics_queue_family)
+        -> Result<PreparedExternalFrame, resource::ResourceError> {
+        auto valid = Validate(capabilities, lease);
+        if (valid.is_err()) return Err(valid.unwrap_err());
         auto range = VkImageSubresourceRange {
             .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
             .baseMipLevel   = 0,

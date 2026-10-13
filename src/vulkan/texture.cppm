@@ -38,6 +38,8 @@ struct NativeAccess {
     VkAccessFlags        access {};
     VkPipelineStageFlags stages { VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT };
     rstd::uint32_t       queue_family { VK_QUEUE_FAMILY_IGNORED };
+    rstd::uint32_t       released_from { VK_QUEUE_FAMILY_IGNORED };
+    VkImageLayout        release_old_layout { VK_IMAGE_LAYOUT_UNDEFINED };
     friend bool          operator==(const NativeAccess&, const NativeAccess&) = default;
 };
 inline auto native_access(tex::AccessState state, tex::Aspect aspect = tex::Aspect::Color)
@@ -232,7 +234,10 @@ struct QueueSignal {
     PFN_vkGetSemaphoreCounterValueKHR counter {};
     PFN_vkWaitSemaphoresKHR           wait {};
     tex::Serial                       identity {};
-    QueueSignal(DeviceSession s, tex::Serial id): session(rstd::move(s)), identity(id) {}
+    QueueParameters                   queue;
+    vvk::CommandPool                  pool;
+    QueueSignal(DeviceSession s, tex::Serial id, QueueParameters selected)
+        : session(rstd::move(s)), identity(id), queue(selected) {}
     auto value() const -> Result<tex::Serial, tex::Error> {
         if (session.lost()) return Err(tex::Error { tex::ErrorKind::Lost, VK_ERROR_DEVICE_LOST });
         tex::Serial current {};
@@ -493,19 +498,41 @@ inline auto dependency_wait(const DeviceSession& session, const tex::SubmissionT
 struct TextureReadReservation {
     tex::TextureRef texture;
     bool            active { true };
-    explicit TextureReadReservation(tex::TextureRef value): texture(rstd::move(value)) {
+    bool            native_only;
+    explicit TextureReadReservation(tex::TextureRef value, bool native = true)
+        : texture(rstd::move(value)), native_only(native) {
         ++tex::BackendAccess::Storage(texture)->prepared_reads;
+        if (native_only) ++tex::BackendAccess::Storage(texture)->prepared_native_reads;
     }
-    ~TextureReadReservation() {
-        if (active) --tex::BackendAccess::Storage(texture)->prepared_reads;
-    }
+    ~TextureReadReservation() { release(); }
     void release() {
         if (active) {
             --tex::BackendAccess::Storage(texture)->prepared_reads;
+            if (native_only) --tex::BackendAccess::Storage(texture)->prepared_native_reads;
             active = false;
         }
     }
 };
+inline auto reserve_texture_read(const DeviceSession& session, const tex::TextureViewRef& view)
+    -> Result<Arc<TextureReadReservation>, tex::Error> {
+    if (! session.valid() || ! view.valid() || ! view.permits(false))
+        return Err(tex::Error { tex::ErrorKind::Invalid });
+    auto id = view.texture().identity();
+    if (id.device != session.epoch() || id.epoch != session.epoch())
+        return Err(tex::Error { tex::ErrorKind::DeviceMismatch });
+    auto native = native_view(view);
+    if (native.is_err()) return Err(native.unwrap_err());
+    const auto& storage = *tex::BackendAccess::Storage(view.texture());
+    if (storage.recording) return Err(tex::Error { tex::ErrorKind::Busy });
+    const auto range = view.description().range;
+    for (tex::Count layer = range.first_layer; layer < range.first_layer + range.layer_count;
+         ++layer)
+        for (tex::Count mip = range.first_mip; mip < range.first_mip + range.mip_count; ++mip)
+            if (storage.states[usize(layer * storage.desc.mip_levels + mip)].access ==
+                tex::Access::Undefined)
+                return Err(tex::Error { tex::ErrorKind::Invalid });
+    return Ok(Arc<TextureReadReservation>::make(view.texture(), false));
+}
 auto import_dependency(const DeviceSession& session, VkSemaphore semaphore, tex::Serial value,
                        Arc<dyn<rstd::any::Any>> owner) -> Result<tex::SubmissionToken, tex::Error>;
 struct TextureRead {
@@ -515,11 +542,11 @@ struct TextureRead {
     tex::Stages                 stages { tex::Stages::Fragment };
     Arc<TextureReadReservation> reservation;
 };
-inline auto prepare_texture_read(const DeviceSession& session, tex::TextureViewRef view,
-                                 tex::Stages stages, bool linear = false)
-    -> Result<TextureRead, tex::Error> {
+inline auto validate_sampled_texture(const DeviceSession& session, const tex::TextureViewRef& view,
+                                     tex::Stages stages, bool linear = false)
+    -> Result<VkImageView, tex::Error> {
     if (! session.valid() || ! view.valid() || ! tex::Count(stages) ||
-        (tex::Count(stages) & ~tex::Count(7)))
+        (tex::Count(stages) & ~tex::Count(tex::Stages::Shaders)))
         return Err(tex::Error { tex::ErrorKind::Invalid });
     if (session.lost()) return Err(tex::Error { tex::ErrorKind::Lost, VK_ERROR_DEVICE_LOST });
     auto id = view.texture().identity();
@@ -534,8 +561,16 @@ inline auto prepare_texture_read(const DeviceSession& session, tex::TextureViewR
     if (! (features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ||
         (linear && ! (features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)))
         return Err(tex::Error { tex::ErrorKind::Unsupported });
-    auto& storage      = *tex::BackendAccess::Storage(view.texture());
-    auto  native_state = rstd::any::downcast_ref<NativeTexture>(storage.backing.deref());
+    return native_view(view);
+}
+inline auto prepare_texture_read(const DeviceSession& session, tex::TextureViewRef view,
+                                 tex::Stages stages, bool linear = false)
+    -> Result<TextureRead, tex::Error> {
+    auto handle = validate_sampled_texture(session, view, stages, linear);
+    if (handle.is_err()) return Err(handle.unwrap_err());
+    const auto& desc         = view.texture().description();
+    auto&       storage      = *tex::BackendAccess::Storage(view.texture());
+    auto        native_state = rstd::any::downcast_ref<NativeTexture>(storage.backing.deref());
     if (native_state.is_none()) return Err(tex::Error { tex::ErrorKind::DeviceMismatch });
     auto range = view.description().range;
     if (storage.recording) return Err(tex::Error { tex::ErrorKind::Busy });
@@ -550,8 +585,6 @@ inline auto prepare_texture_read(const DeviceSession& session, tex::TextureViewR
                         .tracking->states[usize(layer * desc.mip_levels + mip)]
                         .queue_family != session.device().graphics_queue().family_index)
                 return Err(tex::Error { tex::ErrorKind::Invalid });
-    auto handle = native_view(view);
-    if (handle.is_err()) return Err(handle.unwrap_err());
     auto dependency  = storage.last_use.valid() ? storage.last_use : storage.last_write;
     auto reservation = Arc<TextureReadReservation>::make(view.texture());
     return Ok(TextureRead { rstd::move(view),
@@ -594,31 +627,46 @@ struct RecordingDependency {
     tex::SubmissionToken token;
     tex::Stages          stages;
 };
+struct NativeSubmissionParticipant {
+    using Trait                  = NativeSubmissionParticipant;
+    static constexpr bool direct = false;
+    template<typename Self, typename = void>
+    struct Api {
+        using Trait = NativeSubmissionParticipant;
+        void Commit(tex::SubmissionToken token) { rstd::trait_call<0>(this, rstd::move(token)); }
+        void Uncertain() { rstd::trait_call<1>(this); }
+        void Cancel() { rstd::trait_call<2>(this); }
+    };
+    template<typename T>
+    using Funcs = TraitFuncs<&T::Commit, &T::Uncertain, &T::Cancel>;
+};
 class TextureRecording {
 public:
-    Arc<QueueSignal>              signal;
-    VkCommandBuffer               command {};
-    tex::Serial                   identity {};
-    bool                          submitted {}, uncertain {};
-    ImageUploadManager            uploads;
-    RecordedImageUploads          recorded_images;
-    Vec<RecordingTexture>         textures;
-    Vec<tex::TextureViewRef>      views;
-    Vec<tex::SamplerRef>          samplers;
-    Vec<RecordingDependency>      dependencies;
-    Vec<Box<dyn<rstd::any::Any>>> retained;
-    Vec<ImageUploadBatchLease>    upload_leases;
-    Vec<NativeSemaphoreWait>      native_waits;
-    Vec<NativeSemaphoreSignal>    native_signals;
-    Option<NativeFence>           fence;
-    Option<Arc<SubmissionFence>>  completion_fence;
+    Arc<QueueSignal>                 signal;
+    VkCommandBuffer                  command {};
+    tex::Serial                      identity {};
+    bool                             submitted {}, uncertain {};
+    ImageUploadManager               uploads;
+    RecordedImageUploads             recorded_images;
+    Vec<RecordingTexture>            textures;
+    Vec<tex::TextureViewRef>         views;
+    Vec<tex::SamplerRef>             samplers;
+    Vec<RecordingDependency>         dependencies;
+    Vec<Arc<TextureReadReservation>> prepared_reads;
+    Vec<Box<dyn<rstd::any::Any>>>    retained;
+    Vec<ImageUploadBatchLease>       upload_leases;
+    Vec<NativeSemaphoreWait>         native_waits;
+    Vec<NativeSemaphoreSignal>       native_signals;
+    Option<NativeFence>              fence;
+    Option<Arc<SubmissionFence>>     completion_fence;
     struct SurfaceAccess {
         FrameSurfaceLease        lease;
         NativeAccess             state;
         Arc<dyn<rstd::any::Any>> owner;
         bool                     released {};
     };
-    Vec<SurfaceAccess> surfaces;
+    Vec<SurfaceAccess>                         surfaces;
+    Vec<Arc<dyn<NativeSubmissionParticipant>>> participants;
     TextureRecording(Arc<QueueSignal> s, tex::Serial id)
         : signal(rstd::move(s)), identity(id), uploads(signal->session.device()) {}
     ~TextureRecording() {
@@ -627,15 +675,14 @@ public:
             if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST)
                 rstd::panic("cannot retire uncertain texture submission");
         }
+        if (! submitted && ! uncertain)
+            for (auto& participant : participants) participant->Cancel();
         for (auto& entry : textures)
             if (tex::BackendAccess::Storage(entry.texture)->recording == identity)
                 tex::BackendAccess::Storage(entry.texture)->recording = 0;
         if (command)
             signal->session.device().handle().Dispatch().vkFreeCommandBuffers(
-                *signal->session.device().handle(),
-                *signal->session.device().cmd_pool(),
-                1,
-                &command);
+                *signal->session.device().handle(), *signal->pool, 1, &command);
     }
     auto FlushUploads() -> Result<empty, tex::Error> {
         if (signal->session.lost())
@@ -646,7 +693,8 @@ public:
         return Ok(empty {});
     }
     auto RecordAccess(tex::TextureAccess use, bool emit_barrier,
-                      Option<NativeAccess> final = None()) -> Result<empty, tex::Error> {
+                      Option<NativeAccess> final = None(), bool handoff = false)
+        -> Result<empty, tex::Error> {
         if (submitted) return Err(tex::Error { tex::ErrorKind::Invalid });
         auto checked = tex::validate_access(use);
         if (checked.is_err()) return Err(checked.unwrap_err());
@@ -663,7 +711,8 @@ public:
         if (native.is_err()) return Err(native.unwrap_err());
         auto  range   = checked.unwrap();
         auto& storage = *tex::BackendAccess::Storage(texture);
-        if (storage.prepared_reads) return Err(tex::Error { tex::ErrorKind::Busy });
+        if (storage.prepared_reads && (tex::writes(use.access) || storage.prepared_native_reads))
+            return Err(tex::Error { tex::ErrorKind::Busy });
         if (storage.recording && storage.recording != identity)
             return Err(tex::Error { tex::ErrorKind::Busy });
         usize index {};
@@ -683,9 +732,18 @@ public:
                 dependencies.push(RecordingDependency { rstd::move(dependency), tex::Stages::All });
         }
         auto& entry = textures[index];
-        auto  destination =
+        if (use.require_contents)
+            for (tex::Count layer = range.first_layer;
+                 layer < range.first_layer + range.layer_count;
+                 ++layer)
+                for (tex::Count mip = range.first_mip; mip < range.first_mip + range.mip_count;
+                     ++mip)
+                    if (entry.states[usize(layer * texture.description().mip_levels + mip)]
+                            .access == tex::Access::Undefined)
+                        return Err(tex::Error { tex::ErrorKind::Invalid });
+        auto destination =
             final.is_some() ? *final : native_access({ use.access, use.stages }, range.aspect);
-        auto family = session.device().graphics_queue().family_index;
+        auto family = signal->queue.family_index;
         if (destination.queue_family == VK_QUEUE_FAMILY_IGNORED) destination.queue_family = family;
         for (tex::Count layer = range.first_layer; layer < range.first_layer + range.layer_count;
              ++layer)
@@ -693,10 +751,16 @@ public:
                 auto source =
                     entry.native_states[usize(layer * texture.description().mip_levels + mip)];
                 if ((! emit_barrier && source.queue_family != family) ||
-                    (destination.queue_family != family && source.queue_family != family))
+                    (destination.queue_family != family && source.queue_family != family) ||
+                    (source.released_from != VK_QUEUE_FAMILY_IGNORED &&
+                     (source.queue_family != family || destination.queue_family != family ||
+                      source.layout != destination.layout)) ||
+                    (source.released_from == VK_QUEUE_FAMILY_IGNORED &&
+                     source.queue_family != family &&
+                     source.queue_family != VK_QUEUE_FAMILY_IGNORED))
                     return Err(tex::Error { tex::ErrorKind::Unsupported });
             }
-        entry.written |= tex::writes(use.access);
+        if (! handoff) entry.written |= tex::writes(use.access);
         auto& device = session.device().handle();
         for (tex::Count layer = range.first_layer; layer < range.first_layer + range.layer_count;
              ++layer) {
@@ -705,24 +769,27 @@ public:
                     entry.states[usize(layer * texture.description().mip_levels + mip)];
                 auto& native_previous =
                     entry.native_states[usize(layer * texture.description().mip_levels + mip)];
-                auto source = native_previous;
+                auto source  = native_previous;
+                bool acquire = source.released_from != VK_QUEUE_FAMILY_IGNORED;
                 if (use.discard) {
+                    // Discarding contents does not remove prior GPU access dependencies.
                     source.layout = VK_IMAGE_LAYOUT_UNDEFINED;
-                    source.access = 0;
                 }
                 VkImageMemoryBarrier barrier { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
                 barrier.srcAccessMask = source.access;
                 barrier.dstAccessMask = destination.access;
-                barrier.oldLayout     = source.layout;
+                barrier.oldLayout     = acquire ? source.release_old_layout : source.layout;
                 barrier.newLayout     = destination.layout;
-                bool transfer         = source.queue_family != destination.queue_family &&
-                                        source.queue_family != VK_QUEUE_FAMILY_IGNORED;
+                bool transfer = acquire || (source.queue_family != destination.queue_family &&
+                                            source.queue_family != VK_QUEUE_FAMILY_IGNORED);
                 barrier.srcQueueFamilyIndex =
-                    transfer ? source.queue_family : VK_QUEUE_FAMILY_IGNORED;
+                    transfer ? (acquire ? source.released_from : source.queue_family)
+                             : VK_QUEUE_FAMILY_IGNORED;
                 barrier.dstQueueFamilyIndex =
                     transfer ? destination.queue_family : VK_QUEUE_FAMILY_IGNORED;
-                if (transfer && destination.queue_family == family) barrier.srcAccessMask = 0;
-                if (transfer && source.queue_family == family) barrier.dstAccessMask = 0;
+                if (acquire) barrier.srcAccessMask = 0;
+                if (transfer && ! acquire && source.queue_family == family)
+                    barrier.dstAccessMask = 0;
                 barrier.image            = native.unwrap();
                 barrier.subresourceRange = { range.aspect == tex::Aspect::Depth
                                                  ? VK_IMAGE_ASPECT_DEPTH_BIT
@@ -734,10 +801,9 @@ public:
                 if (emit_barrier)
                     device.Dispatch().vkCmdPipelineBarrier(
                         command,
-                        transfer && destination.queue_family == family
-                            ? VkPipelineStageFlags(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)
-                            : source.stages,
-                        transfer && source.queue_family == family
+                        acquire ? VkPipelineStageFlags(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)
+                                : source.stages,
+                        transfer && ! acquire && source.queue_family == family
                             ? VkPipelineStageFlags(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT)
                             : destination.stages,
                         0,
@@ -747,8 +813,12 @@ public:
                         nullptr,
                         1,
                         &barrier);
-                previous        = { use.access, use.stages };
+                if (! handoff) previous = { use.access, use.stages };
                 native_previous = destination;
+                if (transfer && ! acquire) {
+                    native_previous.released_from      = family;
+                    native_previous.release_old_layout = source.layout;
+                }
             }
         }
         views.push(rstd::move(use.view));
@@ -757,13 +827,31 @@ public:
     auto UseTexture(tex::TextureAccess use) -> Result<empty, tex::Error> {
         return RecordAccess(rstd::move(use), true);
     }
+    auto DiscardContents(const tex::TextureViewRef& view) -> Result<empty, tex::Error> {
+        if (! view.valid() || ! view.permits(true))
+            return Err(tex::Error { tex::ErrorKind::Invalid });
+        for (auto& entry : textures) {
+            if (entry.texture.identity() != view.texture().identity()) continue;
+            const auto range = view.description().range;
+            for (tex::Count layer = range.first_layer;
+                 layer < range.first_layer + range.layer_count;
+                 ++layer)
+                for (tex::Count mip = range.first_mip; mip < range.first_mip + range.mip_count;
+                     ++mip)
+                    entry.states[usize(layer * entry.texture.description().mip_levels + mip)] =
+                        tex::AccessState {};
+            entry.written = true;
+            return Ok(empty {});
+        }
+        return Err(tex::Error { tex::ErrorKind::Invalid });
+    }
     auto RecordFinalState(tex::TextureAccess use) -> Result<empty, tex::Error> {
         if (use.discard) return Err(tex::Error { tex::ErrorKind::Invalid });
         return RecordAccess(rstd::move(use), false);
     }
     auto RecordNativeAccess(tex::TextureAccess use, NativeAccess state)
         -> Result<empty, tex::Error> {
-        auto family = signal->session.device().graphics_queue().family_index;
+        auto family = signal->queue.family_index;
         if (state.layout == VK_IMAGE_LAYOUT_UNDEFINED || ! state.stages ||
             (state.queue_family != VK_QUEUE_FAMILY_IGNORED && state.queue_family != family &&
              state.queue_family != VK_QUEUE_FAMILY_EXTERNAL &&
@@ -845,15 +933,29 @@ public:
         return dyn<rstd::any::Any>::from_ref(*this).as_mut_ref();
     }
 };
+struct NativeQueueSubmit {
+    using Trait                  = NativeQueueSubmit;
+    static constexpr bool direct = false;
+    template<typename Self, typename = void>
+    struct Api {
+        using Trait = NativeQueueSubmit;
+        auto Submit(const vvk::Queue& queue, const VkSubmitInfo& info, VkFence fence) -> VkResult {
+            return rstd::trait_call<0>(this, queue, info, fence);
+        }
+    };
+    template<typename T>
+    using Funcs = rstd::TraitFuncs<&T::Submit>;
+};
 struct TextureRecordingReceiver {
     Box<TextureRecording> state;
 };
 class TextureContext {
-    Arc<QueueSignal>          signal_;
-    Vec<tex::Submission>      pending_;
-    Vec<tex::Serial>          pending_values_;
-    Vec<Weak<tex::ViewState>> views_;
-    Vec<tex::SamplerRef>      samplers_;
+    Arc<QueueSignal>                    signal_;
+    Option<Box<dyn<NativeQueueSubmit>>> submitter_;
+    Vec<tex::Submission>                pending_;
+    Vec<tex::Serial>                    pending_values_;
+    Vec<Weak<tex::ViewState>>           views_;
+    Vec<tex::SamplerRef>                samplers_;
     struct ProducerPending {
         Arc<ProducerReservation> reservation;
         tex::SubmissionToken     completion;
@@ -861,7 +963,8 @@ class TextureContext {
     Vec<ProducerPending> producers_;
     tex::Serial          next_submission_ {};
     bool                 failed_ {};
-    explicit TextureContext(Arc<QueueSignal> signal): signal_(rstd::move(signal)) {}
+    explicit TextureContext(Arc<QueueSignal> signal, Option<Box<dyn<NativeQueueSubmit>>> submitter)
+        : signal_(rstd::move(signal)), submitter_(rstd::move(submitter)) {}
 
 public:
     TextureContext(const TextureContext&)                    = delete;
@@ -878,11 +981,17 @@ public:
         pending_.clear();
         producers_.clear();
     }
-    static auto create(DeviceSession session) -> Result<TextureContext, tex::Error>;
-    auto        session() const -> const DeviceSession& { return signal_->session; }
-    auto        QuerySupport(const tex::TextureDesc& desc) const -> Result<empty, tex::Error>;
-    auto        CreateTexture(const tex::TextureDesc& desc) -> Result<tex::TextureRef, tex::Error>;
-    auto        CreateView(const tex::TextureRef& texture, tex::ViewDesc desc)
+    static auto create(DeviceSession                       session,
+                       Option<Box<dyn<NativeQueueSubmit>>> submitter = None())
+        -> Result<TextureContext, tex::Error>;
+    static auto create_on_queue(DeviceSession session, QueueParameters queue,
+                                Option<Box<dyn<NativeQueueSubmit>>> submitter = None())
+        -> Result<TextureContext, tex::Error>;
+    auto session() const -> const DeviceSession& { return signal_->session; }
+    auto queue() const -> const QueueParameters& { return signal_->queue; }
+    auto QuerySupport(const tex::TextureDesc& desc) const -> Result<empty, tex::Error>;
+    auto CreateTexture(const tex::TextureDesc& desc) -> Result<tex::TextureRef, tex::Error>;
+    auto CreateView(const tex::TextureRef& texture, tex::ViewDesc desc)
         -> Result<tex::TextureViewRef, tex::Error>;
     auto CreateSampler(const tex::SamplerDesc& desc) -> Result<tex::SamplerRef, tex::Error>;
     auto ImportTexture(TextureImport desc) -> Result<tex::TextureRef, tex::Error>;
@@ -912,6 +1021,17 @@ inline auto texture_recording(tex::Submission& work, const DeviceSession& sessio
         return Err(tex::Error { tex::ErrorKind::Invalid });
     return Ok(*recorder);
 }
+inline auto texture_recorded_in(tex::Submission& work, const DeviceSession& session,
+                                const tex::TextureViewRef& view) -> Result<bool, tex::Error> {
+    auto recording = texture_recording(work, session);
+    if (recording.is_err()) return Err(recording.unwrap_err());
+    if (! view.valid()) return Err(tex::Error { tex::ErrorKind::Invalid });
+    auto identity = view.texture().identity();
+    if (identity.device != session.epoch() || identity.epoch != session.epoch())
+        return Err(tex::Error { tex::ErrorKind::DeviceMismatch });
+    return Ok(tex::BackendAccess::Storage(view.texture())->recording ==
+              recording.unwrap()->identity);
+}
 inline auto native_recording(tex::Submission& work, const DeviceSession& session)
     -> Result<VkCommandBuffer, tex::Error> {
     auto recorder = texture_recording(work, session);
@@ -921,11 +1041,153 @@ inline auto native_recording(tex::Submission& work, const DeviceSession& session
     if (flushed.is_err()) return Err(flushed.unwrap_err());
     return Ok(state->command);
 }
+inline auto native_queue(tex::Submission& work, const DeviceSession& session)
+    -> Result<QueueParameters, tex::Error> {
+    auto recording = texture_recording(work, session);
+    if (recording.is_err()) return Err(recording.unwrap_err());
+    return Ok(recording.unwrap()->signal->queue);
+}
+inline auto release_texture(tex::Submission& work, const DeviceSession& session,
+                            tex::TextureAccess use, rstd::uint32_t destination)
+    -> Result<empty, tex::Error> {
+    auto recording = texture_recording(work, session);
+    if (recording.is_err()) return Err(recording.unwrap_err());
+    if (recording.unwrap()->signal->queue.family_index == destination) return Ok(empty {});
+    bool found {};
+    for (const auto& queue : session.device().queues())
+        found |=
+            queue.family_index == destination &&
+            (queue.flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT));
+    if (! found) return Err(tex::Error { tex::ErrorKind::Unsupported });
+    auto access = native_access({ use.access, use.stages }, use.view.description().range.aspect);
+    access.queue_family = destination;
+    return recording.unwrap()->RecordAccess(rstd::move(use), true, Some(access), true);
+}
+inline auto discard_texture_contents(tex::Submission& work, const DeviceSession& session,
+                                     const tex::TextureViewRef& view) -> Result<empty, tex::Error> {
+    auto recording = texture_recording(work, session);
+    if (recording.is_err()) return Err(recording.unwrap_err());
+    return recording.unwrap()->DiscardContents(view);
+}
+inline auto attach_prepared_texture_read(tex::Submission& work, const DeviceSession& session,
+                                         Arc<TextureReadReservation> reservation)
+    -> Result<empty, tex::Error> {
+    auto recording = texture_recording(work, session);
+    if (recording.is_err()) return Err(recording.unwrap_err());
+    if (! reservation || ! reservation->active) return Err(tex::Error { tex::ErrorKind::Stale });
+    for (const auto& previous : recording.unwrap()->prepared_reads)
+        if (Arc<TextureReadReservation>::ptr_eq(previous, reservation)) return Ok(empty {});
+    recording.unwrap()->prepared_reads.push(rstd::move(reservation));
+    return Ok(empty {});
+}
 inline auto native_command_recording(tex::Submission& work, const DeviceSession& session)
     -> Result<vvk::CommandBuffer, tex::Error> {
     auto command = native_recording(work, session);
     if (command.is_err()) return Err(command.unwrap_err());
     return Ok(vvk::CommandBuffer(command.unwrap(), session.device().handle().Dispatch()));
+}
+class TextureMipmapProgram {
+    DeviceSession       session_;
+    tex::TextureViewRef view_;
+    tex::Range          range_;
+    VkImage             image_;
+    TextureMipmapProgram(DeviceSession session, tex::TextureViewRef view, tex::Range range,
+                         VkImage image)
+        : session_(rstd::move(session)), view_(rstd::move(view)), range_(range), image_(image) {}
+
+public:
+    static auto prepare(DeviceSession session, tex::TextureViewRef view,
+                        Option<tex::Range> selection = None())
+        -> Result<TextureMipmapProgram, tex::Error> {
+        if (! session.valid() || ! view.valid() || ! view.permits(true))
+            return Err(tex::Error { tex::ErrorKind::Invalid });
+        if (session.lost()) return Err(tex::Error { tex::ErrorKind::Lost, VK_ERROR_DEVICE_LOST });
+        auto identity = view.texture().identity();
+        if (identity.device != session.epoch() || identity.epoch != session.epoch())
+            return Err(tex::Error { tex::ErrorKind::DeviceMismatch });
+        const auto& desc  = view.texture().description();
+        auto        range = selection.unwrap_or(view.description().range);
+        if (desc.samples != 1 || range.aspect != tex::Aspect::Color ||
+            ! tex::has(desc.usage, tex::Usage::TransferSource) ||
+            ! tex::has(desc.usage, tex::Usage::TransferDestination))
+            return Err(tex::Error { tex::ErrorKind::Unsupported });
+        auto checked = tex::validate_access(
+            { view, tex::Access::TransferSource, tex::Stages::Transfer, false, Some(range) });
+        if (checked.is_err()) return Err(checked.unwrap_err());
+        if (range.mip_count > 1) {
+            auto       features = session.device()
+                                      .gpu()
+                                      .GetFormatProperties(ToVkType(desc.format))
+                                      .optimalTilingFeatures;
+            const auto required = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                  VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+            if ((features & required) != required)
+                return Err(tex::Error { tex::ErrorKind::Unsupported });
+        }
+        auto image = native_texture(view.texture());
+        if (image.is_err()) return Err(image.unwrap_err());
+        return Ok(
+            TextureMipmapProgram(rstd::move(session), rstd::move(view), range, image.unwrap()));
+    }
+    auto record(tex::Submission& work) const -> Result<empty, tex::Error> {
+        const auto& desc    = view_.texture().description();
+        const auto  range   = range_;
+        auto        command = native_recording(work, session_);
+        if (command.is_err()) return Err(command.unwrap_err());
+        for (tex::Count mip = range.first_mip + 1; mip < range.first_mip + range.mip_count; ++mip) {
+            auto source           = range;
+            source.first_mip      = mip - 1;
+            source.mip_count      = 1;
+            auto destination      = source;
+            destination.first_mip = mip;
+            auto read             = work.commands()->UseTexture({ view_,
+                                                                  tex::Access::TransferSource,
+                                                                  tex::Stages::Transfer,
+                                                                  false,
+                                                                  Some(source),
+                                                                  true });
+            if (read.is_err()) return Err(read.unwrap_err());
+            auto write = work.commands()->UseTexture({ view_,
+                                                       tex::Access::TransferDestination,
+                                                       tex::Stages::Transfer,
+                                                       true,
+                                                       Some(destination) });
+            if (write.is_err()) return Err(write.unwrap_err());
+            const auto  from = tex::mip_extent(desc, mip - 1), to = tex::mip_extent(desc, mip);
+            VkImageBlit blit {};
+            blit.srcSubresource = {
+                VK_IMAGE_ASPECT_COLOR_BIT, mip - 1, range.first_layer, range.layer_count
+            };
+            blit.dstSubresource = {
+                VK_IMAGE_ASPECT_COLOR_BIT, mip, range.first_layer, range.layer_count
+            };
+            blit.srcOffsets[1] = { rstd::int32_t(from.width), rstd::int32_t(from.height), 1 };
+            blit.dstOffsets[1] = { rstd::int32_t(to.width), rstd::int32_t(to.height), 1 };
+            session_.device().handle().Dispatch().vkCmdBlitImage(
+                command.unwrap(),
+                image_,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                image_,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1,
+                &blit,
+                VK_FILTER_LINEAR);
+        }
+        return work.commands()->UseTexture({ view_,
+                                             tex::Access::Sampled,
+                                             tex::Stages::Fragment,
+                                             false,
+                                             Some(tex::Range(range)),
+                                             true });
+    }
+};
+inline auto generate_texture_mipmaps(tex::Submission& work, const DeviceSession& session,
+                                     tex::TextureViewRef view,
+                                     Option<tex::Range>  selection = None())
+    -> Result<empty, tex::Error> {
+    auto prepared = TextureMipmapProgram::prepare(session, rstd::move(view), selection);
+    if (prepared.is_err()) return Err(prepared.unwrap_err());
+    return prepared->record(work);
 }
 inline auto RecordFinalState(tex::Submission& work, const DeviceSession& session,
                              tex::TextureAccess access) -> Result<empty, tex::Error> {
@@ -956,7 +1218,7 @@ inline auto ReleaseTexture(tex::Submission& work, const DeviceSession& session,
 }
 inline void record_surface_barrier(TextureRecording& recording, const FrameSurfaceLease& lease,
                                    NativeAccess source, NativeAccess destination) {
-    auto                 family = recording.signal->session.device().graphics_queue().family_index;
+    auto                 family   = recording.signal->queue.family_index;
     bool                 transfer = source.queue_family != destination.queue_family;
     VkImageMemoryBarrier barrier { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
     barrier.srcAccessMask = transfer && destination.queue_family == family ? 0 : source.access;
@@ -1014,6 +1276,35 @@ inline auto recordAcquire(tex::Submission& work, const DeviceSession& session,
     record_surface_barrier(*recording, lease, initial, target);
     recording->surfaces.push(TextureRecording::SurfaceAccess { lease, target, rstd::move(owner) });
     return Ok(empty {});
+}
+inline auto recordSurfaceDependency(tex::Submission& work, const DeviceSession& session,
+                                    const FrameSurfaceLease& lease) -> Result<empty, tex::Error> {
+    auto recording = texture_recording(work, session);
+    if (recording.is_err()) return Err(recording.unwrap_err());
+    for (const auto& surface : recording.unwrap()->surfaces)
+        if (surface.lease.identity == lease.identity &&
+            surface.lease.image.handle == lease.image.handle)
+            return surface.released
+                       ? Result<empty, tex::Error>(Err(tex::Error { tex::ErrorKind::Invalid }))
+                       : Result<empty, tex::Error>(Ok(empty {}));
+    return Err(tex::Error { tex::ErrorKind::Invalid });
+}
+inline auto recordSurfaceAccess(tex::Submission& work, const DeviceSession& session,
+                                const FrameSurfaceLease& lease, Arc<dyn<rstd::any::Any>> owner,
+                                NativeAccess target) -> Result<empty, tex::Error> {
+    auto checked = texture_recording(work, session);
+    if (checked.is_err()) return Err(checked.unwrap_err());
+    auto recording      = checked.unwrap();
+    target.queue_family = session.device().graphics_queue().family_index;
+    for (auto& surface : recording->surfaces)
+        if (surface.lease.identity == lease.identity &&
+            surface.lease.image.handle == lease.image.handle) {
+            if (surface.released) return Err(tex::Error { tex::ErrorKind::Invalid });
+            record_surface_barrier(*recording, lease, surface.state, target);
+            surface.state = target;
+            return Ok(empty {});
+        }
+    return recordAcquire(work, session, lease, rstd::move(owner), target);
 }
 inline auto recordSurfaceFinalState(tex::Submission& work, const DeviceSession& session,
                                     const FrameSurfaceLease& lease, NativeAccess state)
@@ -1172,25 +1463,47 @@ struct Impl<vrento::texture::SubmissionQueue, vrento::vulkan::TextureContext>
 
 namespace vrento::vulkan
 {
-auto TextureContext::create(DeviceSession session) -> Result<TextureContext, tex::Error> {
+auto TextureContext::create(DeviceSession session, Option<Box<dyn<NativeQueueSubmit>>> submitter)
+    -> Result<TextureContext, tex::Error> {
+    if (! session.valid()) return Err(tex::Error { tex::ErrorKind::Invalid });
+    return create_on_queue(session, session.device().graphics_queue(), rstd::move(submitter));
+}
+auto TextureContext::create_on_queue(DeviceSession session, QueueParameters selected,
+                                     Option<Box<dyn<NativeQueueSubmit>>> submitter)
+    -> Result<TextureContext, tex::Error> {
     if (! session.valid()) return Err(tex::Error { tex::ErrorKind::Invalid });
     if (session.lost()) return Err(tex::Error { tex::ErrorKind::Lost, VK_ERROR_DEVICE_LOST });
+    bool found {};
+    for (const auto& queue : session.device().queues())
+        found |= *queue.handle == *selected.handle && queue.family_index == selected.family_index &&
+                 queue.queue_index == selected.queue_index && queue.flags == selected.flags;
+    if (! found ||
+        ! (selected.flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT)))
+        return Err(tex::Error { tex::ErrorKind::Unsupported });
     static tex::Serial next_signal { 1 };
-    auto               signal = Arc<QueueSignal>::make(
-        rstd::move(session), __atomic_fetch_add(&next_signal, tex::Serial(1), __ATOMIC_RELAXED));
+    auto               signal =
+        Arc<QueueSignal>::make(rstd::move(session),
+                               __atomic_fetch_add(&next_signal, tex::Serial(1), __ATOMIC_RELAXED),
+                               selected);
     VkSemaphoreTypeCreateInfo type { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
     type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
     VkSemaphoreCreateInfo info { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    info.pNext   = &type;
-    auto& device = signal->session.device().handle();
-    auto  result = device.CreateSemaphore(info, signal->semaphore);
+    info.pNext                     = &type;
+    auto&                   device = signal->session.device().handle();
+    VkCommandPoolCreateInfo pool_info { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    pool_info.flags =
+        VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pool_info.queueFamilyIndex = selected.family_index;
+    auto pool_result           = device.CreateCommandPool(pool_info, signal->pool);
+    if (pool_result != VK_SUCCESS) return Err(texture_error(pool_result));
+    auto result = device.CreateSemaphore(info, signal->semaphore);
     if (result != VK_SUCCESS) return Err(texture_error(result));
     signal->counter = reinterpret_cast<PFN_vkGetSemaphoreCounterValueKHR>(
         device.Dispatch().vkGetDeviceProcAddr(*device, "vkGetSemaphoreCounterValueKHR"));
     signal->wait = reinterpret_cast<PFN_vkWaitSemaphoresKHR>(
         device.Dispatch().vkGetDeviceProcAddr(*device, "vkWaitSemaphoresKHR"));
     if (! signal->counter || ! signal->wait) return Err(tex::Error { tex::ErrorKind::Unsupported });
-    return Ok(TextureContext(rstd::move(signal)));
+    return Ok(TextureContext(rstd::move(signal), rstd::move(submitter)));
 }
 auto TextureContext::QuerySupport(const tex::TextureDesc& desc) const -> Result<empty, tex::Error> {
     auto checked = tex::validate(desc);
@@ -1251,11 +1564,10 @@ auto TextureContext::CreateTexture(const tex::TextureDesc& desc)
                                  tex::BackendAccess::Storage(texture)->backing.deref())
                                  .unwrap();
     for (tex::Count i = 0; i < desc.layers * desc.mip_levels; ++i)
-        native->tracking->states.push(
-            NativeAccess { VK_IMAGE_LAYOUT_UNDEFINED,
-                           0,
-                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                           session().device().graphics_queue().family_index });
+        native->tracking->states.push(NativeAccess { VK_IMAGE_LAYOUT_UNDEFINED,
+                                                     0,
+                                                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                                     VK_QUEUE_FAMILY_IGNORED });
     tex::BackendAccess::Storage(texture)->status = Some(Arc<dyn<tex::ResourceStatus>>::make(
         TextureDeviceStatus { session(), native->tracking.clone() }));
     return Ok(rstd::move(texture));
@@ -1397,8 +1709,9 @@ auto TextureContext::ImportTexture(TextureImport desc) -> Result<tex::TextureRef
         return Err(tex::Error { tex::ErrorKind::Invalid });
     for (tex::Count i = 0; i < desc.description.layers * desc.description.mip_levels; ++i)
         native->tracking->states.push(NativeAccess(initial));
-    tex::BackendAccess::Storage(texture)->last_write = desc.ready;
-    tex::BackendAccess::Storage(texture)->last_use   = desc.ready;
+    tex::BackendAccess::Storage(texture)->last_write       = desc.ready;
+    tex::BackendAccess::Storage(texture)->content_revision = 1;
+    tex::BackendAccess::Storage(texture)->last_use         = desc.ready;
     return Ok(rstd::move(texture));
 }
 auto TextureContext::AttachWait(tex::Submission& work, NativeSemaphoreWait wait)
@@ -1537,7 +1850,8 @@ auto TextureContext::CommitProducerWrite(ProducerWrite& write, tex::SubmissionTo
         .unwrap()
         ->tracking->states[index] = reservation.target.final;
     storage.last_write            = completion;
-    storage.last_use              = completion;
+    ++storage.content_revision;
+    storage.last_use = completion;
     reservation.release();
     return Ok(empty {});
 }
@@ -1547,7 +1861,7 @@ auto TextureContext::Begin() -> Result<tex::Submission, tex::Error> {
     auto recorder = Box<TextureRecording>::make(signal_.clone(), next_texture_recording());
     if (! recorder->uploads.init()) return Err(tex::Error { tex::ErrorKind::Backend });
     VkCommandBufferAllocateInfo info { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    info.commandPool        = *session().device().cmd_pool();
+    info.commandPool        = *signal_->pool;
     info.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     info.commandBufferCount = 1;
     auto& device            = session().device().handle();
@@ -1661,12 +1975,15 @@ auto TextureContext::Submit(tex::Submission work) -> Result<tex::SubmissionToken
         TextureCompletion { signal_.clone(), serial, completion_fence.clone() }));
     pending_.reserve(pending_.len() + usize(1));
     pending_values_.reserve(pending_values_.len() + usize(1));
-    result = session().observe_result(
-        session().device().graphics_queue().handle.Submit(info, completion_fence->handle()));
+    const auto& queue = signal_->queue.handle;
+    result            = session().observe_result(
+        submitter_ ? (*submitter_)->Submit(queue, info, completion_fence->handle())
+                   : queue.Submit(info, completion_fence->handle()));
     if (result != VK_SUCCESS) {
         failed_             = true;
         recording.uncertain = true;
         tex::BackendAccess::Uncertain(work);
+        for (auto& participant : recording.participants) participant->Uncertain();
         for (auto& entry : recording.textures)
             rstd::any::downcast_ref<NativeTexture>(
                 tex::BackendAccess::Storage(entry.texture)->backing.deref())
@@ -1679,13 +1996,18 @@ auto TextureContext::Submit(tex::Submission work) -> Result<tex::SubmissionToken
     next_submission_    = serial;
     recording.submitted = true;
     tex::BackendAccess::Submitted(work);
+    for (auto& participant : recording.participants) participant->Commit(token);
+    for (auto& reservation : recording.prepared_reads) reservation->release();
     for (auto& entry : recording.textures) {
         auto& state  = *tex::BackendAccess::Storage(entry.texture);
         state.states = rstd::move(entry.states);
         rstd::any::downcast_ref<NativeTexture>(state.backing.deref()).unwrap()->tracking->states =
             rstd::move(entry.native_states);
         state.recording = 0;
-        if (entry.written) state.last_write = token;
+        if (entry.written) {
+            state.last_write = token;
+            ++state.content_revision;
+        }
         state.last_use = token;
     }
     pending_.push(rstd::move(work));

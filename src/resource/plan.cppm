@@ -6,10 +6,10 @@ import :resource.texture;
 import :resource.buffer;
 import :resource.shader;
 
+using namespace rstd::prelude;
+
 export namespace vrento::resource
 {
-
-using namespace rstd::prelude;
 
 enum class ResourceAccess
 {
@@ -19,27 +19,31 @@ enum class ResourceAccess
 };
 
 struct TexturePlanEntry {
-    TextureUseHandle handle;
-    TextureRequest   request;
-    String           allocation_key;
-    ResourceAccess   access { ResourceAccess::Read };
-    u32              version { 0 };
+    TextureUseHandle   handle;
+    TextureResourceRef definition;
+    auto               request() const -> const TextureRequest& { return definition.definition(); }
+    String             allocation_key;
+    ResourceAccess     access { ResourceAccess::Read };
+    u32                version { 0 };
 
     void UpdateRequest(TextureRequest updated) {
         // Frame-boundary retention belongs to the graph, not the refreshed image definition.
-        if ((request.content & TextureContentFlag(TextureContent::PreserveAcrossFrames)) != u32()) {
+        if (definition.valid() &&
+            (request().content & TextureContentFlag(TextureContent::PreserveAcrossFrames)) !=
+                u32()) {
             updated.lifetime = TextureLifetimeClass::Retained;
             updated.content |= TextureContentFlag(TextureContent::PreserveAcrossFrames);
         }
-        request = rstd::move(updated);
+        definition = definition.with_definition(rstd::move(updated));
     }
 };
 
 struct BufferPlanEntry {
-    BufferUseHandle handle;
-    BufferRequest   request;
-    ResourceAccess  access { ResourceAccess::Read };
-    u32             version { 0 };
+    BufferUseHandle   handle;
+    BufferResourceRef definition;
+    auto              request() const -> const BufferRequest& { return definition.definition(); }
+    ResourceAccess    access { ResourceAccess::Read };
+    u32               version { 0 };
 };
 
 struct ShaderPlanEntry {
@@ -68,6 +72,22 @@ struct ResourcePlan {
     Vec<BufferPlanEntry>  buffers;
     Vec<ShaderPlanEntry>  shaders;
 
+    auto clone() const -> ResourcePlan {
+        ResourcePlan result { .generation = generation };
+        for (const auto& entry : textures)
+            result.textures.push({ entry.handle,
+                                   entry.definition.clone(),
+                                   entry.allocation_key.clone(),
+                                   entry.access,
+                                   entry.version });
+        for (const auto& entry : buffers)
+            result.buffers.push(
+                { entry.handle, entry.definition.clone(), entry.access, entry.version });
+        for (const auto& entry : shaders)
+            result.shaders.push({ entry.handle, entry.request.clone(), entry.version });
+        return result;
+    }
+
     auto DeclareTexture(TextureRequest request, ResourceAccess access) -> TextureUseHandle {
         if (generation == u64()) return {};
 
@@ -86,9 +106,9 @@ struct ResourcePlan {
             .generation = generation,
         };
         textures.push(TexturePlanEntry {
-            .handle  = handle,
-            .request = rstd::move(request),
-            .access  = access,
+            .handle     = handle,
+            .definition = TextureResourceRef(rstd::move(request)),
+            .access     = access,
         });
         return handle;
     }

@@ -58,6 +58,7 @@ enum class Stages : Count
     Color    = 16,
     Depth    = 32,
     Geometry = 64,
+    Shaders  = Vertex | Fragment | Compute | Geometry,
     All      = 127
 };
 constexpr auto operator|(Stages a, Stages b) -> Stages { return Stages(Count(a) | Count(b)); }
@@ -255,7 +256,9 @@ struct StorageState {
     Vec<AccessState>                 states;
     Option<Arc<dyn<ResourceStatus>>> status;
     Serial                           recording {}, pool {}, writer {}, version {};
+    Serial                           content_revision {};
     Count                            prepared_reads {};
+    Count                            prepared_native_reads {};
     SubmissionToken                  last_write, last_use;
     StorageState(Identity id, TextureDesc d, Arc<dyn<rstd::any::Any>> owner)
         : identity(id), desc(d), backing(rstd::move(owner)) {
@@ -297,6 +300,7 @@ public:
         return (*state_)->status.is_some() ? (*(*state_)->status)->Check() : Ok(empty {});
     }
     auto ready() const -> SubmissionToken { return (*state_)->last_write; }
+    auto content_revision() const -> Serial { return (*state_)->content_revision; }
 
 private:
     auto backend_state() const -> const Arc<StorageState>& { return *state_; }
@@ -470,6 +474,7 @@ struct TextureAccess {
     Stages         stages { Stages::Fragment };
     bool           discard {};
     Option<Range>  range;
+    bool           require_contents {};
 };
 inline bool writes(Access access) {
     return access == Access::ColorAttachment || access == Access::DepthAttachment ||
@@ -493,7 +498,7 @@ inline auto validate_access(const TextureAccess& use) -> Result<Range, Error> {
     if (! has(use.view.texture().description().usage, required) ||
         ((use.access == Access::Sampled || use.access == Access::StorageRead ||
           use.access == Access::StorageWrite) &&
-         (Count(use.stages) & ~Count(7))))
+         (Count(use.stages) & ~Count(Stages::Shaders))))
         return Err(Error { ErrorKind::Invalid });
     auto range = use.range.is_some() ? *use.range : use.view.description().range;
     auto normalized =
@@ -590,10 +595,13 @@ public:
     bool submitted() const { return status() == SubmissionStatus::Submitted; }
     bool cancelled() const { return status() == SubmissionStatus::Cancelled; }
     bool uncertain() const { return status() == SubmissionStatus::Uncertain; }
+    bool same(const SubmissionReceipt& other) const {
+        return Arc<SubmissionState>::ptr_eq(state_, other.state_);
+    }
 };
 class Submission {
-    Box<dyn<TextureCommands>> commands_;
-    Arc<SubmissionState>      state_;
+    Option<Box<dyn<TextureCommands>>> commands_;
+    Arc<SubmissionState>              state_;
     friend struct BackendAccess;
     bool valid_ { true };
     void cancel() {
@@ -603,7 +611,7 @@ class Submission {
 
 public:
     explicit Submission(Box<dyn<TextureCommands>> commands)
-        : commands_(rstd::move(commands)), state_(Arc<SubmissionState>::make()) {}
+        : commands_(Some(rstd::move(commands))), state_(Arc<SubmissionState>::make()) {}
     Submission(const Submission&)                    = delete;
     auto operator=(const Submission&) -> Submission& = delete;
     Submission(Submission&& other)
@@ -621,12 +629,18 @@ public:
     }
     ~Submission() { cancel(); }
     bool valid() const { return valid_; }
+    void discard() {
+        if (! valid_ || state_->status != SubmissionStatus::Recording) return;
+        cancel();
+        valid_    = false;
+        commands_ = None();
+    }
     auto receipt() const -> SubmissionReceipt { return SubmissionReceipt(state_.clone()); }
-    auto commands() -> mut_ref<dyn<TextureCommands>> { return commands_.deref_mut(); }
-    auto backend() -> mut_ref<dyn<rstd::any::Any>> { return commands_->Backend(); }
+    auto commands() -> mut_ref<dyn<TextureCommands>> { return (*commands_).deref_mut(); }
+    auto backend() -> mut_ref<dyn<rstd::any::Any>> { return (*commands_)->Backend(); }
     template<typename T>
     void retain(T value) {
-        commands_->Retain(Box<dyn<rstd::any::Any>>::make(rstd::move(value)));
+        (*commands_)->Retain(Box<dyn<rstd::any::Any>>::make(rstd::move(value)));
     }
 };
 inline void BackendAccess::Submitted(Submission& work) {

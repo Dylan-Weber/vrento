@@ -21,6 +21,11 @@ sources = [
   "tests/extension_names.cpp",
   "tests/uniform.cpp",
   "tests/pipeline_layout.cpp",
+  "tests/pipeline_cache.cpp",
+  "tests/graph_vulkan.cpp",
+  "tests/renderer.cpp",
+  "tests/pass_set.cppm",
+  "tests/gpu_buffer.cpp",
   "tests/geometry.cpp",
   "tests/draw_buffer.cpp",
   "tests/node.cpp",
@@ -42,6 +47,14 @@ rstd-cppstd = { version = "0.1.0", pub = true }
 rstd-log = { version = "0.1.0", pub = true }
 vvk = { version = "0.1.0", pub = true }
 wavsen = { git = "https://github.com/hypengw/wavsen.git" }
+lito-spirv = { version = "0.1.0" }
 
 [dev-dependencies]
 rstd-test = { version = "0.1.0" }
+
+[build-tools.glslang]
+path = "glslangValidator"
+
+[[test.attach]]
+package = "vrento"
+sources = ["tests/frame_graph.cpp", "tests/vulkan_pass.cpp"]
