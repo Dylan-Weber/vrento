@@ -27,6 +27,7 @@ class PreparedResourceUploads {
     rstd::sync::Arc<FrameSubmissionLease> frame_;
     texture::Serial                       recording_;
     Vec<PreparedTextureUpdate>            updates_;
+    vulkan::BufferUploadSnapshot          buffer_writes_;
 
 public:
     PreparedResourceUploads(vulkan::DeviceSession                 session,
@@ -35,16 +36,16 @@ public:
         : session_(rstd::move(session)),
           frame_(rstd::move(frame)),
           recording_(recording),
-          updates_(rstd::move(updates)) {}
+          updates_(rstd::move(updates)),
+          buffer_writes_(frame_->recorded_buffers.Snapshot()) {}
     auto BufferWrites() const -> Vec<vulkan::BufferUploadWrite> {
         return frame_->recorded_buffers.Writes();
     }
     auto BufferBinding(const vulkan::BufferAllocation& allocation) const
         -> rstd::sync::Arc<dyn<vulkan::GraphBinding>> {
         Vec<vulkan::GraphRange> writes;
-        for (const auto& write : BufferWrites())
-            if (write.allocation.identity() == allocation.identity())
-                writes.push({ .offset = write.offset, .size = write.size });
+        for (const auto& write : buffer_writes_.ranges(allocation.identity()))
+            writes.push({ .offset = write.offset, .size = write.size });
         return rstd::sync::Arc<dyn<vulkan::GraphBinding>>::make(vulkan::GraphUploadedBufferBinding(
             session_, allocation.clone(), frame_->receipt, rstd::move(writes)));
     }

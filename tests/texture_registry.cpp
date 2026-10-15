@@ -1,4 +1,5 @@
 #include <rstd/macro.hpp>
+#include <cstdio>
 #include <rstd/test/gtest.hpp>
 import rstd;
 import rstd.test;
@@ -915,4 +916,111 @@ TEST(MediaRegistry, OpenFailureOwnsDecoderDiagnostic) {
     media.Clear();
     EXPECT_FALSE(snapshot.error().source->as_Media().source.cause.as_Decoder().message.is_empty());
     EXPECT_EQ(session.validation_errors(), 0u);
+}
+
+TEST(RenderResourceSystem, BufferRangeSnapshotSurvivesCancelCommitAndRestore) {
+    auto              session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    vk::BufferManager buffers(session.device());
+    buffers.init();
+    auto a = buffers.Allocate({ 64, 4, vk::BufferUploadClass::Uniform }).unwrap();
+    auto b = buffers.Allocate({ 64, 4, vk::BufferUploadClass::Uniform }).unwrap();
+    EXPECT_EQ(a.buffer(), b.buffer());
+    EXPECT_NE(a.identity(), b.identity());
+    array<rstd::uint8_t, 8> bytes {};
+    buffers.QueueWrite(a, bytes.as_slice(), 8).unwrap();
+    buffers.QueueWrite(b, bytes.as_slice(), 16).unwrap();
+    buffers.QueueWrite(a, bytes.as_slice(), 0).unwrap();
+    vk::RecordedBufferUploads first;
+    buffers.PreparePendingUploads(first);
+    auto old = first.Snapshot();
+    EXPECT_EQ(old.ranges(a.identity()).len(), usize(1));
+    EXPECT_EQ(old.ranges(a.identity())[usize()].size, 16u);
+    EXPECT_EQ(old.ranges(b.identity())[usize()].offset, 16u);
+    EXPECT_TRUE(old.ranges(0).is_empty());
+    EXPECT_TRUE(old.ranges(~rstd::uint64_t()).is_empty());
+    first = vk::RecordedBufferUploads {};
+    buffers.QueueWrite(a, bytes.as_slice(), 16).unwrap();
+    vk::RecordedBufferUploads next;
+    buffers.PreparePendingUploads(next);
+    auto extended = next.Snapshot();
+    EXPECT_EQ(extended.ranges(a.identity())[usize()].size, 24u);
+    EXPECT_EQ(old.ranges(a.identity())[usize()].size, 16u);
+    auto context = vk::TextureContext::create(session).unwrap();
+    auto work    = context.Begin().unwrap();
+    auto command = vk::native_command_recording(work, session).unwrap();
+    buffers.RecordUploads(command, next);
+    auto lease = buffers.CommitRecordedUploads(rstd::move(next)).unwrap();
+    work.discard();
+    buffers.QueueWrite(b, bytes.as_slice(), 24).unwrap();
+    EXPECT_TRUE(buffers.RestoreUploads(rstd::move(lease)));
+    vk::RecordedBufferUploads restored;
+    buffers.PreparePendingUploads(restored);
+    auto merged = restored.Snapshot();
+    EXPECT_EQ(merged.ranges(b.identity())[usize()].size, 16u);
+    EXPECT_EQ(extended.ranges(b.identity())[usize()].size, 8u);
+    restored = vk::RecordedBufferUploads {};
+    EXPECT_EQ(merged.ranges(a.identity())[usize()].size, 24u);
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
+
+TEST(RenderResourceSystem, BufferRangeSnapshotOutlivesUploadOwners) {
+    auto                     session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    vk::BufferUploadSnapshot snapshot;
+    rstd::uint64_t           identity {};
+    {
+        vk::BufferManager buffers(session.device());
+        buffers.init();
+        auto allocation = buffers.Allocate({ 64, 4, vk::BufferUploadClass::Uniform }).unwrap();
+        identity        = allocation.identity();
+        array<rstd::uint8_t, 8> bytes {};
+        buffers.QueueWrite(allocation, bytes.as_slice(), 8).unwrap();
+        vk::RecordedBufferUploads prepared;
+        buffers.PreparePendingUploads(prepared);
+        snapshot = prepared.Snapshot();
+    }
+    auto copy = snapshot.clone();
+    snapshot  = vk::BufferUploadSnapshot {};
+    ASSERT_EQ(copy.ranges(identity).len(), usize(1));
+    EXPECT_EQ(copy.ranges(identity)[usize()].offset, 8u);
+    EXPECT_EQ(copy.ranges(identity)[usize()].size, 8u);
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
+
+TEST(RenderResourceSystem, BufferRangeQueryScale) {
+    auto session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    for (unsigned count : array<unsigned, 3> { 16u, 128u, 1024u }) {
+        vk::BufferManager buffers(session.device());
+        buffers.init();
+        Vec<vk::BufferAllocation> allocations;
+        array<rstd::uint8_t, 8>   bytes {};
+        for (unsigned n {}; n < count; ++n) {
+            auto allocation = buffers.Allocate({ 64, 4, vk::BufferUploadClass::Uniform }).unwrap();
+            buffers.QueueWrite(allocation, bytes.as_slice(), 16).unwrap();
+            buffers.QueueWrite(allocation, bytes.as_slice(), 0).unwrap();
+            buffers.QueueWrite(allocation, bytes.as_slice(), 8).unwrap();
+            allocations.push(rstd::move(allocation));
+        }
+        vk::RecordedBufferUploads prepared;
+        auto                      start = rstd::time::Instant::now();
+        buffers.TryPreparePendingUploads(prepared).unwrap();
+        auto snapshot   = prepared.Snapshot();
+        auto prepare_ns = start.elapsed().as_nanos();
+        EXPECT_EQ(snapshot.writes().len(), usize(count));
+        for (unsigned trial {}; trial < 3; ++trial) {
+            auto           queried = rstd::time::Instant::now();
+            rstd::uint64_t total {};
+            for (unsigned repeat {}; repeat < 32; ++repeat)
+                for (const auto& allocation : allocations)
+                    for (const auto& range : snapshot.ranges(allocation.identity()))
+                        total += range.size;
+            EXPECT_EQ(total, rstd::uint64_t(count) * 32 * 24);
+            std::printf(
+                "buffer ranges N=%u C=%u trial=%u prepare_ns=%llu query32_ns=%llu\n",
+                count,
+                count * 3,
+                trial,
+                static_cast<unsigned long long>(prepare_ns.to_primitive()),
+                static_cast<unsigned long long>(queried.elapsed().as_nanos().to_primitive()));
+        }
+    }
 }

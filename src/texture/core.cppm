@@ -679,6 +679,16 @@ struct SubmissionQueue {
 export namespace rstd
 {
 template<>
+struct Impl<hash::Hash, vrento::texture::Identity> : ImplBase<vrento::texture::Identity> {
+    template<typename H>
+        requires Impled<H, hash::Hasher>
+    void hash(H& state) const noexcept {
+        hash::hash_into(u64(this->self().device), state);
+        hash::hash_into(u64(this->self().epoch), state);
+        hash::hash_into(u64(this->self().resource), state);
+    }
+};
+template<>
 struct Impl<fmt::Display, vrento::texture::Error> : ImplBase<vrento::texture::Error> {
     auto fmt(fmt::Formatter& formatter) const -> bool {
         const auto& value = this->self();

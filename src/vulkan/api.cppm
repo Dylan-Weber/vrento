@@ -891,6 +891,50 @@ struct BufferUploadTicket {
 
 class BufferManager;
 
+struct BufferUploadRange {
+    rstd::uint64_t allocation {};
+    VkDeviceSize   offset {}, size {};
+};
+class BufferUploadSnapshot {
+    Option<Arc<Vec<BufferUploadRange>>> ranges_;
+    friend class BufferManager;
+    explicit BufferUploadSnapshot(Vec<BufferUploadRange> ranges)
+        : ranges_(Some(Arc<Vec<BufferUploadRange>>::make(rstd::move(ranges)))) {}
+
+public:
+    BufferUploadSnapshot() = default;
+    auto clone() const -> BufferUploadSnapshot {
+        BufferUploadSnapshot result;
+        result.ranges_ = ranges_.clone();
+        return result;
+    }
+    auto writes() const -> slice<BufferUploadRange> {
+        return ranges_ ? (*ranges_)->as_slice() : slice<BufferUploadRange> {};
+    }
+    auto ranges(rstd::uint64_t allocation) const -> slice<BufferUploadRange> {
+        auto  values = writes();
+        usize low {}, high = values.len();
+        while (low < high) {
+            auto middle = low + (high - low) / usize(2);
+            if (values[middle].allocation < allocation)
+                low = middle + usize(1);
+            else
+                high = middle;
+        }
+        auto first = low;
+        high       = values.len();
+        while (low < high) {
+            auto middle = low + (high - low) / usize(2);
+            if (values[middle].allocation <= allocation)
+                low = middle + usize(1);
+            else
+                high = middle;
+        }
+        if (first == low) return {};
+        return slice<BufferUploadRange>::from_raw_parts(values.as_raw_ptr() + first.to_primitive(),
+                                                        low - first);
+    }
+};
 struct BufferUploadWrite {
     BufferAllocation allocation;
     VkDeviceSize     offset {}, size {};
@@ -907,6 +951,7 @@ public:
 
     bool Valid() const noexcept;
     auto Writes() const -> Vec<BufferUploadWrite>;
+    auto Snapshot() const -> BufferUploadSnapshot;
 
 private:
     struct State;

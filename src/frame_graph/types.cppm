@@ -271,6 +271,24 @@ inline auto subtract_range(ResourceKind kind, ResourceRange source, ResourceRang
 export namespace rstd
 {
 template<>
+struct Impl<hash::Hash, vrento::fg::ResourceId> : ImplBase<vrento::fg::ResourceId> {
+    template<typename H>
+        requires Impled<H, hash::Hasher>
+    void hash(H& state) const noexcept {
+        hash::hash_into(u64(this->self().value), state);
+        hash::hash_into(u64(this->self().generation), state);
+    }
+};
+template<>
+struct Impl<hash::Hash, vrento::fg::ResourceVersion> : ImplBase<vrento::fg::ResourceVersion> {
+    template<typename H>
+        requires Impled<H, hash::Hasher>
+    void hash(H& state) const noexcept {
+        hash::hash_into(this->self().resource, state);
+        hash::hash_into(u32(this->self().version), state);
+    }
+};
+template<>
 struct Impl<Copy, vrento::fg::PassId> {};
 template<>
 struct Impl<hash::Hash, vrento::fg::PassId> : ImplBase<vrento::fg::PassId> {

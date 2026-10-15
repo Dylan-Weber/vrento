@@ -3,6 +3,7 @@ export import :frame_graph;
 import rstd;
 
 using namespace rstd::prelude;
+using rstd::collections::HashMap;
 
 export namespace vrento::vulkan
 {
@@ -289,12 +290,45 @@ validate_pass_execution(const PassExecutionInfo& pass, slice<GraphBindingRequire
 
     return Ok(empty {});
 }
+class GraphBindingLayout {
+    HashMap<ResourceId, usize>              resources_;
+    HashMap<fg::ResourceVersion, fg::Index> versions_;
+    HashMap<ResourceId, fg::Index>          slots_;
+    bool                                    allocations_ {};
+
+public:
+    GraphBindingLayout(slice<GraphBindingRequirement> resources,
+                       slice<fg::AllocationSlot>      allocations = {})
+        : allocations_(! allocations.is_empty()) {
+        for (usize i {}; i < resources.len(); ++i) resources_.insert(resources[i].id, i);
+        for (const auto& allocation : allocations) {
+            versions_.insert(allocation.version, allocation.slot);
+            auto previous = slots_.get_mut(allocation.version.resource);
+            if (! previous)
+                slots_.insert(allocation.version.resource, allocation.slot);
+            else if (**previous != allocation.slot)
+                **previous = fg::invalid_index;
+        }
+    }
+    auto resource(ResourceId id) const -> Option<usize> {
+        auto found = resources_.get(id);
+        return found ? Some(usize(**found)) : None<usize>();
+    }
+    auto slot(ResourceId id, Option<GraphIndex> version = None()) const -> Option<fg::Index> {
+        auto found = version ? versions_.get({ id, *version }) : slots_.get(id);
+        return found && **found != fg::invalid_index ? Some(fg::Index(**found)) : None<fg::Index>();
+    }
+    auto has_allocations() const -> bool { return allocations_; }
+};
 class VulkanPassSet {
     struct Data {
-        VulkanPassData declarations;
-        fg::FrameGraph graph;
+        VulkanPassData     declarations;
+        fg::FrameGraph     graph;
+        GraphBindingLayout bindings;
         Data(VulkanPassData values, fg::FrameGraph compiled)
-            : declarations(rstd::move(values)), graph(rstd::move(compiled)) {}
+            : declarations(rstd::move(values)),
+              graph(rstd::move(compiled)),
+              bindings(declarations.resources.as_slice(), graph.inspect().allocations.as_slice()) {}
     };
     rstd::sync::Arc<Data> data_;
     VulkanPassSet(VulkanPassData declarations, fg::FrameGraph graph)
@@ -416,6 +450,7 @@ public:
     }
     auto frame_graph() const -> const fg::FrameGraph& { return data_->graph; }
     auto scope() const -> GraphSerial { return data_->graph.scope(); }
+    auto binding_layout() const -> const GraphBindingLayout& { return data_->bindings; }
     auto resources() const -> slice<GraphBindingRequirement> {
         return data_->declarations.resources.as_slice();
     }

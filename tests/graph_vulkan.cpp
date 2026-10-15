@@ -1457,3 +1457,250 @@ TEST(GraphVulkan, SharedImportedTexturesRequireReadOnlyGraphUses) {
     EXPECT_EQ(session.validation_errors(), 0u);
 }
 } // namespace vrento_test::graph_vulkan
+namespace vrento_test::binding_index
+{
+struct Counts {
+    unsigned info {}, frozen {}, read_only {}, live {};
+    bool     fail {};
+};
+struct FrozenLease {
+    rstd::sync::Arc<Counts> counts;
+    explicit FrozenLease(rstd::sync::Arc<Counts> value): counts(rstd::move(value)) {
+        ++counts->live;
+    }
+    ~FrozenLease() { --counts->live; }
+};
+struct Binding {
+    rstd::sync::Arc<Counts>              counts;
+    tex::Identity                        identity;
+    Option<rstd::sync::Arc<FrozenLease>> lease;
+    auto                                 Info() const -> vk::GraphBindingInfo {
+        ++counts->info;
+        return { vk::GraphResourceKind::Buffer, identity, 64 };
+    }
+    auto Freeze(bool read_only) const
+        -> Result<rstd::sync::Arc<dyn<vk::GraphBinding>>, vk::GraphExecutionError>;
+};
+} // namespace vrento_test::binding_index
+namespace rstd
+{
+template<>
+struct Impl<vk::GraphBinding, vrento_test::binding_index::Binding>
+    : ImplBase<vrento_test::binding_index::Binding> {
+    auto Info() const -> vk::GraphBindingInfo { return self().Info(); }
+    auto Texture() const -> Option<tex::TextureViewRef> { return None(); }
+    auto Use(tex::Submission&, const vk::PassResourceUse&) const
+        -> Result<empty, vk::GraphExecutionError> {
+        return Ok(empty {});
+    }
+    auto Release(tex::Submission&, rstd::uint32_t, const vk::PassResourceUse&) const
+        -> Result<empty, vk::GraphExecutionError> {
+        return Ok(empty {});
+    }
+    auto Freeze(bool read_only) const
+        -> Result<sync::Arc<dyn<vk::GraphBinding>>, vk::GraphExecutionError> {
+        return self().Freeze(read_only);
+    }
+};
+} // namespace rstd
+namespace vrento_test::binding_index
+{
+auto Binding::Freeze(bool read_only) const
+    -> Result<rstd::sync::Arc<dyn<vk::GraphBinding>>, vk::GraphExecutionError> {
+    ++counts->frozen;
+    if (read_only) ++counts->read_only;
+    if (counts->fail) return Err(vk::GraphExecutionError { vk::GraphExecutionStage::Prepare });
+    return Ok(rstd::sync::Arc<dyn<vk::GraphBinding>>::make(Binding {
+        counts.clone(), identity, Some(rstd::sync::Arc<FrozenLease>::make(counts.clone())) }));
+}
+auto binding(const rstd::sync::Arc<Counts>& counts, tex::Identity identity)
+    -> rstd::sync::Arc<dyn<vk::GraphBinding>> {
+    return rstd::sync::Arc<dyn<vk::GraphBinding>>::make(Binding { counts.clone(), identity });
+}
+TEST(GraphBindings, SparseVersionsGenerationCloneAndMove) {
+    auto              counts = rstd::sync::Arc<Counts>::make();
+    vk::GraphBindings values(7);
+    auto              first  = binding(counts, { 1, 1, 1 });
+    auto              second = binding(counts, { 1, 1, 2 });
+    values.bind_version({ { 9001, 4 }, 5 }, first.clone()).unwrap();
+    EXPECT_TRUE(values.resolve({ 9001, 4 }));
+    values.bind_version({ { 9001, 4 }, 1 }, second.clone()).unwrap();
+    values.bind_version({ { 9001, 8 }, 5 }, second.clone()).unwrap();
+    EXPECT_FALSE(values.resolve({ 9001, 4 }));
+    EXPECT_FALSE(values.resolve({ 9001, 4 }, 2));
+    EXPECT_FALSE(values.resolve({ 9001, 9 }, 5));
+    EXPECT_EQ((*values.resolve({ 9001, 4 }, 5))->Info().identity.resource, 1u);
+    EXPECT_EQ((*values.resolve({ 9001, 8 }, 5))->Info().identity.resource, 2u);
+    EXPECT_TRUE(values.bind({ 9001, 10 }, first.clone()).is_err());
+    EXPECT_TRUE(values.bind_version({ { 9001, 4 }, 5 }, first.clone()).is_err());
+    values.bind({ 42, 9 }, first.clone()).unwrap();
+    EXPECT_TRUE(values.resolve({ 42, 9 }, 99));
+    EXPECT_TRUE(values.bind_version({ { 42, 10 }, 1 }, second.clone()).is_err());
+    auto cloned = values.clone();
+    auto moved  = rstd::move(cloned);
+    EXPECT_EQ(moved.descriptions().len(), usize(3));
+    EXPECT_EQ((*moved.resolve({ 9001, 4 }, 1))->Info().identity.resource, 2u);
+}
+TEST(GraphBindings, PreparationScale) {
+    auto session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    for (unsigned count : array<unsigned, 4> { 16u, 128u, 512u, 1024u }) {
+        vrento::fg::FrameGraphBuilder builder(700);
+        auto                          id = builder.add_pass({ 1 }).unwrap();
+        vk::PassExecutionInfo         pass { .id = id, .kind = 9 };
+        vk::GraphBindings             bindings(700);
+        auto                          counts = rstd::sync::Arc<Counts>::make();
+        for (unsigned n {}; n < count; ++n) {
+            auto input = builder
+                             .import_resource({ .id    = { 3 * n + 1, 17 },
+                                                .kind  = vrento::fg::ResourceKind::Buffer,
+                                                .bytes = 64 })
+                             .unwrap();
+            pass.uses.push({ input.resource,
+                             0,
+                             vk::GraphAccess::Read,
+                             vk::PassUsage::Uniform,
+                             vk::PassStages::Vertex,
+                             { .size = 64 } });
+            bindings
+                .bind(input.resource, binding(counts, { session.epoch(), session.epoch(), n + 1 }))
+                .unwrap();
+        }
+        vrento_test::declare_pass(builder, pass).unwrap();
+        Vec<vk::PassExecutionInfo> passes;
+        passes.push(rstd::move(pass));
+        auto graph =
+            vk::VulkanPassSet::associate(rstd::move(builder).finish().unwrap(), rstd::move(passes))
+                .unwrap();
+        for (unsigned trial {}; trial < 3; ++trial) {
+            counts->info = counts->frozen = counts->read_only = 0;
+            auto start                                        = rstd::time::Instant::now();
+            auto prepared = bindings.prepare(graph, session).unwrap();
+            auto elapsed  = start.elapsed().as_nanos();
+            EXPECT_EQ(counts->info, count);
+            EXPECT_EQ(counts->frozen, count);
+            EXPECT_EQ(counts->read_only, count);
+            std::printf("binding preparation B=U=%u trial=%u ns=%llu info=%u\n",
+                        count,
+                        trial,
+                        static_cast<unsigned long long>(elapsed.to_primitive()),
+                        counts->info);
+        }
+    }
+}
+TEST(GraphBindings, FreezePassPropagatesWritesAcrossPhysicalAliases) {
+    auto              session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto              queue   = vk::TextureContext::create(session).unwrap();
+    auto              work    = queue.Begin().unwrap();
+    auto              counts  = rstd::sync::Arc<Counts>::make();
+    vk::GraphBindings bindings(9);
+    for (unsigned n {}; n < 3; ++n)
+        bindings
+            .bind({ n + 1, 1 },
+                  binding(counts, { session.epoch(), session.epoch(), n < 2 ? 1u : 2u }))
+            .unwrap();
+    vk::PassExecutionInfo pass { .id = { 1 }, .kind = 9 };
+    pass.uses.push({ { 1, 1 },
+                     0,
+                     vk::GraphAccess::Read,
+                     vk::PassUsage::Uniform,
+                     vk::PassStages::Vertex,
+                     { .size = 64 } });
+    pass.uses.push({ { 2, 1 },
+                     1,
+                     vk::GraphAccess::Write,
+                     vk::PassUsage::Storage,
+                     vk::PassStages::Compute,
+                     { .size = 64 } });
+    auto frozen = bindings.freeze_pass(pass, session, work).unwrap();
+    EXPECT_EQ(counts->info, 3u);
+    EXPECT_EQ(counts->frozen, 2u);
+    EXPECT_EQ(counts->read_only, 0u);
+    EXPECT_FALSE(frozen.resolve({ 3, 1 }));
+    work.discard();
+}
+} // namespace vrento_test::binding_index
+
+namespace vrento_test::binding_index
+{
+TEST(GraphBindings, IndexedAliasValidationMatchesPairwiseRules) {
+    auto session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto counts  = rstd::sync::Arc<Counts>::make();
+    for (unsigned seed {}; seed < 256; ++seed) {
+        Vec<vk::GraphBindingRequirement>      requirements;
+        Vec<vrento::fg::AllocationSlot>       allocations;
+        vk::GraphBindings                     bindings(11);
+        array<tex::Identity, 6>               identities {};
+        array<vrento::fg::ResourceVersion, 6> versions {};
+        array<unsigned, 6>                    slots {};
+        array<bool, 6>                        shared {};
+        bool                                  has_allocations = (seed % 3) != 0;
+        unsigned                              random          = seed + 1;
+        for (unsigned n {}; n < 6; ++n) {
+            random               = random * 1664525u + 1013904223u;
+            auto id              = vk::ResourceId { n / 2 + 1, 1 };
+            identities[usize(n)] = { session.epoch(), session.epoch(), (random >> 16) % 3 + 1 };
+            versions[usize(n)]   = { id, n % 2 };
+            slots[usize(n)]      = (random >> 20) % 3;
+            shared[usize(n)]     = ((seed >> (n / 2)) & 1u) != 0;
+            bindings.bind_version(versions[usize(n)], binding(counts, identities[usize(n)]))
+                .unwrap();
+            if (has_allocations) allocations.push({ versions[usize(n)], slots[usize(n)] });
+            if (! (n % 2))
+                requirements.push({ .id               = id,
+                                    .kind             = vk::GraphResourceKind::Buffer,
+                                    .bytes            = 64,
+                                    .read_only_import = shared[usize(n)] });
+        }
+        bool expected = true;
+        for (unsigned i {}; i < 6; ++i)
+            for (unsigned j {}; j < i; ++j) {
+                if (versions[usize(i)].resource == versions[usize(j)].resource ||
+                    identities[usize(i)] != identities[usize(j)])
+                    continue;
+                bool shared_import = has_allocations && shared[usize(i)] && shared[usize(j)];
+                if (! shared_import && (! has_allocations || slots[usize(i)] != slots[usize(j)]))
+                    expected = false;
+            }
+        auto result =
+            bindings.validate_resources(requirements.as_slice(), session, allocations.as_slice());
+        EXPECT_EQ(result.is_ok(), expected) << "seed=" << seed;
+    }
+}
+} // namespace vrento_test::binding_index
+
+namespace vrento_test::binding_index
+{
+TEST(GraphBindings, FreezeFailureReleasesCompletedSnapshots) {
+    auto session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto queue   = vk::TextureContext::create(session).unwrap();
+    auto work    = queue.Begin().unwrap();
+    auto first   = rstd::sync::Arc<Counts>::make();
+    auto second  = rstd::sync::Arc<Counts>::make();
+    second->fail = true;
+    vk::GraphBindings bindings(9);
+    bindings.bind({ 1, 1 }, binding(first, { session.epoch(), session.epoch(), 1 })).unwrap();
+    bindings.bind({ 2, 1 }, binding(second, { session.epoch(), session.epoch(), 2 })).unwrap();
+    vk::PassExecutionInfo pass { .id = { 1 }, .kind = 9 };
+    for (unsigned n {}; n < 2; ++n)
+        pass.uses.push({ { n + 1, 1 },
+                         0,
+                         vk::GraphAccess::Read,
+                         vk::PassUsage::Uniform,
+                         vk::PassStages::Vertex,
+                         { .size = 64 } });
+    auto result = bindings.freeze_pass(pass, session, work);
+    ASSERT_TRUE(result.is_err());
+    EXPECT_EQ(result.as_ref().unwrap_err().resource.value, 2u);
+    EXPECT_EQ(first->frozen, 1u);
+    EXPECT_EQ(first->live, 0u);
+    second->fail = false;
+    {
+        auto retry = bindings.freeze_pass(pass, session, work).unwrap();
+        EXPECT_EQ(first->live, 1u);
+        EXPECT_EQ(second->live, 1u);
+    }
+    EXPECT_EQ(first->live, 0u);
+    EXPECT_EQ(second->live, 0u);
+    work.discard();
+}
+} // namespace vrento_test::binding_index

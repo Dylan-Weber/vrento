@@ -14,6 +14,7 @@ using namespace rstd::prelude;
 using namespace rstd::literals;
 using rstd::cmp::max;
 using rstd::cmp::min;
+using rstd::collections::HashMap;
 using rstd::sync::Arc;
 
 namespace vrento::vulkan
@@ -228,6 +229,7 @@ struct RecordedBufferUploads::State {
     u64                      serial { 0 };
     bool                     reserved { false }, recorded { false };
     Vec<BufferCopyOperation> copies;
+    BufferUploadSnapshot     snapshot;
     Vec<Arc<UploadBlock>>    blocks;
     Vec<BufferUploadTicket>  tickets;
 };
@@ -540,29 +542,19 @@ bool BufferManager::HasPendingUploads() const noexcept {
     return m_impl->pending && ! (*m_impl->pending)->copies.is_empty();
 }
 
+auto RecordedBufferUploads::Snapshot() const -> BufferUploadSnapshot {
+    return m_state ? (*m_state)->snapshot.clone() : BufferUploadSnapshot {};
+}
 auto RecordedBufferUploads::Writes() const -> Vec<BufferUploadWrite> {
-    Vec<BufferUploadWrite> pending;
-    if (! m_state) return pending;
-    for (const auto& copy : (*m_state)->copies)
-        pending.push({ copy.destination_lease.clone(),
-                       copy.destination_offset - copy.destination_lease.offset(),
-                       copy.size });
-    rstd::slice_::sort_unstable_by(
-        pending.as_mut_slice().as_mut_ref(), [](const auto& lhs, const auto& rhs) {
-            return lhs.allocation.identity() != rhs.allocation.identity()
-                       ? lhs.allocation.identity() < rhs.allocation.identity()
-                       : lhs.offset < rhs.offset;
-        });
     Vec<BufferUploadWrite> result;
-    for (auto& write : pending) {
-        if (auto previous = result.last_mut();
-            previous && (*previous)->allocation.identity() == write.allocation.identity() &&
-            write.offset <= (*previous)->offset + (*previous)->size) {
-            (*previous)->size =
-                rstd::cmp::max((*previous)->offset + (*previous)->size, write.offset + write.size) -
-                (*previous)->offset;
-        } else
-            result.push(rstd::move(write));
+    if (! m_state) return result;
+    const auto&         copies = (*m_state)->copies;
+    HashMap<u64, usize> allocations;
+    for (usize i {}; i < copies.len(); ++i)
+        allocations.insert(u64(copies[i].destination_lease.identity()), i);
+    for (const auto& range : (*m_state)->snapshot.writes()) {
+        auto index = *allocations.get(u64(range.allocation)).unwrap();
+        result.push({ copies[index].destination_lease.clone(), range.offset, range.size });
     }
     return result;
 }
@@ -575,6 +567,27 @@ auto BufferManager::TryPreparePendingUploads(RecordedBufferUploads& prepared)
     if (! HasPendingUploads()) return Ok(rstd::empty {});
     if ((*m_impl->pending)->reserved)
         return Err(BackendError { "reserve buffer uploads"_Str, BackendCause::Busy() });
+    Vec<BufferUploadRange> pending;
+    for (const auto& copy : (*m_impl->pending)->copies)
+        pending.push({ copy.destination_lease.identity(),
+                       copy.destination_offset - copy.destination_lease.offset(),
+                       copy.size });
+    rstd::slice_::sort_unstable_by(
+        pending.as_mut_slice().as_mut_ref(), [](const auto& a, const auto& b) {
+            return a.allocation != b.allocation ? a.allocation < b.allocation : a.offset < b.offset;
+        });
+    Vec<BufferUploadRange> ranges;
+    for (const auto& write : pending) {
+        auto previous = ranges.last_mut();
+        if (previous && (*previous)->allocation == write.allocation &&
+            write.offset <= (*previous)->offset + (*previous)->size)
+            (*previous)->size =
+                max((*previous)->offset + (*previous)->size, write.offset + write.size) -
+                (*previous)->offset;
+        else
+            ranges.push(BufferUploadRange(write));
+    }
+    (*m_impl->pending)->snapshot = BufferUploadSnapshot(rstd::move(ranges));
     (*m_impl->pending)->reserved = true;
     prepared                     = RecordedBufferUploads(this, m_impl->pending->clone());
     return Ok(rstd::empty {});
