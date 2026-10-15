@@ -74,9 +74,9 @@ public:
                 upload.mip    = mip;
                 upload.width  = Count(source.width);
                 upload.height = Count(source.height);
-                upload.bytes.reserve(usize(source.size.to_primitive()));
-                for (Serial i = 0; i < Serial(source.size.to_primitive()); ++i)
-                    upload.bytes.push(u8(source.data.get()[i]));
+                upload.bytes  = Vec<u8>::from(
+                    slice<u8>::from_raw_parts(reinterpret_cast<const byte*>(source.data.get()),
+                                              usize(source.size.to_primitive())));
                 prepared.uploads.push(rstd::move(upload));
             }
             result.push(rstd::move(prepared));

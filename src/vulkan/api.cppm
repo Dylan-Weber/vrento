@@ -655,6 +655,7 @@ public:
     bool init();
     void destroy();
 
+    // Copies the source bytes into owned staging before returning.
     auto QueueRegion(VkImage image, VkBufferImageCopy region, slice<rstd::uint8_t> bytes,
                      rstd::uint32_t block_bytes = 4) -> Result<ImageUploadTicket, BackendError>;
     bool HasPendingUploads() const noexcept;

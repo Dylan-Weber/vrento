@@ -286,6 +286,74 @@ TEST(Texture, PublicApi) {
         rstd::as<TextureContentPreparer>(preparer).PrepareImage(oversized).unwrap_err().kind ==
         ErrorKind::Invalid);
 }
+TEST(Texture, ImageUploadsOwnEveryMipPayload) {
+    FakeDevice          device;
+    auto                api = dyn<TextureDevice>::from_ref(device);
+    ImagePrepareContext preparer(api.as_mut_ref());
+    for (auto format : array<TextureFormat, 2> { TextureFormat::RGBA8, TextureFormat::BC1 }) {
+        auto  layout = format_layout(format);
+        Image image;
+        image.header.format = format;
+        unsigned released {};
+        for (Count slot_index {}; slot_index < 2; ++slot_index) {
+            Image::Slot slot;
+            slot.width  = 64 >> slot_index;
+            slot.height = 32 >> slot_index;
+            for (Count mip {}; mip < 3; ++mip) {
+                auto  width  = Count(slot.width) >> mip;
+                auto  height = Count(slot.height) >> mip;
+                auto  size   = ((width + layout.block_width - 1) / layout.block_width) *
+                               ((height + layout.block_height - 1) / layout.block_height) *
+                               layout.block_bytes;
+                auto* bytes  = new rstd::uint8_t[size];
+                for (Serial index {}; index < size; ++index)
+                    bytes[index] = rstd::uint8_t((index + slot_index + mip) % 251);
+                slot.mipmaps.push(ImageData { rstd::int32_t(width),
+                                              rstd::int32_t(height),
+                                              isize(size),
+                                              ImageDataPtr(bytes, [&released](rstd::uint8_t* data) {
+                                                  ++released;
+                                                  delete[] data;
+                                              }) });
+            }
+            image.slots.push(rstd::move(slot));
+        }
+        auto prepared = preparer.PrepareImage(image).unwrap();
+        image.slots.clear();
+        EXPECT_EQ(released, 6u);
+        ASSERT_EQ(prepared.len(), usize(2));
+        for (usize slot {}; slot < prepared.len(); ++slot) {
+            ASSERT_EQ(prepared[slot].uploads.len(), usize(3));
+            EXPECT_EQ(prepared[slot].view.texture().description().format, format);
+            for (usize mip {}; mip < prepared[slot].uploads.len(); ++mip) {
+                const auto& upload = prepared[slot].uploads[mip];
+                EXPECT_EQ(upload.mip, mip.to_primitive());
+                EXPECT_EQ(upload.width, 64u >> (slot.to_primitive() + mip.to_primitive()));
+                EXPECT_EQ(upload.height, 32u >> (slot.to_primitive() + mip.to_primitive()));
+                EXPECT_EQ(validate_upload(upload).unwrap().required_bytes,
+                          upload.bytes.len().to_primitive());
+                for (usize index {}; index < upload.bytes.len(); ++index)
+                    ASSERT_EQ(upload.bytes[index], u8((index + slot + mip).to_primitive() % 251));
+            }
+        }
+    }
+}
+TEST(Texture, ImageUploadsRejectMismatchedPayloads) {
+    FakeDevice          device;
+    auto                api = dyn<TextureDevice>::from_ref(device);
+    ImagePrepareContext preparer(api.as_mut_ref());
+    Image               image;
+    Image::Slot         slot;
+    slot.width = slot.height = 2;
+    array<rstd::uint8_t, 16> bytes {};
+    slot.mipmaps.push(ImageData { 2, 2, isize(16), ImageDataPtr(bytes.data(), [](rstd::uint8_t*) {
+                                  }) });
+    image.slots.push(rstd::move(slot));
+    for (auto size : array<int, 4> { -1, 0, 15, 17 }) {
+        image.slots[usize()].mipmaps[usize()].size = isize(size);
+        EXPECT_EQ(preparer.PrepareImage(image).unwrap_err().kind, ErrorKind::Invalid);
+    }
+}
 TEST(Texture, ShaderAccessStages) {
     FakeDevice  device;
     TextureDesc desc;

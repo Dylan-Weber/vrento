@@ -197,6 +197,62 @@ void fill(tex::Submission& work, tex::TextureViewRef target, unsigned width, uns
     for (unsigned i = 0; i < width * height * 4; ++i) upload.bytes.push(u8(value));
     work.commands()->Upload(rstd::move(upload)).unwrap();
 }
+TEST(TextureVulkan, UploadLayoutsPreserveMipAndLayerPayloads) {
+    auto  session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto  device  = vk::TextureContext::create(session).unwrap();
+    usize tested_formats {};
+    for (auto format : array<vrento::TextureFormat, 2> { vrento::TextureFormat::RGBA8,
+                                                         vrento::TextureFormat::BC1 }) {
+        tex::TextureDesc desc;
+        desc.dimension  = tex::Dimension::Array2D;
+        desc.extent     = { 12, 8 };
+        desc.mip_levels = desc.layers = 2;
+        desc.format                   = format;
+        desc.usage =
+            tex::Usage::Sampled | tex::Usage::TransferDestination | tex::Usage::TransferSource;
+        if (device.QuerySupport(desc).is_err()) continue;
+        ++tested_formats;
+        auto texture = device.CreateTexture(desc).unwrap();
+        auto view    = device.CreateView(texture, { tex::Dimension::Array2D }).unwrap();
+        auto blocks  = tex::format_layout(format);
+        for (unsigned layout {}; layout < 4; ++layout) {
+            for (unsigned layer {}; layer < desc.layers; ++layer) {
+                for (unsigned mip {}; mip < desc.mip_levels; ++mip) {
+                    auto extent = tex::mip_extent(desc, mip);
+                    auto row_bytes =
+                        ((extent.width + blocks.block_width - 1) / blocks.block_width) *
+                        blocks.block_bytes;
+                    auto rows  = (extent.height + blocks.block_height - 1) / blocks.block_height;
+                    auto pitch = row_bytes + (layout >= 2 ? 7 : 0);
+                    auto size  = pitch * (rows - 1) + row_bytes;
+                    tex::TextureUpload upload;
+                    upload.target    = view;
+                    upload.mip       = mip;
+                    upload.layer     = layer;
+                    upload.width     = extent.width;
+                    upload.height    = extent.height;
+                    upload.row_pitch = layout == 0 ? 0 : pitch;
+                    upload.bytes.resize(usize(size + (layout == 3 ? 31 : 0)), u8(0xee));
+                    for (unsigned row {}; row < rows; ++row)
+                        for (unsigned byte {}; byte < row_bytes; ++byte)
+                            upload.bytes[usize(row * pitch + byte)] =
+                                u8((row * row_bytes + byte + mip * 13 + layer * 7) % 251);
+                    auto work = device.Begin().unwrap();
+                    work.commands()->Upload(rstd::move(upload)).unwrap();
+                    auto submitted = device.Submit(rstd::move(work)).unwrap();
+                    device.wait(submitted).unwrap();
+                    auto bytes = read(device, view, mip, layer);
+                    ASSERT_EQ(bytes.len(), usize(row_bytes * rows));
+                    for (usize index {}; index < bytes.len(); ++index)
+                        ASSERT_EQ(bytes[index],
+                                  u8((index.to_primitive() + mip * 13 + layer * 7) % 251));
+                }
+            }
+        }
+    }
+    EXPECT_GT(tested_formats, usize());
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
 TEST(TextureVulkan, Resources) {
     auto             session = vk::DeviceSession::create({ .validation = true }).unwrap();
     auto             device  = vk::TextureContext::create(session).unwrap();

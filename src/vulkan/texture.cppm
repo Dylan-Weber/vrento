@@ -876,10 +876,18 @@ public:
         if (access.is_err()) return access;
         auto    data = layout.unwrap();
         Vec<u8> packed;
-        packed.reserve(usize(data.row_bytes * data.rows));
-        for (tex::Serial row = 0; row < data.rows; ++row)
-            for (tex::Serial byte = 0; byte < data.row_bytes; ++byte)
-                packed.push(u8(upload.bytes[usize(row * data.source_pitch + byte)]));
+        auto    bytes = slice<u8>::from_raw_parts(upload.bytes.as_slice().as_raw_ptr(),
+                                                  usize(data.row_bytes * data.rows));
+        if (data.source_pitch != data.row_bytes) {
+            packed.reserve(usize(data.row_bytes * data.rows));
+            for (tex::Serial row = 0; row < data.rows; ++row) {
+                auto start = usize(row * data.source_pitch);
+                packed.extend_from_slice(slice<u8>::from_raw_parts(
+                    upload.bytes.as_slice().as_raw_ptr() + start.to_primitive(),
+                    usize(data.row_bytes)));
+            }
+            bytes = packed.as_slice();
+        }
         VkBufferImageCopy region {};
         region.imageSubresource = { desc.range.aspect == tex::Aspect::Depth
                                         ? VK_IMAGE_ASPECT_DEPTH_BIT
@@ -890,12 +898,12 @@ public:
         region.imageOffset      = { rstd::int32_t(upload.x), rstd::int32_t(upload.y), 0 };
         region.imageExtent      = { upload.width, upload.height, 1 };
         auto image              = native_texture(upload.target.texture()).unwrap();
-        auto bytes              = slice<rstd::uint8_t>::from_raw_parts(
-            reinterpret_cast<const rstd::uint8_t*>(packed.data()), packed.len());
+        auto content            = slice<rstd::uint8_t>::from_raw_parts(
+            reinterpret_cast<const rstd::uint8_t*>(bytes.as_raw_ptr()), bytes.len());
         auto queued = uploads.QueueRegion(
             image,
             region,
-            bytes,
+            content,
             tex::format_layout(upload.target.texture().description().format).block_bytes);
         if (queued.is_err()) return Err(tex::Error::from_backend(queued.unwrap_err()));
         return Ok(empty {});
