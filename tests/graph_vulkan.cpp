@@ -80,7 +80,8 @@ struct SurfaceClearDraw {
 };
 struct SurfaceClearBackend {
     auto Prepare(const rg::PassExecutionInfo&, const vk::GraphPrepareContext&)
-        -> Result<rstd::sync::Arc<dyn<vk::VulkanPass>>, vk::GraphExecutionError>;
+        -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<vk::VulkanPass>>>,
+                  vk::GraphExecutionError>;
 };
 struct UncertainSubmit {
     unsigned calls {}, fail_at { 1 };
@@ -93,7 +94,8 @@ struct UncertainSubmit {
 struct Backend {
     rstd::sync::Arc<Assets> assets;
     auto                    Prepare(const rg::PassExecutionInfo&, const vk::GraphPrepareContext&)
-        -> Result<rstd::sync::Arc<dyn<vk::VulkanPass>>, vk::GraphExecutionError>;
+        -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<vk::VulkanPass>>>,
+                  vk::GraphExecutionError>;
 };
 } // namespace vrento_test::graph_vulkan
 namespace rstd
@@ -103,7 +105,8 @@ template<>
 struct Impl<vk::VulkanPassBackend, vrento_test::graph_vulkan::SurfaceClearBackend>
     : ImplBase<vrento_test::graph_vulkan::SurfaceClearBackend> {
     auto Prepare(const rg::PassExecutionInfo& pass, const vk::GraphPrepareContext& context)
-        -> Result<sync::Arc<dyn<vk::VulkanPass>>, vk::GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<sync::Arc<dyn<vk::VulkanPass>>>,
+                  vk::GraphExecutionError> {
         return self().Prepare(pass, context);
     }
 };
@@ -119,7 +122,8 @@ template<>
 struct Impl<vk::VulkanPassBackend, vrento_test::graph_vulkan::Backend>
     : ImplBase<vrento_test::graph_vulkan::Backend> {
     auto Prepare(const rg::PassExecutionInfo& pass, const vk::GraphPrepareContext& context)
-        -> Result<rstd::sync::Arc<dyn<vk::VulkanPass>>, vk::GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<vk::VulkanPass>>>,
+                  vk::GraphExecutionError> {
         return self().Prepare(pass, context);
     }
 };
@@ -134,7 +138,8 @@ struct Impl<vk::VulkanPass, rstd::sync::Arc<vrento_test::graph_vulkan::Prepared>
 namespace vrento_test::graph_vulkan
 {
 auto SurfaceClearBackend::Prepare(const rg::PassExecutionInfo&, const vk::GraphPrepareContext&)
-    -> Result<rstd::sync::Arc<dyn<vk::VulkanPass>>, vk::GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<vk::VulkanPass>>>,
+              vk::GraphExecutionError> {
     return Ok(rstd::sync::Arc<dyn<vk::VulkanPass>>::make(SurfaceClearDraw {}));
 }
 template<rstd::size_t N>
@@ -145,10 +150,10 @@ auto shader(const unsigned (&words)[N], vrento::ShaderType stage) -> vk::Uni_Sha
     return value;
 }
 auto Backend::Prepare(const rg::PassExecutionInfo& pass, const vk::GraphPrepareContext& context)
-    -> Result<rstd::sync::Arc<dyn<vk::VulkanPass>>, vk::GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<vk::VulkanPass>>>,
+              vk::GraphExecutionError> {
     ++assets->prepares;
-    if (assets->pending && pass.kind == 2)
-        return Err(vk::GraphExecutionError { vk::GraphExecutionStage::Pending });
+    if (assets->pending && pass.kind == 2) return Ok(vrento::vulkan::PendingPreparation {});
     if (assets->fail_prepare && pass.kind == 2)
         return Err(vk::GraphExecutionError { vk::GraphExecutionStage::Prepare });
     auto prepared = rstd::sync::Arc<Prepared>::make(assets.clone(), pass.kind);
@@ -224,7 +229,10 @@ auto Prepared::Record(vk::GraphRecordContext& context) const
         auto waited = context.submission.commands()->Wait(*assets->gate, tex::Stages::All);
         if (waited.is_err())
             return Err(vk::GraphExecutionError {
-                vk::GraphExecutionStage::Access, {}, {}, VK_SUCCESS, Some(waited.unwrap_err()) });
+                vk::GraphExecutionStage::Access,
+                {},
+                {},
+                vrento::vulkan::GraphExecutionCause::Texture(waited.unwrap_err()) });
         return Ok(empty {});
     }
     if (kind == 1) {
@@ -235,7 +243,10 @@ auto Prepared::Record(vk::GraphRecordContext& context) const
         auto result = context.submission.commands()->Upload(rstd::move(upload));
         if (result.is_err())
             return Err(vk::GraphExecutionError {
-                vk::GraphExecutionStage::Record, {}, {}, VK_SUCCESS, Some(result.unwrap_err()) });
+                vk::GraphExecutionStage::Record,
+                {},
+                {},
+                vrento::vulkan::GraphExecutionCause::Texture(result.unwrap_err()) });
     } else if (kind == 2) {
         d.vkCmdBindPipeline(
             command, VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline->pipeline->pipeline.handle);
@@ -348,7 +359,8 @@ void queue_output(vk::DeviceSession session, vk::QueueParameters transfer, bool 
                 "queue graph stage=%u resource=%llu native=%d\n",
                 unsigned(error.stage),
                 static_cast<unsigned long long>(error.resource.value),
-                error.texture ? int(error.texture->kind) : int(error.native));
+                error.texture_error() ? int(error.texture_error()->kind)
+                                      : int(error.native_result()));
     }
     if (uncertain) {
         rstd_assert(submitted.status() == vk::GraphSubmissionStatus::Uncertain);
@@ -593,9 +605,10 @@ TEST(GraphVulkan, BindPrepareRecordAndRetire) {
             rstd_assert(assets->live == 0);
             assets->fail_prepare = false;
             assets->pending      = true;
-            rstd_assert(vk::PreparedGraphProgram::prepare(session, description, bindings, backends)
-                            .unwrap_err()
-                            .stage == vk::GraphExecutionStage::Pending);
+            rstd_assert(
+                ! vk::PreparedGraphProgram::prepare(session, description, bindings, backends)
+                      .unwrap()
+                      .ready());
             rstd_assert(assets->live == 0 && views[usize(1)].texture().content_revision() == 0);
             assets->pending = false;
         }

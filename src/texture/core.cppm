@@ -1,11 +1,14 @@
 export module vrento:texture.core;
 export import :types.texture;
 import rstd;
+import :vulkan.error;
+
+using namespace rstd::prelude;
+using rstd::sync::Arc;
 
 export namespace vrento::texture
 {
-using namespace rstd::prelude;
-using rstd::sync::Arc;
+
 using Serial = rstd::uint64_t;
 using Count  = rstd::uint32_t;
 
@@ -22,8 +25,15 @@ enum class ErrorKind
     Timeout
 };
 struct Error {
-    ErrorKind     kind;
-    rstd::int32_t native {};
+    ErrorKind                    kind;
+    rstd::int32_t                native {};
+    vulkan::BackendErrorSnapshot backend;
+    static auto                  from_backend(vulkan::BackendError error) -> Error {
+        auto native = error.cause.native();
+        return { error.cause.lost() ? ErrorKind::Lost : ErrorKind::Backend,
+                 static_cast<rstd::int32_t>(native),
+                 vulkan::BackendErrorSnapshot(rstd::move(error)) };
+    }
 };
 enum class Dimension
 {
@@ -684,6 +694,11 @@ struct Impl<fmt::Debug, vrento::texture::Error> : ImplBase<vrento::texture::Erro
     }
 };
 template<>
-struct Impl<error::Error, vrento::texture::Error>
-    : DefaultInImpl<error::Error, vrento::texture::Error> {};
+struct Impl<error::Error, vrento::texture::Error> : ImplBase<vrento::texture::Error> {
+    auto source() const noexcept -> Option<error::ErrorRef> {
+        const auto& value = this->self();
+        if (value.backend) return Some(dyn<error::Error>::from_ref(value.backend.error()));
+        return None();
+    }
+};
 } // namespace rstd

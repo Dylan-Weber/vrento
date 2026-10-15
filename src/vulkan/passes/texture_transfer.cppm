@@ -13,8 +13,10 @@ struct TextureTransferPrepared {
     Option<TextureMipmapProgram>  mips;
     auto Record(GraphRecordContext& context) const -> Result<empty, GraphExecutionError> {
         auto fail = [](graph_texture::Error error) -> Result<empty, GraphExecutionError> {
-            return Err(GraphExecutionError {
-                GraphExecutionStage::Record, {}, {}, VK_SUCCESS, Some(error) });
+            return Err(GraphExecutionError { GraphExecutionStage::Record,
+                                             {},
+                                             {},
+                                             vrento::vulkan::GraphExecutionCause::Texture(error) });
         };
         if (mips) {
             auto generated = mips->record(context.submission);
@@ -39,12 +41,14 @@ struct TextureTransferPrepared {
 };
 struct TextureTransferBackend {
     auto Prepare(const PassExecutionInfo& pass, const GraphPrepareContext& context)
-        -> Result<rstd::sync::Arc<dyn<VulkanPass>>, GraphExecutionError>;
+        -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<VulkanPass>>>,
+                  GraphExecutionError>;
 };
 struct TextureTransferPass {
     PassExecutionInfo description;
     auto              Instantiate(const GraphPrepareContext& context) const
-        -> Result<rstd::sync::Arc<dyn<VulkanPass>>, GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<VulkanPass>>>,
+                  GraphExecutionError> {
         return TextureTransferBackend {}.Prepare(description, context);
     }
 };
@@ -57,7 +61,8 @@ struct Impl<vrento::vulkan::VulkanPassBackend, vrento::vulkan::TextureTransferBa
     : ImplBase<vrento::vulkan::TextureTransferBackend> {
     auto Prepare(const vrento::vulkan::PassExecutionInfo&   pass,
                  const vrento::vulkan::GraphPrepareContext& context)
-        -> Result<sync::Arc<dyn<vrento::vulkan::VulkanPass>>, vrento::vulkan::GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<sync::Arc<dyn<vrento::vulkan::VulkanPass>>>,
+                  vrento::vulkan::GraphExecutionError> {
         return self().Prepare(pass, context);
     }
 };
@@ -67,8 +72,10 @@ namespace vrento::vulkan
 {
 auto TextureTransferBackend::Prepare(const PassExecutionInfo&   pass,
                                      const GraphPrepareContext& context)
-    -> Result<rstd::sync::Arc<dyn<VulkanPass>>, GraphExecutionError> {
-    auto unsupported = [&]() -> Result<rstd::sync::Arc<dyn<VulkanPass>>, GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<VulkanPass>>>, GraphExecutionError> {
+    auto unsupported =
+        [&]() -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<VulkanPass>>>,
+                        GraphExecutionError> {
         return Err(GraphExecutionError { GraphExecutionStage::Unsupported, pass.id });
     };
     if (! pass.parameters.is_empty() || pass.graphics) return unsupported();
@@ -102,11 +109,11 @@ auto TextureTransferBackend::Prepare(const PassExecutionInfo&   pass,
         source.layer_count = read.range.layer_count;
         auto prepared      = TextureMipmapProgram::prepare(context.session, *dst, Some(source));
         if (prepared.is_err())
-            return Err(GraphExecutionError { GraphExecutionStage::Prepare,
-                                             pass.id,
-                                             write.resource,
-                                             VK_SUCCESS,
-                                             Some(prepared.unwrap_err()) });
+            return Err(GraphExecutionError {
+                GraphExecutionStage::Prepare,
+                pass.id,
+                write.resource,
+                vrento::vulkan::GraphExecutionCause::Texture(prepared.unwrap_err()) });
         return Ok(rstd::sync::Arc<dyn<VulkanPass>>::make(TextureTransferPrepared {
             .target = rstd::move(dst).unwrap(), .mips = Some(rstd::move(prepared).unwrap()) }));
     }
@@ -183,7 +190,8 @@ struct TextureTransferFactory {
     using Pass = TextureTransferPass;
     template<typename T>
     auto Compile(const T&, const PassExecutionInfo& declaration, const PassCompileContext&)
-        -> Result<rstd::sync::Arc<dyn<VulkanPass>>, GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<VulkanPass>>>,
+                  GraphExecutionError> {
         bool valid =
             (rstd::mtp::same_as<T, TextureCopyDesc> && declaration.kind == texture_copy_kind) ||
             (rstd::mtp::same_as<T, TextureMipsDesc> && declaration.kind == texture_mips_kind);

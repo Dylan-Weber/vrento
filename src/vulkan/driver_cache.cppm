@@ -2,9 +2,11 @@ export module vrento:vulkan.driver_cache;
 import rstd;
 import :vulkan.api;
 
+using namespace rstd::prelude;
+using namespace rstd::literals;
+
 export namespace vrento::vulkan
 {
-using namespace rstd::prelude;
 enum class DriverCacheStage
 {
     Device,
@@ -14,8 +16,16 @@ enum class DriverCacheStage
     File
 };
 struct DriverCacheError {
-    DriverCacheStage stage;
-    VkResult         native { VK_SUCCESS };
+    DriverCacheStage     stage;
+    VkResult             native { VK_SUCCESS };
+    BackendErrorSnapshot cause;
+    static auto io(ref<rstd::path::Path> path, rstd::io::error::Error error, String operation)
+        -> DriverCacheError {
+        return { DriverCacheStage::File,
+                 VK_SUCCESS,
+                 BackendErrorSnapshot(BackendError {
+                     rstd::move(operation), BackendCause::Io(error, path.to_string_lossy()) }) };
+    }
 };
 struct DriverCacheStats {
     bool  loaded {}, rejected {};
@@ -129,9 +139,12 @@ public:
     }
     auto load(const Device& device, ref<rstd::path::Path> path) -> Result<empty, DriverCacheError> {
         auto file = rstd::fs::File::open(path);
-        if (file.is_err()) return Err(DriverCacheError { DriverCacheStage::File });
+        if (file.is_err())
+            return Err(DriverCacheError::io(path, file.unwrap_err(), "open pipeline cache"_Str));
         auto metadata = file->metadata();
-        if (metadata.is_err()) return Err(DriverCacheError { DriverCacheStage::File });
+        if (metadata.is_err())
+            return Err(
+                DriverCacheError::io(path, metadata.unwrap_err(), "read cache metadata"_Str));
         if (metadata->len() > u64(limit_.to_primitive())) {
             auto result = initialize(device);
             if (result.is_ok()) stats_.rejected = true;
@@ -143,8 +156,16 @@ public:
         while (offset < data.len()) {
             auto read = file->read(mut_ref<u8[]>::from_raw_parts(
                 data.data() + offset.to_primitive(), data.len() - offset));
-            if (read.is_err() || *read == usize())
-                return Err(DriverCacheError { DriverCacheStage::File });
+            if (read.is_err())
+                return Err(
+                    DriverCacheError::io(path, read.unwrap_err(), "read pipeline cache"_Str));
+            if (*read == usize())
+                return Err(DriverCacheError {
+                    DriverCacheStage::File,
+                    VK_SUCCESS,
+                    BackendErrorSnapshot(BackendError {
+                        "read pipeline cache"_Str,
+                        BackendCause::Invalid("unexpected end of cache file"_Str) }) });
             offset += *read;
         }
         return initialize(device, data.as_slice());
@@ -152,9 +173,38 @@ public:
     auto save(const Device& device, ref<rstd::path::Path> path) -> Result<empty, DriverCacheError> {
         auto encoded = encode(device);
         if (encoded.is_err()) return Err(encoded.unwrap_err());
-        if (rstd::fs::write(path, encoded->as_slice()).is_err())
-            return Err(DriverCacheError { DriverCacheStage::File });
+        auto written = rstd::fs::write(path, encoded->as_slice());
+        if (written.is_err())
+            return Err(
+                DriverCacheError::io(path, written.unwrap_err(), "write pipeline cache"_Str));
         return Ok(empty {});
     }
 };
 } // namespace vrento::vulkan
+
+export namespace rstd
+{
+template<>
+struct Impl<fmt::Display, vrento::vulkan::DriverCacheError>
+    : ImplBase<vrento::vulkan::DriverCacheError> {
+    auto fmt(fmt::Formatter& f) const -> bool {
+        return f.write_fmt(fmt::Arguments::make("pipeline cache stage={} result={}",
+                                                int(this->self().stage),
+                                                int(this->self().native)));
+    }
+};
+template<>
+struct Impl<fmt::Debug, vrento::vulkan::DriverCacheError>
+    : ImplBase<vrento::vulkan::DriverCacheError> {
+    auto fmt(fmt::Formatter& f) const -> bool { return as<fmt::Display>(this->self()).fmt(f); }
+};
+template<>
+struct Impl<error::Error, vrento::vulkan::DriverCacheError>
+    : ImplBase<vrento::vulkan::DriverCacheError> {
+    auto source() const noexcept -> Option<error::ErrorRef> {
+        const auto& e = this->self();
+        return e.cause ? Some(dyn<error::Error>::from_ref(e.cause.error()))
+                       : None<error::ErrorRef>();
+    }
+};
+} // namespace rstd

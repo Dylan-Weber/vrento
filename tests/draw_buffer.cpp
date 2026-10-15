@@ -68,8 +68,8 @@ TEST(DrawBuffer, Allocations) {
     auto   sink                           = dyn<resource::BufferContentWriter>::from_ref(writer);
     request.dynamic_allocation_generation = primary.allocation_generation + u64(10);
     auto stale = RenderBufferResolver::updateDrawBuffers(request, primary, sink.as_mut_ref());
-    rstd_assert(stale.is_err());
-    rstd_assert(stale.unwrap_err_unchecked().kind == DrawBufferUpdateErrorKind::NeedsReprepare);
+    rstd_assert(stale.is_ok());
+    rstd_assert(stale.unwrap() == DrawUpdateOutcome::NeedsReprepare);
     request.dynamic_allocation_generation = u64();
     rstd_assert(
         RenderBufferResolver::updateDrawBuffers(request, primary, sink.as_mut_ref()).is_ok());
@@ -119,8 +119,8 @@ TEST(DrawBuffer, Allocations) {
     geometry = view();
     rstd_assert(first.BufferView().storage_generation != storage);
     auto replaced = RenderBufferResolver::updateDrawBuffers(request, primary, sink.as_mut_ref());
-    rstd_assert(replaced.is_err());
-    rstd_assert(replaced.unwrap_err_unchecked().kind == DrawBufferUpdateErrorKind::NeedsReprepare);
+    rstd_assert(replaced.is_ok());
+    rstd_assert(replaced.unwrap() == DrawUpdateOutcome::NeedsReprepare);
     rstd_assert(writer.writes == usize(6));
 
     geometry.index      = Some(indices.BufferView());
@@ -136,7 +136,8 @@ TEST(DrawBuffer, Allocations) {
     rstd_assert(indexed.draw_count == u32(1) && writer.writes == usize(9));
     geometry.index = None<GeometryBufferView>();
     rstd_assert(
-        RenderBufferResolver::updateDrawBuffers(request, indexed, sink.as_mut_ref()).is_err());
+        RenderBufferResolver::updateDrawBuffers(request, indexed, sink.as_mut_ref()).unwrap() ==
+        DrawUpdateOutcome::NeedsReprepare);
     rstd_assert(resolver.prepareDrawBuffers(request).is_none());
     request.buffer_uses = slice<resource::BufferUseHandle>::from_raw_parts(uses.begin(), usize(2));
     geometry.vertices[usize()].capacity = usize();

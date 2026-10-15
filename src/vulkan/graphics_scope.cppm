@@ -3,9 +3,11 @@ export import :vulkan.graph;
 import :resource_registry.graphics;
 import rstd;
 
+using namespace rstd::prelude;
+
 export namespace vrento::vulkan
 {
-using namespace rstd::prelude;
+
 struct GraphicsScopeResources {
     DeviceSession                     session;
     GraphicsScopeInfo                 info;
@@ -31,7 +33,8 @@ class GraphicsScopeCache {
 
 public:
     auto Prepare(const GraphicsDescription&, const GraphPrepareContext&)
-        -> Result<rstd::sync::Arc<dyn<PreparedGraphicsScope>>, GraphExecutionError>;
+        -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<PreparedGraphicsScope>>>,
+                  GraphExecutionError>;
     void collect() {
         framebuffers_.PruneExpired();
         passes_.PruneExpired();
@@ -50,7 +53,8 @@ struct Impl<vrento::vulkan::GraphicsScopeBackend, vrento::vulkan::GraphicsScopeC
     : ImplBase<vrento::vulkan::GraphicsScopeCache> {
     auto Prepare(const vrento::vulkan::GraphicsDescription& description,
                  const vrento::vulkan::GraphPrepareContext& context)
-        -> Result<rstd::sync::Arc<dyn<vrento::vulkan::PreparedGraphicsScope>>,
+        -> Result<vrento::vulkan::Preparation<
+                      rstd::sync::Arc<dyn<vrento::vulkan::PreparedGraphicsScope>>>,
                   vrento::vulkan::GraphExecutionError> {
         return self().Prepare(description, context);
     }
@@ -69,7 +73,8 @@ inline auto attachment_store(AttachmentStore store) -> VkAttachmentStoreOp {
 }
 auto GraphicsScopeCache::Prepare(const GraphicsDescription& description,
                                  const GraphPrepareContext& context)
-    -> Result<rstd::sync::Arc<dyn<PreparedGraphicsScope>>, GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<PreparedGraphicsScope>>>,
+              GraphExecutionError> {
     if (session_.is_none())
         session_ = Some(DeviceSession(context.session));
     else if (session_->epoch() != context.session.epoch())

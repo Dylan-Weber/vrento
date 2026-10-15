@@ -20,9 +20,9 @@ using namespace rstd::literals;
 using rstd::collections::BTreeSet;
 using rstd::ffi::CStr;
 using rstd::ffi::CString;
+using namespace vrento::vulkan;
 
 #include "ExtensionNames.hpp"
-using namespace vrento::vulkan;
 
 constexpr rstd::array<InstanceLayer, 0> base_inst_layers {};
 
@@ -54,8 +54,8 @@ VkBool32 DebugUtilsMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT mess
     return VK_FALSE;
 }
 
-vvk::DebugUtilsMessenger SetupDebugCallback(vvk::Instance& instance) {
-    return instance.CreateDebugUtilsMessenger(VkDebugUtilsMessengerCreateInfoEXT {
+auto SetupDebugCallback(vvk::Instance& instance) -> Result<vvk::DebugUtilsMessenger, BackendError> {
+    VkDebugUtilsMessengerCreateInfoEXT info {
         .sType           = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
         .pNext           = nullptr,
         .flags           = 0,
@@ -68,12 +68,18 @@ vvk::DebugUtilsMessenger SetupDebugCallback(vvk::Instance& instance) {
                            VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
         .pfnUserCallback = DebugUtilsMessengerCallback,
         .pUserData       = nullptr,
-    });
+    };
+    VkDebugUtilsMessengerEXT handle {};
+    auto                     result =
+        instance.Dispatch().vkCreateDebugUtilsMessengerEXT(*instance, &info, nullptr, &handle);
+    if (result != VK_SUCCESS)
+        return Err(BackendError { "create debug messenger"_Str, BackendCause::Native(result) });
+    return Ok(vvk::DebugUtilsMessenger(handle, *instance, instance.Dispatch()));
 }
 
-bool CreateInstance(vvk::Instance* inst, slice<CString> exts, slice<CString> layers,
+auto CreateInstance(vvk::Instance* inst, slice<CString> exts, slice<CString> layers,
                     vvk::InstanceDispatch& dld, rstd::uint32_t api_version,
-                    const vvk::GlobalDispatch& global) {
+                    const vvk::GlobalDispatch& global) -> Result<empty, BackendError> {
     VkApplicationInfo app_info {
         .sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pNext              = nullptr,
@@ -119,32 +125,57 @@ bool CreateInstance(vvk::Instance* inst, slice<CString> exts, slice<CString> lay
             info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
 #endif
     auto result = vvk::Instance::Create(*inst, global, info, dld);
-    if (result.is_err()) {
-        const auto error = result.unwrap_err_unchecked();
-        rstd_error("instance creation failed: kind={}, vk={}, command={}",
-                   static_cast<int>(error.kind),
-                   static_cast<int>(error.api_result),
-                   error.command ? error.command : "");
-        return false;
-    }
-    return true;
+    if (result.is_err())
+        return Err(
+            BackendError { "create instance"_Str,
+                           BackendCause::Dispatch(DispatchFailure::capture(result.unwrap_err())) });
+    return Ok(empty {});
 }
-void EnumateExts(BTreeSet<String>& set, const vvk::GlobalDispatch& dld) {
-    if (auto rv = vvk::EnumerateInstanceExtensionProperties(dld); rv.is_some()) {
-        for (const auto& ext : *rv)
-            set.insert(String::make(CStr::from_ptr(ext.extensionName).to_str().unwrap()));
+template<typename Property, typename Enumerate>
+auto EnumerateProperties(BTreeSet<String>& set, Enumerate enumerate, ref<str> operation)
+    -> Result<empty, BackendError> {
+    Vec<Property>  properties;
+    rstd::uint32_t count {};
+    VkResult       result;
+    do {
+        result = enumerate(&count, nullptr);
+        if (result != VK_SUCCESS)
+            return Err(BackendError { String::make(operation), BackendCause::Native(result) });
+        properties.resize(usize(count), Property {});
+        result = enumerate(&count, properties.data());
+    } while (result == VK_INCOMPLETE);
+    if (result != VK_SUCCESS)
+        return Err(BackendError { String::make(operation), BackendCause::Native(result) });
+    for (rstd::uint32_t i {}; i < count; ++i) {
+        if constexpr (requires(Property p) { p.extensionName; })
+            set.insert(
+                String::make(CStr::from_ptr(properties[usize(i)].extensionName).to_str().unwrap()));
+        else
+            set.insert(
+                String::make(CStr::from_ptr(properties[usize(i)].layerName).to_str().unwrap()));
     }
-}
-void EnumateLayers(BTreeSet<String>& set, const vvk::GlobalDispatch& dld) {
-    if (auto rv = vvk::EnumerateInstanceLayerProperties(dld); rv.is_some()) {
-        for (const auto& ext : *rv)
-            set.insert(String::make(CStr::from_ptr(ext.layerName).to_str().unwrap()));
-    }
+    return Ok(empty {});
 }
 } // namespace
 
-bool Instance::ChoosePhysicalDevice(mut_ref<CheckGpuOp> checkgpu, slice<rstd::uint8_t> uuid) {
-    auto deviceList = m_vinst.EnumeratePhysicalDevices();
+auto Instance::TryChoosePhysicalDevice(mut_ref<CheckGpuOp> checkgpu, slice<rstd::uint8_t> uuid)
+    -> Result<empty, BackendError> {
+    Vec<VkPhysicalDevice> handles;
+    rstd::uint32_t        count {};
+    VkResult              result;
+    do {
+        result = m_vinst.Dispatch().vkEnumeratePhysicalDevices(*m_vinst, &count, nullptr);
+        if (result != VK_SUCCESS)
+            return Err(
+                BackendError { "enumerate physical devices"_Str, BackendCause::Native(result) });
+        handles.resize(usize(count), VK_NULL_HANDLE);
+        result = m_vinst.Dispatch().vkEnumeratePhysicalDevices(*m_vinst, &count, handles.data());
+    } while (result == VK_INCOMPLETE);
+    if (result != VK_SUCCESS)
+        return Err(BackendError { "enumerate physical devices"_Str, BackendCause::Native(result) });
+    Vec<vvk::PhysicalDevice> deviceList;
+    for (rstd::uint32_t i {}; i < count; ++i)
+        deviceList.push(vvk::PhysicalDevice(handles[usize(i)], m_vinst.Dispatch()));
 
     auto logGpu = [](const VkPhysicalDeviceProperties& props) {
         rstd_info("vulkan device: {}", props.deviceName);
@@ -181,10 +212,10 @@ bool Instance::ChoosePhysicalDevice(mut_ref<CheckGpuOp> checkgpu, slice<rstd::ui
     if (final_gpu) {
         logGpu(final_props);
         m_gpu = final_gpu;
-        return true;
+        return Ok(empty {});
     } else {
-        rstd_error("failed to find GPU with vulkan support");
-        return false;
+        return Err(BackendError { "select physical device"_Str,
+                                  BackendCause::Unsupported("no matching physical device"_Str) });
     }
 }
 
@@ -203,39 +234,54 @@ bool Instance::supportLayer(ref<str> name) const { return m_layers.contains(name
 
 void Instance::Destroy() {}
 
-bool Instance::Create(Instance& inst, slice<Extension> instExts, slice<InstanceLayer> instLayers,
-                      rstd::uint32_t api_version) {
+auto Instance::TryCreate(Instance& inst, slice<Extension> instExts, slice<InstanceLayer> instLayers,
+                         rstd::uint32_t api_version) -> Result<empty, BackendError> {
     auto loader = vvk::VulkanLoader::Open();
     if (loader.is_err()) {
-        rstd_error("Vulkan loader unavailable: {}", loader.unwrap_err_unchecked().message);
-        return false;
+        auto error = loader.unwrap_err();
+        return Err(BackendError { "open Vulkan loader"_Str,
+                                  BackendCause::Loader(error.kind,
+                                                       rstd::move(error.message),
+                                                       DispatchFailure::capture(error.dispatch)) });
     }
     inst.m_loader      = Some(loader.unwrap_unchecked());
     const auto& global = inst.m_loader->global();
 
-    EnumateExts(inst.m_extensions, global);
+    auto enumerated = EnumerateProperties<VkExtensionProperties>(
+        inst.m_extensions,
+        [&](rstd::uint32_t* count, VkExtensionProperties* data) {
+            return global.vkEnumerateInstanceExtensionProperties(nullptr, count, data);
+        },
+        "enumerate instance extensions"_str);
+    if (enumerated.is_err()) return enumerated;
     auto requested_exts = Vec<Extension>::from(base_inst_exts.as_slice());
     requested_exts.extend_from_slice(instExts);
     auto exts = detail::SelectExtensionNames(inst.m_extensions, requested_exts.as_slice());
-    if (exts.is_err()) {
-        rstd_error("required vulkan instance extension \"{}\" is not supported", exts.unwrap_err());
-        return false;
-    }
+    if (exts.is_err())
+        return Err(BackendError { "select instance extensions"_Str,
+                                  BackendCause::Unsupported(exts.unwrap_err()) });
 
-    EnumateLayers(inst.m_layers, global);
+    auto enumerated_layers = EnumerateProperties<VkLayerProperties>(
+        inst.m_layers,
+        [&](rstd::uint32_t* count, VkLayerProperties* data) {
+            return global.vkEnumerateInstanceLayerProperties(count, data);
+        },
+        "enumerate instance layers"_str);
+    if (enumerated_layers.is_err()) return enumerated_layers;
     auto requested_layers = Vec<InstanceLayer>::from(base_inst_layers.as_slice());
     requested_layers.extend_from_slice(instLayers);
     auto layers = detail::SelectExtensionNames(inst.m_layers, requested_layers.as_slice());
-    if (layers.is_err()) {
-        rstd_error("required vulkan instance layer \"{}\" is not supported", layers.unwrap_err());
-        return false;
-    }
-    if (! CreateInstance(
-            &inst.m_vinst, exts->as_slice(), layers->as_slice(), inst.m_dld, api_version, global))
-        return false;
+    if (layers.is_err())
+        return Err(BackendError { "select instance layers"_Str,
+                                  BackendCause::Unsupported(layers.unwrap_err()) });
+    auto created = CreateInstance(
+        &inst.m_vinst, exts->as_slice(), layers->as_slice(), inst.m_dld, api_version, global);
+    if (created.is_err()) return created;
     inst.m_api_version        = api_version;
     inst.m_enabled_extensions = rstd::move(exts).unwrap();
 
-    inst.m_debug_utils = SetupDebugCallback(inst.m_vinst);
-    return true;
+    auto debug = SetupDebugCallback(inst.m_vinst);
+    if (debug.is_err()) return Err(debug.unwrap_err());
+    inst.m_debug_utils = debug.unwrap();
+    return Ok(empty {});
 }

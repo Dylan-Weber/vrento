@@ -6,10 +6,11 @@ import :vulkan.texture;
 import :vulkan.media;
 import rstd;
 
-export namespace vrento::resource_registry
-{
 using namespace rstd::prelude;
 using rstd::sync::Arc;
+
+export namespace vrento::resource_registry
+{
 
 struct TextureSlot {
     texture::TextureViewRef view;
@@ -24,7 +25,7 @@ struct TextureProducer {
     struct Api {
         using Trait = TextureProducer;
         auto Pump(vulkan::TextureContext& context, double seconds)
-            -> Result<empty, texture::Error> {
+            -> Result<empty, resource::ResourceError> {
             return rstd::trait_call<0>(this, context, seconds);
         }
     };
@@ -101,7 +102,8 @@ public:
         m_pending    = false;
         m_completion = rstd::move(completion);
     }
-    auto Pump(vulkan::TextureContext& context, double seconds) -> Result<empty, texture::Error> {
+    auto Pump(vulkan::TextureContext& context, double seconds)
+        -> Result<empty, resource::ResourceError> {
         return m_producer.is_some() ? (*m_producer)->Pump(context, seconds) : Ok(empty {});
     }
 
@@ -290,9 +292,10 @@ struct Impl<vrento::resource_registry::TextureProducer,
             sync::Arc<dyn<vrento::vulkan::MediaTextureProducer>>>
     : ImplBase<sync::Arc<dyn<vrento::vulkan::MediaTextureProducer>>> {
     auto Pump(vrento::vulkan::TextureContext& context, double seconds)
-        -> Result<empty, vrento::texture::Error> {
+        -> Result<empty, vrento::resource::ResourceError> {
         auto result = self()->Pump(context, seconds);
-        if (result.is_err()) return Err(result.unwrap_err_unchecked());
+        if (result.is_err())
+            return Err(vrento::resource::ResourceError::media(result.unwrap_err()));
         return Ok(empty {});
     }
 };
@@ -326,7 +329,7 @@ public:
         m_media.SetOptions(rstd::move(options));
     }
     void ClearProducers() { m_media.Clear(); }
-    auto DrainProducers(u64 timeout) -> Result<empty, texture::Error> {
+    auto DrainProducers(u64 timeout) -> Result<empty, texture::MediaError> {
         return m_media.Drain(timeout);
     }
 
@@ -347,8 +350,7 @@ public:
                              rstd::move(prepared.producer));
             }
             auto result = m_media.Prepare(m_context, *image, rstd::move(playback));
-            if (result.is_err())
-                return Failure("prepare texture producer failed", Some(result.unwrap_err()));
+            if (result.is_err()) return Err(resource::ResourceError::media(result.unwrap_err()));
             auto             media = rstd::move(result).unwrap_unchecked();
             Vec<TextureSlot> slots;
             slots.push({ rstd::move(media.view), rstd::move(media.sampler) });

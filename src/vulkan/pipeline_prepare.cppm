@@ -2,9 +2,11 @@ export module vrento:vulkan.pipeline_prepare;
 export import :vulkan.device_session;
 import rstd;
 
+using namespace rstd::prelude;
+
 export namespace vrento::vulkan
 {
-using namespace rstd::prelude;
+
 using resource_registry::PipelineBuild;
 using resource_registry::PipelineReadiness;
 struct PipelinePrepareRequest {
@@ -137,8 +139,10 @@ public:
             if (prepared.is_err()) {
                 status  = PipelineReadiness::Failed;
                 failure = Some(rstd::move(prepared).unwrap_err());
-            } else
-                pipeline = Some(rstd::move(prepared).unwrap());
+            } else if (prepared->ready())
+                pipeline = Some(prepared->take_ready());
+            else
+                status = PipelineReadiness::Pending;
         }
         return Ok(PipelinePrepareResult { status, rstd::move(pipeline), rstd::move(failure) });
     }
@@ -198,8 +202,9 @@ public:
         if (result.is_err())
             return Ok(PipelinePrepareResult {
                 PipelineReadiness::Failed, None(), Some(rstd::move(result).unwrap_err()) });
-        return Ok(
-            PipelinePrepareResult { PipelineReadiness::Ready, Some(rstd::move(result).unwrap()) });
+        if (! result->ready())
+            return Ok(PipelinePrepareResult { PipelineReadiness::Pending, None() });
+        return Ok(PipelinePrepareResult { PipelineReadiness::Ready, Some(result->take_ready()) });
     }
     void close() {
         closed_ = true;

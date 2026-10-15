@@ -12,7 +12,8 @@ struct VulkanPass {
     struct Api {
         using Trait = VulkanPass;
         auto Prepare(const GraphPrepareContext& context) const
-            -> Result<rstd::sync::Arc<dyn<VulkanPass>>, GraphExecutionError> {
+            -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<VulkanPass>>>,
+                      GraphExecutionError> {
             return rstd::trait_call<0>(this, context);
         }
         auto Record(GraphRecordContext& context) const -> Result<empty, GraphExecutionError> {
@@ -28,7 +29,8 @@ export namespace rstd
 template<class T>
 struct VulkanPassImplementation : ImplBase<T> {
     auto Prepare(const vrento::vulkan::GraphPrepareContext& context) const
-        -> Result<sync::Arc<dyn<vrento::vulkan::VulkanPass>>, vrento::vulkan::GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<sync::Arc<dyn<vrento::vulkan::VulkanPass>>>,
+                  vrento::vulkan::GraphExecutionError> {
         if constexpr (requires { this->self().Prepare(context); })
             return this->self().Prepare(context);
         else if constexpr (requires { this->self().Instantiate(context); })

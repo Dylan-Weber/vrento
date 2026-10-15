@@ -53,12 +53,17 @@ struct DrawBufferRequest {
 enum class DrawBufferUpdateErrorKind
 {
     InvalidGeometry,
-    NeedsReprepare,
     UploadFailed
 };
+enum class DrawUpdateOutcome
+{
+    Updated,
+    NeedsReprepare
+};
 struct DrawBufferUpdateError {
-    DrawBufferUpdateErrorKind kind;
-    String                    message;
+    DrawBufferUpdateErrorKind       kind;
+    String                          message;
+    resource::ResourceErrorSnapshot source;
 };
 
 String BuildDrawBufferResourceName(DrawId, DrawBufferRole, u32 stream_index = u32());
@@ -74,9 +79,29 @@ public:
     auto        prepareDrawBuffers(const DrawBufferRequest&) -> Option<DrawBufferRefs>;
     static auto updateDrawBuffers(const DrawBufferRequest&, DrawBufferRefs&,
                                   mut_ref<dyn<resource::BufferContentWriter>>)
-        -> Result<empty, DrawBufferUpdateError>;
+        -> Result<DrawUpdateOutcome, DrawBufferUpdateError>;
 
 private:
     const resource_registry::PreparedResourceTable& m_resources;
 };
 } // namespace vrento
+
+export namespace rstd
+{
+template<>
+struct Impl<fmt::Display, vrento::DrawBufferUpdateError> : ImplBase<vrento::DrawBufferUpdateError> {
+    auto fmt(fmt::Formatter& f) const -> bool { return f.write_str(this->self().message.as_str()); }
+};
+template<>
+struct Impl<fmt::Debug, vrento::DrawBufferUpdateError> : ImplBase<vrento::DrawBufferUpdateError> {
+    auto fmt(fmt::Formatter& f) const -> bool { return as<fmt::Display>(this->self()).fmt(f); }
+};
+template<>
+struct Impl<error::Error, vrento::DrawBufferUpdateError> : ImplBase<vrento::DrawBufferUpdateError> {
+    auto source() const noexcept -> Option<error::ErrorRef> {
+        const auto& e = this->self();
+        if (e.source) return Some(dyn<error::Error>::from_ref(e.source.error()));
+        return None();
+    }
+};
+} // namespace rstd

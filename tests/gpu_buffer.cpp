@@ -8,13 +8,12 @@ import vrento.tests.shaders;
 import vrento.tests.pass_set;
 
 using namespace rstd::prelude;
-
 using namespace vrento::vulkan;
 
 namespace vrento_test::texture_vulkan
 {
 auto read(vrento::vulkan::TextureContext&, vrento::texture::TextureViewRef, unsigned, unsigned)
-    -> rstd::Vec<rstd::u8>;
+    -> rstd::vec::Vec<rstd::u8>;
 }
 
 namespace vrento_test::gpu_buffer
@@ -130,7 +129,8 @@ struct BufferPrepared {
 struct BufferBackend {
     rstd::sync::Arc<ComputeAssets> assets;
     auto                           Prepare(const rg::PassExecutionInfo&, const GraphPrepareContext&)
-        -> Result<rstd::sync::Arc<dyn<VulkanPass>>, GraphExecutionError>;
+        -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<VulkanPass>>>,
+                  GraphExecutionError>;
 };
 } // namespace vrento_test::gpu_buffer
 namespace rstd
@@ -141,7 +141,8 @@ struct Impl<vrento::vulkan::VulkanPassBackend, vrento_test::gpu_buffer::BufferBa
     : ImplBase<vrento_test::gpu_buffer::BufferBackend> {
     auto Prepare(const vrento::vulkan::PassExecutionInfo&   pass,
                  const vrento::vulkan::GraphPrepareContext& context)
-        -> Result<sync::Arc<dyn<vrento::vulkan::VulkanPass>>, vrento::vulkan::GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<sync::Arc<dyn<vrento::vulkan::VulkanPass>>>,
+                  vrento::vulkan::GraphExecutionError> {
         return self().Prepare(pass, context);
     }
 };
@@ -149,7 +150,7 @@ struct Impl<vrento::vulkan::VulkanPassBackend, vrento_test::gpu_buffer::BufferBa
 namespace vrento_test::gpu_buffer
 {
 auto BufferBackend::Prepare(const rg::PassExecutionInfo& pass, const GraphPrepareContext& context)
-    -> Result<rstd::sync::Arc<dyn<VulkanPass>>, GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<VulkanPass>>>, GraphExecutionError> {
     BufferPrepared result { assets.clone(), pass.kind };
     if (pass.kind == 103) {
         GraphicsPipeline defaults;
@@ -263,7 +264,8 @@ void compute_output(DeviceSession session, QueueParameters compute, QueueParamet
                 unsigned(error.stage),
                 static_cast<unsigned long long>(error.pass.value),
                 static_cast<unsigned long long>(error.resource.value),
-                error.texture ? int(error.texture->kind) : int(error.native));
+                error.texture_error() ? int(error.texture_error()->kind)
+                                      : int(error.native_result()));
     }
     auto program   = prepared.unwrap();
     auto submitted = program.execute();
@@ -272,7 +274,9 @@ void compute_output(DeviceSession session, QueueParameters compute, QueueParamet
                 "buffer graph failed stage=%u resource=%llu error=%u\n",
                 unsigned(submitted.error()->stage),
                 static_cast<unsigned long long>(submitted.error()->resource.value),
-                submitted.error()->texture ? unsigned(submitted.error()->texture->kind) : 0);
+                submitted.error()->texture_error()
+                    ? unsigned(submitted.error()->texture_error()->kind)
+                    : 0);
     rstd_assert(submitted.status() == GraphSubmissionStatus::Submitted);
     submitted.wait().unwrap();
     auto pixels = vrento_test::texture_vulkan::read(queue, output, 0, 0);

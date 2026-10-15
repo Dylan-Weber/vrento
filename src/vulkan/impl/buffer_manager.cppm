@@ -11,6 +11,7 @@ import rstd;
 import rstd.log;
 
 using namespace rstd::prelude;
+using namespace rstd::literals;
 using rstd::cmp::max;
 using rstd::cmp::min;
 using rstd::sync::Arc;
@@ -64,10 +65,12 @@ VkPipelineStageFlags DestinationStages(BufferUploadClass usage, bool geometry, b
 
 class BufferPage {
 public:
-    static Option<Arc<BufferPage>> Create(const Device& device, VkDeviceSize size) {
-        auto page = Arc<BufferPage>::make(device, size);
-        if (! page->Initialize()) return None();
-        return Some(rstd::move(page));
+    static auto Create(const Device& device, VkDeviceSize size)
+        -> Result<Arc<BufferPage>, BackendError> {
+        auto page        = Arc<BufferPage>::make(device, size);
+        auto initialized = page->Initialize();
+        if (initialized.is_err()) return Err(initialized.unwrap_err());
+        return Ok(rstd::move(page));
     }
 
     bool TryAllocate(VkDeviceSize size, VkDeviceSize alignment, alloc::RangeId& allocation,
@@ -91,23 +94,19 @@ public:
         : m_device(device), m_size(size), m_ranges(size) {}
 
 private:
-    bool Initialize() {
+    auto Initialize() -> Result<rstd::empty, BackendError> {
         VkBufferCreateInfo buffer_info {
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size  = m_size,
             .usage = DestinationUsage(),
         };
         auto buffer = m_device.memory_allocator().create_buffer(buffer_info);
-        if (buffer.is_err()) {
-            const auto error = buffer.unwrap_err_unchecked();
-            rstd_error("buffer page allocation failed: kind={}, vk={}",
-                       static_cast<int>(error.kind),
-                       static_cast<int>(error.api_result));
-            return false;
-        }
+        if (buffer.is_err())
+            return Err(BackendError { "allocate buffer page"_Str,
+                                      BackendCause::Memory(buffer.unwrap_err()) });
         m_buffer.req_size = m_size;
         m_buffer.handle   = buffer.unwrap_unchecked();
-        return true;
+        return Ok(rstd::empty {});
     }
 
     const Device&             m_device;
@@ -118,10 +117,12 @@ private:
 
 class UploadBlock {
 public:
-    static Option<Arc<UploadBlock>> Create(const Device& device, VkDeviceSize size) {
-        auto block = Arc<UploadBlock>::make(device, size);
-        if (! block->Initialize()) return None();
-        return Some(rstd::move(block));
+    static auto Create(const Device& device, VkDeviceSize size)
+        -> Result<Arc<UploadBlock>, BackendError> {
+        auto block       = Arc<UploadBlock>::make(device, size);
+        auto initialized = block->Initialize();
+        if (initialized.is_err()) return Err(initialized.unwrap_err());
+        return Ok(rstd::move(block));
     }
 
     void Reset() {
@@ -146,18 +147,14 @@ public:
             max(m_touched_end, offset + static_cast<VkDeviceSize>(data.len().to_primitive()));
     }
 
-    bool Flush() const {
-        if (m_touched_end <= m_touched_begin) return true;
+    auto Flush() const -> Result<rstd::empty, BackendError> {
+        if (m_touched_end <= m_touched_begin) return Ok(rstd::empty {});
         auto flushed =
             m_buffer.handle.allocation().flush(m_touched_begin, m_touched_end - m_touched_begin);
-        if (flushed.is_err()) {
-            const auto error = flushed.unwrap_err_unchecked();
-            rstd_error("upload flush failed: kind={}, vk={}",
-                       static_cast<int>(error.kind),
-                       static_cast<int>(error.api_result));
-            return false;
-        }
-        return true;
+        if (flushed.is_err())
+            return Err(BackendError { "flush upload buffer"_Str,
+                                      BackendCause::Memory(flushed.unwrap_err()) });
+        return Ok(rstd::empty {});
     }
 
     VkBuffer     handle() const noexcept { return m_buffer.handle.handle(); }
@@ -166,19 +163,24 @@ public:
     UploadBlock(const Device& device, VkDeviceSize size): m_device(device), m_size(size) {}
 
 private:
-    bool Initialize() {
-        if (! CreateStagingBuffer(m_device.memory_allocator(), m_size, m_buffer)) return false;
-        auto mapped = m_buffer.handle.allocation().map();
-        if (mapped.is_err()) {
-            const auto error = mapped.unwrap_err_unchecked();
-            rstd_error("upload mapping failed: kind={}, vk={}",
-                       static_cast<int>(error.kind),
-                       static_cast<int>(error.api_result));
-            return false;
-        }
+    auto Initialize() -> Result<rstd::empty, BackendError> {
+        VkBufferCreateInfo info { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                  .size  = m_size,
+                                  .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT };
+        auto               allocated =
+            m_device.memory_allocator().create_buffer(info, vvk::MemoryRequest::Upload());
+        if (allocated.is_err())
+            return Err(BackendError { "allocate staging buffer"_Str,
+                                      BackendCause::Memory(allocated.unwrap_err()) });
+        m_buffer.req_size = m_size;
+        m_buffer.handle   = allocated.unwrap();
+        auto mapped       = m_buffer.handle.allocation().map();
+        if (mapped.is_err())
+            return Err(BackendError { "map upload buffer"_Str,
+                                      BackendCause::Memory(mapped.unwrap_err()) });
         m_mapping = Some(mapped.unwrap_unchecked());
         Reset();
-        return true;
+        return Ok(rstd::empty {});
     }
 
     const Device&              m_device;
@@ -262,10 +264,10 @@ struct ImageUploadManager::Impl {
     Vec<Arc<UploadBlock>>                    upload_blocks;
     Option<Arc<RecordedImageUploads::State>> pending;
     auto AllocateUpload(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset)
-        -> Option<Arc<UploadBlock>> {
+        -> Result<Arc<UploadBlock>, BackendError> {
         Option<Arc<UploadBlock>> block;
         for (const auto& candidate : (*pending)->blocks) {
-            if (candidate->TryAllocate(size, alignment, offset)) return Some(candidate.clone());
+            if (candidate->TryAllocate(size, alignment, offset)) return Ok(candidate.clone());
         }
         for (const auto& candidate : upload_blocks) {
             if (candidate.strong_count() != usize(1) || candidate->size() < size) continue;
@@ -276,14 +278,18 @@ struct ImageUploadManager::Impl {
             }
         }
         if (! block) {
-            block = UploadBlock::Create(device,
-                                        size > kUploadBlockSize ? AlignUp(size, kLargeAlignment)
-                                                                : kUploadBlockSize);
-            if (! block || ! (*block)->TryAllocate(size, alignment, offset)) return None();
+            auto created = UploadBlock::Create(
+                device,
+                size > kUploadBlockSize ? AlignUp(size, kLargeAlignment) : kUploadBlockSize);
+            if (created.is_err()) return Err(created.unwrap_err());
+            block = Some(created.unwrap());
+            if (! (*block)->TryAllocate(size, alignment, offset))
+                return Err(
+                    BackendError { "allocate image upload"_Str, BackendCause::Capacity(size) });
             upload_blocks.push(block->clone());
         }
         (*pending)->blocks.push(block->clone());
-        return block;
+        return Ok(block.take().unwrap());
     }
 };
 
@@ -386,7 +392,14 @@ void BufferManager::destroy() {
 }
 
 Option<BufferAllocation> BufferManager::Allocate(const BufferAllocationRequest& request) {
-    if (! m_impl->initialized || request.size == 0) return None();
+    return TryAllocate(request).ok();
+}
+auto BufferManager::TryAllocate(const BufferAllocationRequest& request)
+    -> Result<BufferAllocation, BackendError> {
+    if (! m_impl->initialized)
+        return Err(BackendError { "allocate buffer"_Str, BackendCause::Closed() });
+    if (! request.size)
+        return Err(BackendError { "allocate buffer"_Str, BackendCause::Invalid("zero size"_Str) });
 
     VkDeviceSize alignment = max<VkDeviceSize>(request.alignment, 4);
     if (request.usage == BufferUploadClass::Uniform) {
@@ -408,10 +421,12 @@ Option<BufferAllocation> BufferManager::Allocate(const BufferAllocationRequest& 
         const auto page_size = request.size > kBufferPageSize
                                    ? AlignUp(request.size, kLargeAlignment)
                                    : kBufferPageSize;
-        page                 = BufferPage::Create(m_impl->device, page_size);
-        if (! page || ! (*page)->TryAllocate(request.size, alignment, allocation, offset)) {
-            return None();
-        }
+        auto       created   = BufferPage::Create(m_impl->device, page_size);
+        if (created.is_err()) return Err(created.unwrap_err());
+        page = Some(created.unwrap());
+        if (! (*page)->TryAllocate(request.size, alignment, allocation, offset))
+            return Err(
+                BackendError { "allocate buffer range"_Str, BackendCause::Capacity(request.size) });
         m_impl->pages.push(page->clone());
         rstd_info(
             "new destination buffer page, size: {}, pages: {}", page_size, m_impl->pages.len());
@@ -426,23 +441,31 @@ Option<BufferAllocation> BufferManager::Allocate(const BufferAllocationRequest& 
     state->offset     = offset;
     state->size       = request.size;
     state->usage      = request.usage;
-    return Some(BufferAllocation(rstd::move(state)));
+    return Ok(BufferAllocation(rstd::move(state)));
 }
 
 Option<BufferUploadTicket> BufferManager::QueueWrite(BufferAllocation&    allocation,
                                                      slice<rstd::uint8_t> data,
-                                                     VkDeviceSize         destination_offset) {
-    if (! m_impl->initialized || ! allocation || destination_offset > allocation.size() ||
-        static_cast<VkDeviceSize>(data.len().to_primitive()) >
-            allocation.size() - destination_offset) {
-        return None();
-    }
-    if (data.is_empty()) return Some(BufferUploadTicket {});
-    if (m_impl->pending && (*m_impl->pending)->reserved) {
-        rstd_error("queue buffer write while the pending upload batch is reserved");
-        return None();
-    }
-
+                                                     VkDeviceSize         offset) {
+    return TryQueueWrite(allocation, data, offset).ok();
+}
+auto BufferManager::TryQueueWrite(BufferAllocation& allocation, slice<rstd::uint8_t> data,
+                                  VkDeviceSize destination_offset)
+    -> Result<BufferUploadTicket, BackendError> {
+    if (! m_impl->initialized)
+        return Err(BackendError { "queue buffer upload"_Str, BackendCause::Closed() });
+    if (! allocation)
+        return Err(BackendError { "queue buffer upload"_Str,
+                                  BackendCause::Invalid("empty allocation"_Str) });
+    if (destination_offset > allocation.size() ||
+        data.len().to_primitive() > allocation.size() - destination_offset)
+        return Err(BackendError { "queue buffer upload"_Str,
+                                  BackendCause::Range(destination_offset,
+                                                      data.len().to_primitive(),
+                                                      allocation.size()) });
+    if (data.is_empty()) return Ok(BufferUploadTicket {});
+    if (m_impl->pending && (*m_impl->pending)->reserved)
+        return Err(BackendError { "queue buffer upload"_Str, BackendCause::Busy() });
     if (! m_impl->pending) {
         ++m_impl->next_batch;
         if (m_impl->next_batch == u64()) ++m_impl->next_batch;
@@ -473,8 +496,12 @@ Option<BufferUploadTicket> BufferManager::QueueWrite(BufferAllocation&    alloca
         if (! block) {
             const auto block_size =
                 required > kUploadBlockSize ? AlignUp(required, kLargeAlignment) : kUploadBlockSize;
-            block = UploadBlock::Create(m_impl->device, block_size);
-            if (! block || ! (*block)->TryAllocate(required, 4, upload_offset)) return None();
+            auto created = UploadBlock::Create(m_impl->device, block_size);
+            if (created.is_err()) return Err(created.unwrap_err());
+            block = Some(created.unwrap());
+            if (! (*block)->TryAllocate(required, 4, upload_offset))
+                return Err(
+                    BackendError { "allocate upload range"_Str, BackendCause::Capacity(required) });
             m_impl->upload_blocks.push(block->clone());
             rstd_info("new upload buffer block, size: {}, blocks: {}",
                       block_size,
@@ -501,7 +528,7 @@ Option<BufferUploadTicket> BufferManager::QueueWrite(BufferAllocation&    alloca
     auto category = unsigned((*allocation.m_state)->usage);
     ++m_impl->statistics.queued_copies[category];
     m_impl->statistics.queued_bytes[category] += data.len().to_primitive();
-    return Some(ticket);
+    return Ok(ticket);
 }
 
 auto BufferManager::statistics() const -> BufferUploadStatistics { return m_impl->statistics; }
@@ -540,24 +567,39 @@ auto RecordedBufferUploads::Writes() const -> Vec<BufferUploadWrite> {
     return result;
 }
 bool BufferManager::PreparePendingUploads(RecordedBufferUploads& prepared) {
+    return TryPreparePendingUploads(prepared).is_ok();
+}
+auto BufferManager::TryPreparePendingUploads(RecordedBufferUploads& prepared)
+    -> Result<rstd::empty, BackendError> {
     prepared.Reset();
-    if (! HasPendingUploads()) return true;
-    if ((*m_impl->pending)->reserved) return false;
+    if (! HasPendingUploads()) return Ok(rstd::empty {});
+    if ((*m_impl->pending)->reserved)
+        return Err(BackendError { "reserve buffer uploads"_Str, BackendCause::Busy() });
     (*m_impl->pending)->reserved = true;
     prepared                     = RecordedBufferUploads(this, m_impl->pending->clone());
-    return true;
+    return Ok(rstd::empty {});
 }
 bool BufferManager::RecordPendingUploads(vvk::CommandBuffer& cmd, RecordedBufferUploads& recorded) {
     return PreparePendingUploads(recorded) && RecordUploads(cmd, recorded);
 }
 bool BufferManager::RecordUploads(vvk::CommandBuffer& cmd, RecordedBufferUploads& prepared) {
-    if (! prepared.Valid()) return ! HasPendingUploads();
+    return TryRecordUploads(cmd, prepared).is_ok();
+}
+auto BufferManager::TryRecordUploads(vvk::CommandBuffer& cmd, RecordedBufferUploads& prepared)
+    -> Result<rstd::empty, BackendError> {
+    if (! prepared.Valid()) {
+        if (! HasPendingUploads()) return Ok(rstd::empty {});
+        return Err(BackendError { "record buffer uploads"_Str,
+                                  BackendCause::State("uploads not reserved"_Str) });
+    }
     if (prepared.m_owner != this || ! m_impl->pending ||
         ! Arc<RecordedBufferUploads::State>::ptr_eq(*prepared.m_state, *m_impl->pending) ||
         ! (*m_impl->pending)->reserved || (*m_impl->pending)->recorded)
-        return false;
+        return Err(BackendError { "record buffer uploads"_Str,
+                                  BackendCause::State("wrong or already recorded batch"_Str) });
     for (const auto& block : (*m_impl->pending)->blocks) {
-        if (! block->Flush()) return false;
+        auto flushed = block->Flush();
+        if (flushed.is_err()) return flushed;
     }
     for (usize i {}; i < (*m_impl->pending)->copies.len(); ++i) {
         const auto& copy = (*m_impl->pending)->copies[i];
@@ -604,7 +646,7 @@ bool BufferManager::RecordUploads(vvk::CommandBuffer& cmd, RecordedBufferUploads
             barrier);
     }
     (*m_impl->pending)->recorded = true;
-    return true;
+    return Ok(rstd::empty {});
 }
 
 Option<BufferUploadBatchLease>
@@ -727,10 +769,14 @@ void ImageUploadManager::destroy() {
     m_impl->initialized = false;
 }
 
-Option<ImageUploadTicket> ImageUploadManager::QueueRegion(VkImage image, VkBufferImageCopy region,
-                                                          slice<rstd::uint8_t> bytes,
-                                                          rstd::uint32_t       block_bytes) {
-    if (! block_bytes || ! m_impl->initialized || ! image || bytes.is_empty()) return None();
+Result<ImageUploadTicket, BackendError>
+ImageUploadManager::QueueRegion(VkImage image, VkBufferImageCopy region, slice<rstd::uint8_t> bytes,
+                                rstd::uint32_t block_bytes) {
+    if (! m_impl->initialized)
+        return Err(BackendError { "queue image upload"_Str, BackendCause::Closed() });
+    if (! block_bytes || ! image || bytes.is_empty())
+        return Err(BackendError { "queue image upload"_Str,
+                                  BackendCause::Invalid("empty image upload"_Str) });
     if (! m_impl->pending) {
         ++m_impl->next_batch;
         m_impl->pending            = Some(Arc<RecordedImageUploads::State>::make());
@@ -745,28 +791,32 @@ Option<ImageUploadTicket> ImageUploadManager::QueueRegion(VkImage image, VkBuffe
         divisor        = remainder;
     }
     auto block = m_impl->AllocateUpload(size, 256 / gcd * block_bytes, offset);
-    if (! block) return None();
+    if (block.is_err()) return Err(block.unwrap_err());
     (*block)->Write(offset, bytes);
     region.bufferOffset = offset;
-    (*m_impl->pending)->regions.push(ImageRegionOperation { image, region, block.take().unwrap() });
+    (*m_impl->pending)->regions.push(ImageRegionOperation { image, region, block.unwrap() });
     ImageUploadTicket ticket { .value = ++m_impl->next_ticket };
     (*m_impl->pending)->tickets.push(decltype(ticket)(ticket));
-    return Some(ticket);
+    return Ok(ticket);
 }
 
 bool ImageUploadManager::HasPendingUploads() const noexcept {
     return m_impl->pending && ! (*m_impl->pending)->regions.is_empty();
 }
 
-bool ImageUploadManager::RecordQueuedRegions(vvk::CommandBuffer&   command,
-                                             RecordedImageUploads& recorded) {
-    if (! m_impl->pending || (*m_impl->pending)->regions.is_empty()) return true;
+auto ImageUploadManager::RecordQueuedRegions(vvk::CommandBuffer&   command,
+                                             RecordedImageUploads& recorded)
+    -> Result<rstd::empty, BackendError> {
+    if (! m_impl->pending || (*m_impl->pending)->regions.is_empty()) return Ok(rstd::empty {});
     auto& state = **m_impl->pending;
     if (recorded.Valid() && (recorded.m_owner != this || ! Arc<RecordedImageUploads::State>::ptr_eq(
                                                              *recorded.m_state, *m_impl->pending)))
-        return false;
-    for (const auto& block : state.blocks)
-        if (! block->Flush()) return false;
+        return Err(BackendError { "record image upload"_Str,
+                                  BackendCause::State("foreign upload batch"_Str) });
+    for (const auto& block : state.blocks) {
+        auto flushed = block->Flush();
+        if (flushed.is_err()) return Err(flushed.unwrap_err());
+    }
     for (usize index = state.recorded_regions; index < state.regions.len(); ++index) {
         auto& copy = state.regions[index];
         command.CopyBufferToImage(copy.source->handle(),
@@ -777,7 +827,7 @@ bool ImageUploadManager::RecordQueuedRegions(vvk::CommandBuffer&   command,
     state.recorded_regions = state.regions.len();
     state.recorded         = true;
     if (! recorded.Valid()) recorded = RecordedImageUploads(this, m_impl->pending->clone());
-    return true;
+    return Ok(rstd::empty {});
 }
 
 auto ImageUploadManager::CommitRecordedUploads(RecordedImageUploads&& recorded)

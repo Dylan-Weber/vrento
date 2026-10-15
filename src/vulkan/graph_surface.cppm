@@ -63,11 +63,11 @@ public:
         if (use.usage == PassUsage::Release) {
             auto dependency = recordSurfaceDependency(work, session_, lease_);
             if (dependency.is_err())
-                return Err(GraphExecutionError { GraphExecutionStage::Access,
-                                                 {},
-                                                 use.resource,
-                                                 VK_SUCCESS,
-                                                 Some(dependency.unwrap_err()) });
+                return Err(GraphExecutionError {
+                    GraphExecutionStage::Access,
+                    {},
+                    use.resource,
+                    vrento::vulkan::GraphExecutionCause::Texture(dependency.unwrap_err()) });
             return Ok(empty {});
         }
         texture::Access access;
@@ -84,11 +84,11 @@ public:
                                         owner_.clone(),
                                         native_access({ access, graph_stages(use.stages) }));
         if (used.is_err())
-            return Err(GraphExecutionError { GraphExecutionStage::Access,
-                                             {},
-                                             use.resource,
-                                             VK_SUCCESS,
-                                             Some(used.unwrap_err()) });
+            return Err(GraphExecutionError {
+                GraphExecutionStage::Access,
+                {},
+                use.resource,
+                vrento::vulkan::GraphExecutionCause::Texture(used.unwrap_err()) });
         return Ok(empty {});
     }
     auto Freeze(bool) const -> Result<Arc<dyn<GraphBinding>>, GraphExecutionError>;
@@ -119,7 +119,8 @@ public:
           lease_(lease),
           owner_(rstd::move(owner)) {}
     auto Prepare(const GraphicsDescription&, const GraphPrepareContext&)
-        -> Result<Arc<dyn<PreparedGraphicsScope>>, GraphExecutionError>;
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<PreparedGraphicsScope>>>,
+                  GraphExecutionError>;
 };
 struct SurfaceReleasePass {
     FrameSurfaceLease lease;
@@ -127,14 +128,17 @@ struct SurfaceReleasePass {
         auto released = recordRelease(context.submission, context.session, lease);
         if (released.is_err())
             return Err(GraphExecutionError {
-                GraphExecutionStage::Record, {}, {}, VK_SUCCESS, Some(released.unwrap_err()) });
+                GraphExecutionStage::Record,
+                {},
+                {},
+                vrento::vulkan::GraphExecutionCause::Texture(released.unwrap_err()) });
         return Ok(empty {});
     }
 };
 struct SurfaceReleaseBackend {
     FrameSurfaceLease lease;
     auto              Prepare(const PassExecutionInfo&, const GraphPrepareContext&)
-        -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError>;
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError>;
 };
 inline constexpr GraphSerial surface_release_kind = 0x7672742e73757266ull;
 } // namespace vrento::vulkan
@@ -170,8 +174,9 @@ struct Impl<vrento::vulkan::GraphicsScopeBackend, vrento::vulkan::SurfaceScopeBa
     : ImplBase<vrento::vulkan::SurfaceScopeBackend> {
     auto Prepare(const vrento::vulkan::GraphicsDescription& description,
                  const vrento::vulkan::GraphPrepareContext& context)
-        -> Result<sync::Arc<dyn<vrento::vulkan::PreparedGraphicsScope>>,
-                  vrento::vulkan::GraphExecutionError> {
+        -> Result<
+            vrento::vulkan::Preparation<sync::Arc<dyn<vrento::vulkan::PreparedGraphicsScope>>>,
+            vrento::vulkan::GraphExecutionError> {
         return self().Prepare(description, context);
     }
 };
@@ -181,7 +186,8 @@ struct Impl<vrento::vulkan::VulkanPassBackend, vrento::vulkan::SurfaceReleaseBac
     : ImplBase<vrento::vulkan::SurfaceReleaseBackend> {
     auto Prepare(const vrento::vulkan::PassExecutionInfo&   pass,
                  const vrento::vulkan::GraphPrepareContext& context)
-        -> Result<sync::Arc<dyn<vrento::vulkan::VulkanPass>>, vrento::vulkan::GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<sync::Arc<dyn<vrento::vulkan::VulkanPass>>>,
+                  vrento::vulkan::GraphExecutionError> {
         return self().Prepare(pass, context);
     }
 };
@@ -195,12 +201,12 @@ auto SurfaceGraphBinding::Freeze(bool) const
     return Ok(Arc<dyn<GraphBinding>>::make(SurfaceGraphBinding(*this)));
 }
 auto SurfaceReleaseBackend::Prepare(const PassExecutionInfo&, const GraphPrepareContext&)
-    -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError> {
     return Ok(Arc<dyn<VulkanPass>>::make(SurfaceReleasePass { lease }));
 }
 auto SurfaceScopeBackend::Prepare(const GraphicsDescription& description,
                                   const GraphPrepareContext& context)
-    -> Result<Arc<dyn<PreparedGraphicsScope>>, GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<Arc<dyn<PreparedGraphicsScope>>>, GraphExecutionError> {
     if (! description.color || description.color->resource != resource_)
         return shared_textures_ ? (*shared_textures_)->Prepare(description, context)
                                 : textures_.Prepare(description, context);
@@ -238,7 +244,10 @@ auto SurfaceScopeBackend::Prepare(const GraphicsDescription& description,
     create.layers          = 1;
     auto result = context.session.device().handle().CreateFramebuffer(create, *framebuffer);
     if (result != VK_SUCCESS)
-        return Err(GraphExecutionError { GraphExecutionStage::Prepare, {}, {}, result });
+        return Err(GraphExecutionError { GraphExecutionStage::Prepare,
+                                         {},
+                                         {},
+                                         vrento::vulkan::GraphExecutionCause::Native(result) });
     info.render_pass = create.renderPass;
     info.framebuffer = **framebuffer;
     return Ok(
@@ -260,7 +269,10 @@ struct SurfaceTransferPass {
         auto native = native_recording(context.submission, context.session);
         if (native.is_err())
             return Err(GraphExecutionError {
-                GraphExecutionStage::Record, {}, {}, VK_SUCCESS, Some(native.unwrap_err()) });
+                GraphExecutionStage::Record,
+                {},
+                {},
+                vrento::vulkan::GraphExecutionCause::Texture(native.unwrap_err()) });
         auto        image    = native_texture(source.texture()).unwrap();
         auto        extent   = texture::mip_extent(source.texture().description(),
                                                    source.description().range.first_mip);
@@ -305,7 +317,7 @@ struct SurfaceTransferPass {
 struct SurfaceTransferBackend {
     FrameSurfaceLease lease;
     auto              Prepare(const PassExecutionInfo&, const GraphPrepareContext&)
-        -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError>;
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError>;
 };
 inline constexpr GraphSerial surface_transfer_kind = 0x7672742e73747266ull;
 } // namespace vrento::vulkan
@@ -317,7 +329,8 @@ struct Impl<vrento::vulkan::VulkanPassBackend, vrento::vulkan::SurfaceTransferBa
     : ImplBase<vrento::vulkan::SurfaceTransferBackend> {
     auto Prepare(const vrento::vulkan::PassExecutionInfo&   pass,
                  const vrento::vulkan::GraphPrepareContext& context)
-        -> Result<sync::Arc<dyn<vrento::vulkan::VulkanPass>>, vrento::vulkan::GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<sync::Arc<dyn<vrento::vulkan::VulkanPass>>>,
+                  vrento::vulkan::GraphExecutionError> {
         return self().Prepare(pass, context);
     }
 };
@@ -326,7 +339,7 @@ namespace vrento::vulkan
 {
 auto SurfaceTransferBackend::Prepare(const PassExecutionInfo&   pass,
                                      const GraphPrepareContext& context)
-    -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError> {
     if (! lease.valid() || pass.uses.len() != usize(2) ||
         pass.uses[usize()].access != GraphAccess::Read ||
         pass.uses[usize(1)].access != GraphAccess::Write)

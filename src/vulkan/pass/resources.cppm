@@ -2,6 +2,7 @@ export module vrento:vulkan.pass.resources;
 import rstd;
 import :resource_registry.system;
 import :vulkan.pipeline_layout;
+
 using namespace rstd::prelude;
 using namespace rstd::literals;
 using rstd::sync::Arc;
@@ -34,7 +35,8 @@ public:
     }
     auto Prepare(resource::PipelineUseHandle pipeline, resource::RenderPassUseHandle render_pass,
                  const PipelineResourceRequest& recipe, const DeviceSession& session) const
-        -> Result<resource_registry::PipelinePreparation, resource::ResourceError> {
+        -> Result<vrento::Preparation<resource_registry::PipelinePreparation>,
+                  resource::ResourceError> {
         auto layout = layouts_.Resolve(pipeline);
         if (! layout)
             return Err(
@@ -45,8 +47,13 @@ public:
         request.raster.depthClampEnable &= session.device().capabilities().depth_clamp;
         auto result =
             owner_->PreparePipeline(pipeline, render_pass, session.device(), rstd::move(request));
-        if (result.is_err()) return Err(result.unwrap_err());
-        auto value = result.unwrap();
+        if (result.is_err()) {
+            auto error = result.unwrap_err();
+            error.contexts.push(resource::ResourceErrorContext::Pipeline(pipeline, render_pass));
+            return Err(rstd::move(error));
+        }
+        if (! result->ready()) return Ok(PendingPreparation {});
+        auto value = result->take_ready();
         prepared_.retain([&](const Prepared& entry) {
             return entry.use != pipeline;
         });

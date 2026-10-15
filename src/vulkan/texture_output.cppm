@@ -204,12 +204,11 @@ public:
                                        T      desc) -> Result<PassInput, GraphExecutionError> {
             auto result = PassInput::publish(input.scope(), revision, id, rstd::move(desc));
             if (result.is_err())
-                return Err(GraphExecutionError { GraphExecutionStage::Schema,
-                                                 id,
-                                                 {},
-                                                 VK_SUCCESS,
-                                                 None(),
-                                                 Some(result.unwrap_err()) });
+                return Err(GraphExecutionError {
+                    GraphExecutionStage::Schema,
+                    id,
+                    {},
+                    vrento::vulkan::GraphExecutionCause::Graph(result.unwrap_err()) });
             return Ok(result.unwrap());
         };
         auto id = input.execution().id;

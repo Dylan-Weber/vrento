@@ -10,13 +10,11 @@ import :resource_registry.resource_key;
 using rstd::collections::HashMap;
 using rstd::sync::Arc;
 using rstd::sync::Weak;
-
 using namespace rstd::prelude;
+using namespace vrento::vulkan;
 
 export namespace vrento::resource_registry
 {
-
-using namespace vrento::vulkan;
 
 struct PipelineLayoutRequest {
     Vec<DescriptorSetInfo>   descriptor_sets;
@@ -116,8 +114,6 @@ struct Impl<hash::Hash, vrento::resource_registry::PipelineLayoutSchema>
 export namespace vrento::resource_registry
 {
 
-using namespace vrento::vulkan;
-
 class PipelineLayoutRegistry {
 public:
     auto Ensure(const Device& device, const PipelineLayoutRequest& request,
@@ -150,7 +146,7 @@ public:
         for (const auto& range : request.push_constants) {
             if (range.stageFlags == 0 || range.size == 0) {
                 return Err(resource::ResourceError {
-                    .kind    = resource::ResourceErrorKind::MissingDefinition,
+                    .kind    = resource::ResourceErrorKind::Invalid,
                     .message = rstd::format("invalid pipeline push constant range"),
                 });
             }
@@ -504,7 +500,7 @@ public:
             (desc.has_depth_attachment && desc.depth_load_op == VK_ATTACHMENT_LOAD_OP_LOAD &&
              desc.depth_initial_layout == VK_IMAGE_LAYOUT_UNDEFINED))
             return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::MissingDefinition,
+                .kind    = resource::ResourceErrorKind::InvalidUse,
                 .message = "render pass loads undefined attachment"_Str });
         auto key  = MakeRenderPassCacheKey(desc);
         auto slot = m_entries.get_mut(key);
@@ -782,6 +778,7 @@ public:
         if (! state->started && state->status == PipelineReadiness::Pending) {
             state->status = PipelineReadiness::Failed;
             state->error  = Some(resource::ResourceError {
+                .kind    = resource::ResourceErrorKind::Cancelled,
                 .message = "pipeline build cancelled before execution"_Str });
         }
     }
@@ -885,18 +882,21 @@ public:
     }
     auto TryEnsure(const Device& device, PipelineResourceRequest request,
                    RenderPassRegistry& render_pass_cache, PipelineLayoutRegistry& pipeline_layouts)
-        -> Result<PipelineResourceResult, resource::ResourceError> {
+        -> Result<vrento::Preparation<PipelineResourceResult>, resource::ResourceError> {
         auto desc  = MakePipelineResourceDesc(request);
         auto state = InternState(MakePipelineStateKey(desc));
         if (state.is_none())
-            return Err(resource::ResourceError { .message = "pipeline state limit reached"_Str });
+            return Err(resource::ResourceError { .kind    = resource::ResourceErrorKind::Capacity,
+                                                 .message = "pipeline state limit reached"_Str });
         auto key = MakePipelineVariantKey(StateReferenceKey(*state), desc.render_pass);
         return EnsureDescription(
             device, desc, desc.render_pass, rstd::move(key), render_pass_cache, pipeline_layouts);
     }
     auto Ensure(const Device& device, PipelineResourceRequest request, RenderPassRegistry& passes,
                 PipelineLayoutRegistry& layouts) -> Option<PipelineResourceResult> {
-        return TryEnsure(device, rstd::move(request), passes, layouts).ok();
+        auto result = TryEnsure(device, rstd::move(request), passes, layouts);
+        if (result.is_err() || ! result->ready()) return None();
+        return Some(result->take_ready());
     }
     auto RegisterRecipe(PipelineResourceRequest request, const PipelineLayoutRegistry& layouts)
         -> Option<resource::PipelineRecipeHandle> {
@@ -914,7 +914,7 @@ public:
     auto TryEnsureRecipe(const Device& device, resource::PipelineRecipeHandle recipe,
                          const RenderPassResourceDesc& render_pass, RenderPassRegistry& passes,
                          PipelineLayoutRegistry& layouts)
-        -> Result<PipelineResourceResult, resource::ResourceError> {
+        -> Result<vrento::Preparation<PipelineResourceResult>, resource::ResourceError> {
         auto found = m_recipes.get(recipe);
         if (found.is_none() ||
             render_pass.samples != (**found).desc.multisample.rasterizationSamples)
@@ -928,7 +928,9 @@ public:
     auto EnsureRecipe(const Device& device, resource::PipelineRecipeHandle recipe,
                       const RenderPassResourceDesc& render_pass, RenderPassRegistry& passes,
                       PipelineLayoutRegistry& layouts) -> Option<PipelineResourceResult> {
-        return TryEnsureRecipe(device, recipe, render_pass, passes, layouts).ok();
+        auto result = TryEnsureRecipe(device, recipe, render_pass, passes, layouts);
+        if (result.is_err() || ! result->ready()) return None();
+        return Some(result->take_ready());
     }
     auto MatchesRecipe(resource::PipelineRecipeHandle recipe,
                        const PipelineResourceRequest& request) const -> bool {
@@ -949,9 +951,10 @@ private:
                            const RenderPassResourceDesc& render_pass_desc, PipelineCacheKey key,
                            RenderPassRegistry&     render_pass_cache,
                            PipelineLayoutRegistry& pipeline_layouts)
-        -> Result<PipelineResourceResult, resource::ResourceError> {
+        -> Result<vrento::Preparation<PipelineResourceResult>, resource::ResourceError> {
         if (! BindDevice(device))
-            return Err(resource::ResourceError { .message = "pipeline device mismatch"_Str });
+            return Err(resource::ResourceError { .kind    = resource::ResourceErrorKind::Device,
+                                                 .message = "pipeline device mismatch"_Str });
         auto render_pass = render_pass_cache.TryEnsure(device, render_pass_desc);
         if (render_pass.is_err()) return Err(rstd::move(render_pass).unwrap_err());
         auto slot = m_entries.get_mut(key);
@@ -979,16 +982,19 @@ private:
             if (created.is_none() || device.lost()) {
                 auto error = (**pending)->error();
                 if (error) return Err(rstd::move(*error));
-                return Err(resource::ResourceError { .kind = resource::ResourceErrorKind::Pending,
-                                                     .message = "pipeline build pending"_Str });
+                if (device.lost())
+                    return Err(resource::ResourceError::backend(
+                        { "pipeline build"_Str, BackendCause::Native(VK_ERROR_DEVICE_LOST) }));
+                return Ok(PendingPreparation {});
             }
             (void)m_pending.remove(key);
         } else {
             ++m_stats.misses;
             auto pipeline_layout = pipeline_layouts.Resolve(desc.pipeline_layout);
             if (pipeline_layout.is_none())
-                return Err(
-                    resource::ResourceError { .message = "pipeline layout unavailable"_Str });
+                return Err(resource::ResourceError {
+                    .kind    = resource::ResourceErrorKind::MissingDefinition,
+                    .message = "pipeline layout unavailable"_Str });
             if (! m_driver.handle(device)) {
                 auto initialized = m_driver.initialize(device);
                 if (initialized.is_err())
@@ -1008,7 +1014,9 @@ private:
             created = Some(rstd::move(compiled).unwrap());
         }
         if (created.is_none())
-            return Err(resource::ResourceError { .message = "pipeline result unavailable"_Str });
+            return Err(
+                resource::ResourceError { .kind    = resource::ResourceErrorKind::MissingContent,
+                                          .message = "pipeline result unavailable"_Str });
         auto entry = rstd::move(created).unwrap();
         ++m_stats.creations;
         m_stats.creation_nanoseconds += entry->creation_nanoseconds;
@@ -1216,7 +1224,7 @@ public:
               rstd::addressof(render_pass_cache))) {}
 
     auto TryCreateGraphicsPipeline(PipelineResourceRequest request)
-        -> Result<PipelineResourceResult, resource::ResourceError> {
+        -> Result<vrento::Preparation<PipelineResourceResult>, resource::ResourceError> {
         return m_pipeline_cache->TryEnsure(
             *m_device, rstd::move(request), *m_render_pass_cache, *m_pipeline_layouts);
     }

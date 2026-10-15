@@ -278,7 +278,10 @@ struct GraphicsDrawCommands {
         auto recording = native_recording(context.submission, session);
         if (recording.is_err())
             return Err(GraphExecutionError {
-                GraphExecutionStage::Record, {}, {}, VK_SUCCESS, Some(recording.unwrap_err()) });
+                GraphExecutionStage::Record,
+                {},
+                {},
+                vrento::vulkan::GraphExecutionCause::Texture(recording.unwrap_err()) });
         vvk::CommandBuffer command(recording.unwrap(), session.device().handle().Dispatch());
         resource_registry::DescriptorBindingRecordState state;
         state.UsePipeline(pipeline->layout->handle,
@@ -310,7 +313,7 @@ struct GraphicsDrawPass {
     DeviceSession                                 session;
     Arc<resource_registry::PipelineResourceEntry> pipeline;
     auto Instantiate(const GraphPrepareContext&, Arc<GraphicsFrameData>) const
-        -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError>;
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError>;
 };
 struct GraphicsClearCommands {
     auto Record(GraphRecordContext&) const -> Result<empty, GraphExecutionError> {
@@ -319,17 +322,17 @@ struct GraphicsClearCommands {
 };
 struct GraphicsClearPass {
     auto Instantiate(const GraphPrepareContext&) const
-        -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError>;
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError>;
 };
 struct GraphicsDrawFactory {
     using Pass = GraphicsDrawPass;
     auto Compile(const GraphicsDrawDesc&, const PassExecutionInfo&, const PassCompileContext&)
-        -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError>;
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError>;
 };
 struct GraphicsClearFactory {
     using Pass = GraphicsClearPass;
     auto Compile(const GraphicsClearDesc&, const PassExecutionInfo&, const PassCompileContext&)
-        -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError>;
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError>;
 };
 } // namespace vrento::vulkan
 
@@ -342,7 +345,7 @@ namespace vrento::vulkan
 {
 auto GraphicsDrawFactory::Compile(const GraphicsDrawDesc& desc, const PassExecutionInfo& pass,
                                   const PassCompileContext& context)
-    -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError> {
     if (pass.kind != graphics_draw_kind || ! pass.graphics || ! pass.parameters.is_empty())
         return Err(GraphExecutionError { GraphExecutionStage::Schema, pass.id });
     const auto& resources = context.graphics;
@@ -353,26 +356,26 @@ auto GraphicsDrawFactory::Compile(const GraphicsDrawDesc& desc, const PassExecut
         (*resources)->Prepare(desc.pipeline, desc.render_pass, desc.request, context.session);
     if (prepared.is_err()) {
         auto                source = rstd::move(prepared).unwrap_err();
-        GraphExecutionError error { source.kind == resource::ResourceErrorKind::Pending
-                                        ? GraphExecutionStage::Pending
-                                        : GraphExecutionStage::Prepare,
-                                    pass.id };
-        error.preparation = resource::ResourceErrorSnapshot(rstd::move(source));
+        GraphExecutionError error { GraphExecutionStage::Prepare, pass.id };
+        error.cause = vrento::vulkan::GraphExecutionCause::Resource(
+            vrento::resource::ResourceErrorSnapshot(rstd::move(source)));
         return Err(rstd::move(error));
     }
-    return Ok(Arc<dyn<VulkanPass>>::make(
-        GraphicsDrawPass { context.session, prepared->physical.clone() }));
+    if (! prepared->ready()) return Ok(PendingPreparation {});
+    auto value = prepared->take_ready();
+    return Ok(
+        Arc<dyn<VulkanPass>>::make(GraphicsDrawPass { context.session, value.physical.clone() }));
 }
 auto GraphicsClearFactory::Compile(const GraphicsClearDesc&, const PassExecutionInfo& pass,
                                    const PassCompileContext&)
-    -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError> {
     if (pass.kind != graphics_clear_kind || ! pass.graphics || ! pass.parameters.is_empty())
         return Err(GraphExecutionError { GraphExecutionStage::Schema, pass.id });
     return Ok(Arc<dyn<VulkanPass>>::make(GraphicsClearPass {}));
 }
 auto GraphicsDrawPass::Instantiate(const GraphPrepareContext& context,
                                    Arc<GraphicsFrameData>     frame) const
-    -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError> {
     if (! context.scope || session.epoch() != context.session.epoch())
         return Err(GraphExecutionError { GraphExecutionStage::Schema });
     if (frame->viewports.is_empty() || frame->scissors.is_empty())
@@ -390,7 +393,7 @@ auto GraphicsDrawPass::Instantiate(const GraphPrepareContext& context,
         GraphicsDrawCommands { session, pipeline.clone(), rstd::move(frame) }));
 }
 auto GraphicsClearPass::Instantiate(const GraphPrepareContext& context) const
-    -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError> {
     if (! context.scope) return Err(GraphExecutionError { GraphExecutionStage::Prepare });
     return Ok(Arc<dyn<VulkanPass>>::make(GraphicsClearCommands {}));
 }

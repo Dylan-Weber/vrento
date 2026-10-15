@@ -1,11 +1,13 @@
 export module vrento:resource_registry.local_output;
 import rstd;
 import :vulkan.texture;
+import :resource.error;
+
+using namespace rstd::prelude;
+using namespace rstd::literals;
 
 export namespace vrento::resource_registry
 {
-using namespace rstd::prelude;
-using namespace rstd::literals;
 
 #if defined(__linux__)
 class SessionLocalOutput final : public ExSwapchain {
@@ -82,18 +84,29 @@ private:
 
 inline auto CreateSessionLocalOutput(vulkan::TextureContext& context, unsigned width,
                                      unsigned height, VkImageTiling tiling)
-    -> Option<ExSwapchainOwner> {
+    -> Result<ExSwapchainOwner, resource::ResourceError> {
+    auto failure = [](ref<str> operation, vulkan::BackendCause cause) {
+        return Err(
+            resource::ResourceError::backend({ String::make(operation), rstd::move(cause) }));
+    };
 #if defined(__linux__)
     if (! width || ! height ||
         (tiling != VK_IMAGE_TILING_LINEAR && tiling != VK_IMAGE_TILING_OPTIMAL))
-        return None();
+        return failure("local output description"_str,
+                       vulkan::BackendCause::Invalid("invalid extent or tiling"_Str));
     // The local output protocol exports linear planes, including legacy OPTIMAL requests.
     tiling              = VK_IMAGE_TILING_LINEAR;
     const auto& session = context.session();
     const auto& device  = session.device();
-    if (! device.supportExt("VK_EXT_external_memory_dma_buf"_str) || session.lost()) return None();
+    if (session.lost())
+        return failure("local output"_str, vulkan::BackendCause::Native(VK_ERROR_DEVICE_LOST));
+    if (! device.supportExt("VK_EXT_external_memory_dma_buf"_str))
+        return failure("local output"_str,
+                       vulkan::BackendCause::Unsupported("VK_EXT_external_memory_dma_buf"_Str));
     const auto& native = device.handle();
-    if (! native.Dispatch().vkGetMemoryFdKHR) return None();
+    if (! native.Dispatch().vkGetMemoryFdKHR)
+        return failure("local output"_str,
+                       vulkan::BackendCause::Unsupported("vkGetMemoryFdKHR"_Str));
     constexpr VkFormat                      format = VK_FORMAT_R8G8B8A8_UNORM;
     constexpr VkImageUsageFlags             usage  = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -116,18 +129,25 @@ inline auto CreateSessionLocalOutput(vulkan::TextureContext& context, unsigned w
     VkImageFormatProperties2 support { VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
                                        &external_support };
     const auto&              dispatch = device.instance_dispatch();
-    if (! dispatch.resolver) return None();
+    if (! dispatch.resolver) return failure("local output"_str, vulkan::BackendCause::Closed());
     auto query_fn = reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties2>(
         dispatch.resolver(dispatch.instance, "vkGetPhysicalDeviceImageFormatProperties2"));
     if (! query_fn)
         query_fn = reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties2>(
             dispatch.resolver(dispatch.instance, "vkGetPhysicalDeviceImageFormatProperties2KHR"));
-    if (! query_fn || query_fn(*device.gpu(), &query, &support) != VK_SUCCESS ||
-        ! (external_support.externalMemoryProperties.externalMemoryFeatures &
+    if (! query_fn)
+        return failure(
+            "local output format"_str,
+            vulkan::BackendCause::Unsupported("vkGetPhysicalDeviceImageFormatProperties2"_Str));
+    auto queried = query_fn(*device.gpu(), &query, &support);
+    if (queried != VK_SUCCESS)
+        return failure("local output format"_str, vulkan::BackendCause::Native(queried));
+    if (! (external_support.externalMemoryProperties.externalMemoryFeatures &
            VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) ||
         width > support.imageFormatProperties.maxExtent.width ||
         height > support.imageFormatProperties.maxExtent.height)
-        return None();
+        return failure("local output format"_str,
+                       vulkan::BackendCause::Unsupported("exportable linear output extent"_Str));
 
     rstd::array<vulkan::LocalExHandle, 3> handles;
     Vec<rstd::os::fd::OwnedFd>            descriptors;
@@ -154,7 +174,8 @@ inline auto CreateSessionLocalOutput(vulkan::TextureContext& context, unsigned w
         info.tiling      = tiling;
         info.usage       = usage;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        if (native.CreateImage(info, image.handle) != VK_SUCCESS) return None();
+        if (auto code = native.CreateImage(info, image.handle); code != VK_SUCCESS)
+            return failure("vkCreateImage"_str, vulkan::BackendCause::Native(code));
         image.mem_reqs      = native.GetImageMemoryRequirements(*image.handle);
         rstd::uint32_t type = VK_MAX_MEMORY_TYPES;
         for (rstd::uint32_t index {}; index < memory.memoryTypeCount; ++index) {
@@ -165,7 +186,9 @@ inline auto CreateSessionLocalOutput(vulkan::TextureContext& context, unsigned w
                 break;
             }
         }
-        if (type == VK_MAX_MEMORY_TYPES) return None();
+        if (type == VK_MAX_MEMORY_TYPES)
+            return failure("local output allocation"_str,
+                           vulkan::BackendCause::Unsupported("compatible memory type"_Str));
         // Exported DMA-BUF memory requires a dedicated native allocation chain.
         VkMemoryDedicatedAllocateInfo dedicated {
             VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, nullptr, *image.handle, VK_NULL_HANDLE
@@ -176,33 +199,42 @@ inline auto CreateSessionLocalOutput(vulkan::TextureContext& context, unsigned w
         VkMemoryAllocateInfo       allocation {
             VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &exported, image.mem_reqs.size, type
         };
-        if (native.AllocateMemory(allocation, image.mem) != VK_SUCCESS ||
-            image.handle.BindMemory(*image.mem, 0) != VK_SUCCESS)
-            return None();
+        if (auto code = native.AllocateMemory(allocation, image.mem); code != VK_SUCCESS)
+            return failure("vkAllocateMemory"_str, vulkan::BackendCause::Native(code));
+        if (auto code = image.handle.BindMemory(*image.mem, 0); code != VK_SUCCESS)
+            return failure("vkBindImageMemory"_str, vulkan::BackendCause::Native(code));
         VkImageViewCreateInfo view { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
         view.image            = *image.handle;
         view.viewType         = VK_IMAGE_VIEW_TYPE_2D;
         view.format           = format;
         view.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        if (native.CreateImageView(view, image.view) != VK_SUCCESS) return None();
+        if (auto code = native.CreateImageView(view, image.view); code != VK_SUCCESS)
+            return failure("vkCreateImageView"_str, vulkan::BackendCause::Native(code));
         VkSamplerCreateInfo sampler { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
         sampler.magFilter    = VK_FILTER_NEAREST;
         sampler.minFilter    = VK_FILTER_NEAREST;
         sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        if (native.CreateSampler(sampler, image.sampler) != VK_SUCCESS) return None();
+        if (auto code = native.CreateSampler(sampler, image.sampler); code != VK_SUCCESS)
+            return failure("vkCreateSampler"_str, vulkan::BackendCause::Native(code));
         VkMemoryGetFdInfoKHR fd_info { VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
                                        nullptr,
                                        *image.mem,
                                        VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };
         int                  fd = -1;
-        if (native.Dispatch().vkGetMemoryFdKHR(*native, &fd_info, &fd) != VK_SUCCESS || fd < 0)
-            return None();
+        auto exported_fd        = native.Dispatch().vkGetMemoryFdKHR(*native, &fd_info, &fd);
+        if (exported_fd != VK_SUCCESS)
+            return failure("vkGetMemoryFdKHR"_str, vulkan::BackendCause::Native(exported_fd));
+        if (fd < 0)
+            return failure("vkGetMemoryFdKHR"_str,
+                           vulkan::BackendCause::Invalid("invalid exported fd"_Str));
         descriptors.push(rstd::os::fd::OwnedFd::from_raw_fd(fd));
         const auto layout =
             native.GetImageSubresourceLayout(*image.handle, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 });
-        if (layout.rowPitch > rstd::uint64_t(~rstd::uint32_t())) return None();
+        if (layout.rowPitch > rstd::uint64_t(~rstd::uint32_t()))
+            return failure("local output pitch"_str,
+                           vulkan::BackendCause::Capacity(layout.rowPitch));
         image.extent        = info.extent;
         image.generation    = generation;
         image.fd            = fd;
@@ -218,11 +250,15 @@ inline auto CreateSessionLocalOutput(vulkan::TextureContext& context, unsigned w
     auto output = ExSwapchain::Make<SessionLocalOutput>(
         session, rstd::move(local), rstd::move(descriptors), generation);
     auto begun = context.Begin();
-    if (begun.is_err()) return None();
+    if (begun.is_err())
+        return Err(
+            resource::ResourceError::texture(begun.unwrap_err(), "local output initialize"_Str));
     auto work = rstd::move(begun).unwrap_unchecked();
     work.retain(output.clone());
     auto command = vulkan::native_recording(work, session);
-    if (command.is_err()) return None();
+    if (command.is_err())
+        return Err(
+            resource::ResourceError::texture(command.unwrap_err(), "local output initialize"_Str));
     for (auto image : images) {
         VkImageMemoryBarrier barrier { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
         barrier.dstAccessMask       = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -244,15 +280,23 @@ inline auto CreateSessionLocalOutput(vulkan::TextureContext& context, unsigned w
                                                &barrier);
     }
     auto submitted = context.Submit(rstd::move(work));
-    if (submitted.is_err() || context.wait(submitted.unwrap_unchecked()).is_err()) return None();
-    (void)context.Poll();
-    return Some(rstd::move(output));
+    if (submitted.is_err())
+        return Err(
+            resource::ResourceError::texture(submitted.unwrap_err(), "local output submit"_Str));
+    auto waited = context.wait(submitted.unwrap());
+    if (waited.is_err())
+        return Err(resource::ResourceError::texture(waited.unwrap_err(), "local output wait"_Str));
+    auto polled = context.Poll();
+    if (polled.is_err())
+        return Err(resource::ResourceError::texture(polled.unwrap_err(), "local output poll"_Str));
+    return Ok(rstd::move(output));
 #else
     (void)context;
     (void)width;
     (void)height;
     (void)tiling;
-    return None();
+    return failure("local output"_str,
+                   vulkan::BackendCause::Unsupported("DMA-BUF output requires Linux"_Str));
 #endif
 }
 } // namespace vrento::resource_registry

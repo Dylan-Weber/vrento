@@ -3,6 +3,7 @@ export import :vulkan.pass.graph_input;
 export import :vulkan.pass.resources;
 import :vulkan.pass.factory;
 import rstd;
+
 using namespace rstd::prelude;
 using rstd::collections::HashMap;
 using rstd::sync::Arc;
@@ -19,7 +20,7 @@ struct BoundVulkanPass {
     Arc<dyn<VulkanPass>>       pass;
     Arc<typename T::FrameData> data;
     auto                       Prepare(const GraphPrepareContext& context) const
-        -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError> {
         auto concrete = try_vulkan_pass<T>(pass.as_ptr().as_ptr().as_ref());
         if (! concrete) return Err(GraphExecutionError { GraphExecutionStage::Schema });
         return (*concrete)->Instantiate(context, data.clone());
@@ -123,7 +124,7 @@ public:
                                    rstd::move(binding)));
     }
     auto record(const GraphBindings&, Option<PassFrameBinding>, Box<dyn<GraphicsScopeBackend>>,
-                texture::Submission&) const -> Result<empty, GraphExecutionError>;
+                texture::Submission&) const -> Result<FrameProgress, GraphExecutionError>;
 };
 
 class GraphPreparation;
@@ -241,7 +242,7 @@ public:
         -> Result<GraphPreparation, GraphExecutionError>;
     auto instantiate(const GraphBindings&, slice<PassFrameBinding>, Box<dyn<GraphicsScopeBackend>>,
                      bool merge_scopes = true, texture::Submission* work = nullptr) const
-        -> Result<PreparedGraphProgram, GraphExecutionError>;
+        -> Result<Preparation<PreparedGraphProgram>, GraphExecutionError>;
 };
 
 template<typename Owner>
@@ -259,20 +260,21 @@ struct RetainedNativePass {
 template<typename Owner>
 inline auto prepare_native(const Arc<Owner>& owner, PassId id, Arc<dyn<VulkanPass>> selected,
                            const GraphPrepareContext& context)
-    -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError> {
     owner->execution->instantiate();
     auto prepared = selected->Prepare(context);
     if (prepared.is_err()) {
         auto error = prepared.unwrap_err();
-        if (error.stage == GraphExecutionStage::Pending)
-            owner->execution->pending();
-        else
-            owner->execution->fail();
+        owner->execution->fail();
         error.pass = id;
         return Err(error);
     }
+    if (! prepared->ready()) {
+        owner->execution->pending();
+        return Ok(PendingPreparation {});
+    }
     return Ok(Arc<dyn<VulkanPass>>::make(
-        RetainedNativePass<Owner> { prepared.unwrap(), owner.clone(), rstd::move(selected) }));
+        RetainedNativePass<Owner> { prepared->take_ready(), owner.clone(), rstd::move(selected) }));
 }
 struct NativeFrameBackend {
     Arc<CompiledGraph::Data>       owner;
@@ -285,11 +287,12 @@ struct NativeFrameBackend {
         return Ok(owner->routes.clone());
     }
     auto prepare_scope(const GraphicsDescription& description, const GraphPrepareContext& context)
-        -> Result<Arc<dyn<PreparedGraphicsScope>>, GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<PreparedGraphicsScope>>>,
+                  GraphExecutionError> {
         return scopes->Prepare(description, context);
     }
     auto prepare_at(usize slot, const PassExecutionInfo& pass, const GraphPrepareContext& context)
-        -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError> {
         if (slot >= owner->entries.len() || owner->entries[slot].id != pass.id)
             return Err(GraphExecutionError { GraphExecutionStage::Schema, pass.id });
         const auto& input = inputs[slot];
@@ -302,11 +305,12 @@ struct StandaloneFrameBackend {
     Option<PassFrameBinding>       input;
     Box<dyn<GraphicsScopeBackend>> scopes;
     auto prepare_scope(const GraphicsDescription& description, const GraphPrepareContext& context)
-        -> Result<Arc<dyn<PreparedGraphicsScope>>, GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<PreparedGraphicsScope>>>,
+                  GraphExecutionError> {
         return scopes->Prepare(description, context);
     }
     auto prepare(const PassExecutionInfo& pass, const GraphPrepareContext& context)
-        -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError> {
         if (pass.id != owner->description.execution().id)
             return Err(GraphExecutionError { GraphExecutionStage::Schema, pass.id });
         auto selected = input ? input->binding_.clone() : owner->native.clone();
@@ -324,11 +328,10 @@ class GraphPreparation {
 public:
     GraphPreparation(const GraphPreparation&) = delete;
     GraphPreparation(GraphPreparation&&)      = default;
-    auto advance() -> Result<empty, GraphExecutionError> {
+    auto advance() -> Result<FrameProgress, GraphExecutionError> {
         if (failure_) return Err(*failure_);
         auto result = program_.continue_prepare(backend_);
-        if (result.is_err() && result.as_ref().unwrap_err().stage != GraphExecutionStage::Pending)
-            failure_ = Some(GraphExecutionError(result.as_ref().unwrap_err()));
+        if (result.is_err()) failure_ = Some(GraphExecutionError(result.as_ref().unwrap_err()));
         return result;
     }
     auto ready() const -> bool { return ! failure_ && program_.ready(); }
@@ -339,7 +342,7 @@ public:
 
 auto CompiledPass::record(const GraphBindings& bindings, Option<PassFrameBinding> input,
                           Box<dyn<GraphicsScopeBackend>> scopes, texture::Submission& work) const
-    -> Result<empty, GraphExecutionError> {
+    -> Result<FrameProgress, GraphExecutionError> {
     data_->execution->frame();
     const auto& desc = data_->description;
     const auto& pass = desc.execution();
@@ -381,12 +384,13 @@ auto CompiledGraph::prepare_frame(const GraphBindings& bindings, slice<PassFrame
 auto CompiledGraph::instantiate(const GraphBindings& bindings, slice<PassFrameBinding> inputs,
                                 Box<dyn<GraphicsScopeBackend>> scopes, bool merge_scopes,
                                 texture::Submission* work) const
-    -> Result<PreparedGraphProgram, GraphExecutionError> {
+    -> Result<Preparation<PreparedGraphProgram>, GraphExecutionError> {
     auto started = prepare_frame(bindings, inputs, rstd::move(scopes), merge_scopes, work);
     if (started.is_err()) return Err(started.unwrap_err());
     auto preparation = started.unwrap();
     auto result      = preparation.advance();
     if (result.is_err()) return Err(result.unwrap_err());
+    if (*result == FrameProgress::Pending) return Ok(PendingPreparation {});
     return Ok(preparation.program().unwrap());
 }
 } // namespace vrento::vulkan

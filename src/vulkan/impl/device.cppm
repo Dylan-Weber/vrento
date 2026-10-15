@@ -16,23 +16,32 @@ using namespace rstd::literals;
 using rstd::collections::BTreeSet;
 using rstd::ffi::CStr;
 using rstd::ffi::CString;
+using namespace vrento::vulkan;
 
 #include "ExtensionNames.hpp"
-using namespace vrento::vulkan;
 
 namespace
 {
 
-void EnumateDeviceExts(const vvk::PhysicalDevice& gpu, BTreeSet<String>& set) {
+auto EnumateDeviceExts(const vvk::PhysicalDevice& gpu, BTreeSet<String>& set)
+    -> Result<empty, BackendError> {
     Vec<VkExtensionProperties> properties;
-    VVK_CHECK_VOID_RE(gpu.EnumerateDeviceExtensionProperties(properties));
+    auto                       result = gpu.EnumerateDeviceExtensionProperties(properties);
+    if (result != VK_SUCCESS)
+        return Err(
+            BackendError { "enumerate device extensions"_Str, BackendCause::Native(result) });
     for (auto& ext : properties)
         set.insert(String::make(CStr::from_ptr(ext.extensionName).to_str().unwrap()));
+    return Ok(empty {});
 }
 
 } // namespace
 
 bool Device::CheckGPU(vvk::PhysicalDevice gpu, slice<Extension> exts, VkSurfaceKHR surface) {
+    return ValidateGPU(gpu, exts, surface).is_ok();
+}
+auto Device::ValidateGPU(vvk::PhysicalDevice gpu, slice<Extension> exts, VkSurfaceKHR surface)
+    -> Result<empty, BackendError> {
     auto props = gpu.GetQueueFamilyProperties();
 
     bool     has_graphics_queue { false };
@@ -42,21 +51,31 @@ bool Device::CheckGPU(vvk::PhysicalDevice gpu, slice<Extension> exts, VkSurfaceK
         if (prop.queueFlags & VK_QUEUE_GRAPHICS_BIT) has_graphics_queue = true;
         if (surface) {
             bool ok { false };
-            VVK_CHECK(gpu.GetSurfaceSupportKHR(index, surface, ok));
+            auto result = gpu.GetSurfaceSupportKHR(index, surface, ok);
+            if (result != VK_SUCCESS)
+                return Err(
+                    BackendError { "query present support"_Str, BackendCause::Native(result) });
             if (ok) has_present_queue = true;
         }
         index++;
     }
-    if (! has_graphics_queue) return false;
-    if (surface && ! has_present_queue) return false;
+    if (! has_graphics_queue)
+        return Err(BackendError { "validate device"_Str,
+                                  BackendCause::Unsupported("graphics queue"_Str) });
+    if (surface && ! has_present_queue)
+        return Err(
+            BackendError { "validate device"_Str, BackendCause::Unsupported("present queue"_Str) });
 
     auto extensions = BTreeSet<String>::make();
-    EnumateDeviceExts(gpu, extensions);
+    auto enumerated = EnumateDeviceExts(gpu, extensions);
+    if (enumerated.is_err()) return enumerated;
     bool requires_timeline_semaphore { false };
     bool requires_maintenance { false };
     for (auto& ext : exts) {
         if (ext.required) {
-            if (! extensions.contains(ext.name)) return false;
+            if (! extensions.contains(ext.name))
+                return Err(BackendError { "validate device extensions"_Str,
+                                          BackendCause::Unsupported(String::make(ext.name)) });
             if (ext.name == "VK_EXT_swapchain_maintenance1"_str) requires_maintenance = true;
             if (ext.name ==
                 CStr::from_ptr(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME).to_str().unwrap()) {
@@ -80,15 +99,22 @@ bool Device::CheckGPU(vvk::PhysicalDevice gpu, slice<Extension> exts, VkSurfaceK
     if (requires_timeline_semaphore && requires_maintenance)
         timeline_features.pNext = &maintenance_features;
     gpu.GetFeatures2KHR(features2);
-    if (requires_maintenance && ! maintenance_features.swapchainMaintenance1) return false;
+    if (requires_maintenance && ! maintenance_features.swapchainMaintenance1)
+        return Err(BackendError { "validate device"_Str,
+                                  BackendCause::Unsupported("swapchainMaintenance1"_Str) });
 #if ! __is_target_os(macos)
-    if (! features2.features.geometryShader) return false;
+    if (! features2.features.geometryShader)
+        return Err(BackendError { "validate device"_Str,
+                                  BackendCause::Unsupported("geometryShader"_Str) });
 #endif
-    if (requires_timeline_semaphore && ! timeline_features.timelineSemaphore) return false;
-    return true;
+    if (requires_timeline_semaphore && ! timeline_features.timelineSemaphore)
+        return Err(BackendError { "validate device"_Str,
+                                  BackendCause::Unsupported("timelineSemaphore"_Str) });
+    return Ok(empty {});
 }
 
-Vec<VkDeviceQueueCreateInfo> Device::ChooseDeviceQueue(VkSurfaceKHR surface) {
+auto Device::ChooseDeviceQueue(VkSurfaceKHR surface)
+    -> Result<Vec<VkDeviceQueueCreateInfo>, BackendError> {
     Vec<VkDeviceQueueCreateInfo> queues;
 
     auto props = m_gpu.GetQueueFamilyProperties();
@@ -99,6 +125,9 @@ Vec<VkDeviceQueueCreateInfo> Device::ChooseDeviceQueue(VkSurfaceKHR surface) {
         if (prop.queueFlags & VK_QUEUE_GRAPHICS_BIT) graphic_indexs.emplace_back(index);
         index++;
     }
+    if (graphic_indexs.is_empty())
+        return Err(BackendError { "choose device queues"_Str,
+                                  BackendCause::Unsupported("graphics queue"_Str) });
     m_graphics_queue.family_index = graphic_indexs[usize()];
     m_graphics_queue.flags        = props[usize(m_graphics_queue.family_index)].queueFlags;
     const static float defaultQueuePriorities[] = { 0.0f, 0.0f };
@@ -108,12 +137,16 @@ Vec<VkDeviceQueueCreateInfo> Device::ChooseDeviceQueue(VkSurfaceKHR surface) {
         for (auto& prop : props) {
             (void)prop;
             bool ok { false };
-            VVK_CHECK(m_gpu.GetSurfaceSupportKHR(index, surface, ok))
+            auto result = m_gpu.GetSurfaceSupportKHR(index, surface, ok);
+            if (result != VK_SUCCESS)
+                return Err(
+                    BackendError { "query present support"_Str, BackendCause::Native(result) });
             if (ok) present_indexs.emplace_back(index);
             index++;
         }
         if (present_indexs.is_empty()) {
-            rstd_error("not find present queue");
+            return Err(BackendError { "choose device queues"_Str,
+                                      BackendCause::Unsupported("present queue"_Str) });
         } else {
             m_present_queue.family_index = present_indexs[usize()];
         }
@@ -128,11 +161,13 @@ Vec<VkDeviceQueueCreateInfo> Device::ChooseDeviceQueue(VkSurfaceKHR surface) {
         };
         queues.push(rstd::move(info));
     }
-    return queues;
+    return Ok(rstd::move(queues));
 }
 
-bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, Device& device,
-                    SwapchainOptions swapchain_options) {
+auto Device::TryCreate(Instance& inst, slice<Extension> exts, VkExtent2D extent, Device& device,
+                       SwapchainOptions swapchain_options) -> Result<empty, BackendError> {
+    auto valid = ValidateGPU(inst.gpu(), exts, *inst.surface());
+    if (valid.is_err()) return valid;
     device.m_instance             = *inst.inst();
     device.m_instance_api_version = inst.api_version();
     device.m_gpu                  = inst.gpu();
@@ -140,13 +175,12 @@ bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, De
     device.set_out_extent(extent);
     device.m_enabled_instance_extensions = Vec<CString>::from(inst.enabled_extensions());
 
-    EnumateDeviceExts(inst.gpu(), device.m_extensions);
+    auto enumerated = EnumateDeviceExts(inst.gpu(), device.m_extensions);
+    if (enumerated.is_err()) return enumerated;
     auto selected = detail::SelectExtensionNames(device.m_extensions, exts);
-    if (selected.is_err()) {
-        rstd_error("required vulkan device extension \"{}\" is not supported",
-                   selected.unwrap_err());
-        return false;
-    }
+    if (selected.is_err())
+        return Err(BackendError { "select device extensions"_Str,
+                                  BackendCause::Unsupported(selected.unwrap_err()) });
     device.m_enabled_device_extensions = rstd::move(selected).unwrap();
     auto tested_exts_c = Vec<const char*>::with_capacity(device.m_enabled_device_extensions.len());
     auto tested_exts   = BTreeSet<String>::make();
@@ -189,13 +223,13 @@ bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, De
     };
     device.m_gpu.GetFeatures2KHR(supported2);
     if (! supported_timeline.timelineSemaphore) {
-        rstd_error("required vulkan feature timelineSemaphore is not supported");
-        return false;
+        return Err(BackendError { "create device"_Str,
+                                  BackendCause::Unsupported("timelineSemaphore"_Str) });
     }
 #if ! __is_target_os(macos)
     if (! supported2.features.geometryShader) {
-        rstd_error("required vulkan feature geometryShader is not supported");
-        return false;
+        return Err(
+            BackendError { "create device"_Str, BackendCause::Unsupported("geometryShader"_Str) });
     }
 #endif
     const bool enable_shader_output_viewport_index = tested_exts.contains(
@@ -249,12 +283,16 @@ bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, De
         .swapchainMaintenance1 = VK_TRUE,
     };
     if (maintenance) {
-        if (! supported_maintenance.swapchainMaintenance1) return false;
+        if (! supported_maintenance.swapchainMaintenance1)
+            return Err(BackendError { "create device"_Str,
+                                      BackendCause::Unsupported("swapchainMaintenance1"_Str) });
         enabled_ycbcr.pNext = &enabled_maintenance;
     }
     enabled_timeline.pNext = &enabled_ycbcr;
 
-    auto               queue_create_infos = device.ChooseDeviceQueue(*inst.surface());
+    auto queues = device.ChooseDeviceQueue(*inst.surface());
+    if (queues.is_err()) return Err(queues.unwrap_err());
+    auto               queue_create_infos = queues.unwrap();
     VkDeviceCreateInfo device_info {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &enabled_timeline,
@@ -267,14 +305,10 @@ bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, De
     };
     auto created = vvk::Device::Create(
         device.m_device, *device.m_gpu, inst.inst().Dispatch(), device_info, device.dld);
-    if (created.is_err()) {
-        const auto error = created.unwrap_err_unchecked();
-        rstd_error("device creation failed: kind={}, vk={}, command={}",
-                   static_cast<int>(error.kind),
-                   static_cast<int>(error.api_result),
-                   error.command ? error.command : "");
-        return false;
-    }
+    if (created.is_err())
+        return Err(BackendError {
+            "create device"_Str,
+            BackendCause::Dispatch(DispatchFailure::capture(created.unwrap_err())) });
 
     device.m_graphics_queue.handle = device.m_device.GetQueue(device.m_graphics_queue.family_index);
     device.m_present_queue.handle  = device.m_device.GetQueue(device.m_present_queue.family_index);
@@ -330,11 +364,10 @@ bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, De
     };
 
     if (rq_surface) {
-        if (! Swapchain::Create(
-                device, *inst.surface(), extent, device.m_swapchain, swapchain_options)) {
-            rstd_error("create swapchain failed");
-            return false;
-        }
+        auto result = Swapchain::CreateResult(
+            device, *inst.surface(), extent, device.m_swapchain, swapchain_options);
+        if (result != VK_SUCCESS)
+            return Err(BackendError { "create swapchain"_Str, BackendCause::Native(result) });
         device.set_out_extent(device.m_swapchain.extent());
     }
     {
@@ -342,21 +375,19 @@ bool Device::Create(Instance& inst, slice<Extension> exts, VkExtent2D extent, De
                                        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
                                                 VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
                                        .queueFamilyIndex = device.m_graphics_queue.family_index };
-        VVK_CHECK_BOOL_RE(device.m_device.CreateCommandPool(info, device.m_command_pool));
+        auto result = device.m_device.CreateCommandPool(info, device.m_command_pool);
+        if (result != VK_SUCCESS)
+            return Err(BackendError { "create command pool"_Str, BackendCause::Native(result) });
     }
     {
         auto allocator =
             vvk::MemoryAllocator::Create(*device.m_gpu, inst.inst().Dispatch(), device.dld);
-        if (allocator.is_err()) {
-            const auto error = allocator.unwrap_err_unchecked();
-            rstd_error("memory allocator creation failed: kind={}, vk={}",
-                       static_cast<int>(error.kind),
-                       static_cast<int>(error.api_result));
-            return false;
-        }
+        if (allocator.is_err())
+            return Err(BackendError { "create memory allocator"_Str,
+                                      BackendCause::Memory(allocator.unwrap_err()) });
         device.m_allocator = allocator.unwrap_unchecked();
     }
-    return true;
+    return Ok(empty {});
 }
 
 VkDeviceSize Device::GetUsage() const { return MemoryBudget().usage; }

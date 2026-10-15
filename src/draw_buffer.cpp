@@ -1,6 +1,7 @@
 module vrento;
 import rstd;
 import :resource_registry;
+
 using namespace rstd::prelude;
 using namespace rstd::literals;
 using rstd::sync::atomic::Atomic;
@@ -120,15 +121,14 @@ auto RenderBufferResolver::prepareDrawBuffers(const DrawBufferRequest& request)
 auto RenderBufferResolver::updateDrawBuffers(const DrawBufferRequest&                    request,
                                              DrawBufferRefs&                             buffers,
                                              mut_ref<dyn<resource::BufferContentWriter>> writer)
-    -> Result<empty, DrawBufferUpdateError> {
+    -> Result<DrawUpdateOutcome, DrawBufferUpdateError> {
     const auto& geometry = request.geometry;
     auto        count    = DrawCount(geometry);
     if (count.is_none())
         return Err(DrawBufferUpdateError { DrawBufferUpdateErrorKind::InvalidGeometry,
                                            "invalid geometry range"_Str });
     auto reprepare = [] {
-        return Err(DrawBufferUpdateError { DrawBufferUpdateErrorKind::NeedsReprepare,
-                                           "geometry binding changed"_Str });
+        return Ok(DrawUpdateOutcome::NeedsReprepare);
     };
     if (buffers.render_item != request.render_item || buffers.dynamic != geometry.dynamic ||
         (buffers.dynamic && request.dynamic_allocation_generation != u64() &&
@@ -156,7 +156,8 @@ auto RenderBufferResolver::updateDrawBuffers(const DrawBufferRequest&           
         if (updated.is_err())
             return Err(
                 DrawBufferUpdateError { DrawBufferUpdateErrorKind::UploadFailed,
-                                        rstd::move(updated).unwrap_err_unchecked().message });
+                                        "buffer upload failed"_Str,
+                                        resource::ResourceErrorSnapshot(updated.unwrap_err()) });
     }
     if (geometry.index.is_some() &&
         (! buffers.content_confirmed ||
@@ -165,7 +166,8 @@ auto RenderBufferResolver::updateDrawBuffers(const DrawBufferRequest&           
         if (updated.is_err())
             return Err(
                 DrawBufferUpdateError { DrawBufferUpdateErrorKind::UploadFailed,
-                                        rstd::move(updated).unwrap_err_unchecked().message });
+                                        "buffer upload failed"_Str,
+                                        resource::ResourceErrorSnapshot(updated.unwrap_err()) });
     }
     // Confirm only after all writes succeed; a partial failure retries unchanged input.
     for (usize i {}; i < geometry.vertices.len(); ++i)
@@ -174,6 +176,6 @@ auto RenderBufferResolver::updateDrawBuffers(const DrawBufferRequest&           
         buffers.index_key->data_generation = geometry.index->data_generation;
     buffers.draw_count        = *count;
     buffers.content_confirmed = true;
-    return Ok(empty {});
+    return Ok(DrawUpdateOutcome::Updated);
 }
 } // namespace vrento

@@ -61,7 +61,7 @@ auto make_test_pass(rstd::uint64_t scope, rstd::uint64_t revision,
 namespace vrento_test::texture_vulkan
 {
 auto read(vrento::vulkan::TextureContext&, vrento::texture::TextureViewRef, unsigned, unsigned)
-    -> rstd::Vec<rstd::u8>;
+    -> rstd::vec::Vec<rstd::u8>;
 }
 
 namespace vrento_test::renderer
@@ -107,16 +107,16 @@ struct Native {
     using FrameData = FrameInput;
     Arc<State> state;
     auto       Instantiate(const vk::GraphPrepareContext&, Arc<FrameInput>) const
-        -> Result<Arc<dyn<vk::VulkanPass>>, vk::GraphExecutionError>;
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<vk::VulkanPass>>>, vk::GraphExecutionError>;
     auto Instantiate(const vk::GraphPrepareContext& context) const
-        -> Result<Arc<dyn<vk::VulkanPass>>, vk::GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<vk::VulkanPass>>>, vk::GraphExecutionError> {
         return Instantiate(context, Arc<FrameInput>::make(0));
     }
 };
 struct Compiler {
     using Pass = Native;
     auto Compile(const Configuration&, const vk::PassExecutionInfo&, const vk::PassCompileContext&)
-        -> Result<Arc<dyn<vk::VulkanPass>>, vk::GraphExecutionError>;
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<vk::VulkanPass>>>, vk::GraphExecutionError>;
 };
 } // namespace vrento_test::renderer
 namespace rstd
@@ -126,34 +126,60 @@ namespace rstd
 namespace vrento_test::renderer
 {
 auto Native::Instantiate(const vk::GraphPrepareContext&, Arc<FrameInput> input) const
-    -> Result<Arc<dyn<vk::VulkanPass>>, vk::GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<Arc<dyn<vk::VulkanPass>>>, vk::GraphExecutionError> {
     ++state->instantiated;
     if (input) state->observed = input->value;
     if (state->frame_pending) {
         --state->frame_pending;
-        return Err(vk::GraphExecutionError { vk::GraphExecutionStage::Pending });
+        return Ok(vrento::vulkan::PendingPreparation {});
     }
     if (state->frame_fail) return Err(vk::GraphExecutionError { vk::GraphExecutionStage::Prepare });
     return Ok(Arc<dyn<vk::VulkanPass>>::make(Commands { state.clone() }));
 }
 auto Compiler::Compile(const Configuration& desc, const vk::PassExecutionInfo&,
                        const vk::PassCompileContext&)
-    -> Result<Arc<dyn<vk::VulkanPass>>, vk::GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<Arc<dyn<vk::VulkanPass>>>, vk::GraphExecutionError> {
     rstd_assert(desc.viewport.pViewports == desc.viewports->data());
     ++desc.state->compiled;
     if (desc.state->pending) {
         --desc.state->pending;
-        return Err(vk::GraphExecutionError { vk::GraphExecutionStage::Pending });
+        return Ok(vrento::vulkan::PendingPreparation {});
     }
     if (desc.state->fail) {
         vk::GraphExecutionError error { vk::GraphExecutionStage::Prepare };
-        error.preparation =
+        error.cause = vrento::vulkan::GraphExecutionCause::Resource(
             vrento::resource::ResourceErrorSnapshot(vrento::resource::ResourceError {
                 .message = String::make("native factory failure"_str),
-                .source  = Some(vrento::resource::ResourceErrorSource::Native(-3)) });
+                .source  = Some(vrento::resource::ResourceErrorSource::Native(-3)) }));
         return Err(rstd::move(error));
     }
     return Ok(Arc<dyn<vk::VulkanPass>>::make(Native { desc.state.clone() }));
+}
+TEST(VulkanRenderer, LostDeviceRemainsTheCompileFailureCause) {
+    auto created = vk::DeviceSession::create({ .validation = true });
+    if (created.is_err()) GTEST_SKIP() << "Vulkan unavailable";
+    auto                  session = created.unwrap();
+    vk::Renderer          renderer(session);
+    fg::FrameGraphBuilder builder(48);
+    builder.add_pass({ 1 }).unwrap();
+    auto graph       = rstd::move(builder).finish().unwrap();
+    auto description = [] {
+        return make_test_pass(48,
+                              1,
+                              vk::PassExecutionInfo { .id = { 1 }, .kind = 7 },
+                              Configuration(Arc<State>::make()));
+    };
+    session.observe_result(VK_ERROR_DEVICE_LOST);
+    Vec<vk::PassInput> descriptions;
+    descriptions.push(description());
+    auto compiled = renderer.compile(graph, rstd::move(descriptions));
+    ASSERT_TRUE(compiled.is_err());
+    EXPECT_EQ(compiled.as_ref().unwrap_err().native_result(), VK_ERROR_DEVICE_LOST);
+    auto standalone = renderer.compile_pass(description());
+    ASSERT_TRUE(standalone.is_err());
+    EXPECT_EQ(standalone.as_ref().unwrap_err().native_result(), VK_ERROR_DEVICE_LOST);
+    EXPECT_EQ(renderer.status().error->native_result(), VK_ERROR_DEVICE_LOST);
+    EXPECT_EQ(renderer.statistics().compile_failures, 2u);
 }
 TEST(VulkanRenderer, TypedDescriptionPendingAndFrameRevision) {
     auto created = vk::DeviceSession::create({ .validation = true });
@@ -170,8 +196,8 @@ TEST(VulkanRenderer, TypedDescriptionPendingAndFrameRevision) {
     descriptions.push(make_test_pass(
         44, 8, vk::PassExecutionInfo { .id = { 4 }, .kind = 7 }, Configuration(state.clone())));
     EXPECT_FALSE(descriptions[usize()].get<unsigned>().is_some());
-    EXPECT_EQ(renderer.compile(graph, rstd::move(descriptions)).unwrap_err().stage,
-              vk::GraphExecutionStage::Pending);
+    EXPECT_EQ(renderer.compile(graph, rstd::move(descriptions)).unwrap(),
+              vk::CompileProgress::Pending);
     EXPECT_TRUE(renderer.pending());
     EXPECT_FALSE(renderer.compiled().is_some());
     renderer.continue_compile(renderer.status().id).unwrap();
@@ -192,7 +218,8 @@ TEST(VulkanRenderer, TypedDescriptionPendingAndFrameRevision) {
             .instantiate(bindings,
                          inputs.as_slice(),
                          Box<dyn<vk::GraphicsScopeBackend>>::make(vk::GraphicsScopeCache {}))
-            .unwrap();
+            .unwrap()
+            .take_ready();
     auto context = vk::TextureContext::create(session).unwrap();
     auto work    = context.Begin().unwrap();
     frame.record(work).unwrap();
@@ -232,7 +259,8 @@ TEST(VulkanRenderer, ReusesImmutableDescriptionsAndKeepsPreviousOnFailure) {
                 ->instantiate(bindings,
                               inputs.as_slice(),
                               Box<dyn<vk::GraphicsScopeBackend>>::make(vk::GraphicsScopeCache {}))
-                .unwrap();
+                .unwrap()
+                .take_ready();
         auto queue = vk::TextureContext::create(session).unwrap();
         auto work  = queue.Begin().unwrap();
         prepared.record(work).unwrap();
@@ -269,8 +297,7 @@ TEST(VulkanRenderer, ReusesImmutableDescriptionsAndKeepsPreviousOnFailure) {
     Vec<vk::PassInput> pending;
     pending.push(make_test_pass(
         46, 3, vk::PassExecutionInfo { .id = { 1 }, .kind = 7 }, Configuration(waiting.clone())));
-    EXPECT_EQ(renderer.compile(graph, rstd::move(pending)).unwrap_err().stage,
-              vk::GraphExecutionStage::Pending);
+    EXPECT_EQ(renderer.compile(graph, rstd::move(pending)).unwrap(), vk::CompileProgress::Pending);
     EXPECT_TRUE(renderer.compiled());
     renderer.cancel_compile();
     EXPECT_EQ(renderer.statistics().compile_cancellations, 1u);
@@ -307,8 +334,7 @@ TEST(VulkanRenderer, CompileTransactionsRejectStaleContinuationAndKeepCompletedP
     auto completed_id = renderer.status().id;
     EXPECT_TRUE(renderer.ready());
     second->pending = 2;
-    EXPECT_EQ(renderer.compile(graph, descriptions(2)).unwrap_err().stage,
-              vk::GraphExecutionStage::Pending);
+    EXPECT_EQ(renderer.compile(graph, descriptions(2)).unwrap(), vk::CompileProgress::Pending);
     auto pending_id = renderer.status().id;
     EXPECT_NE(pending_id, completed_id);
     EXPECT_FALSE(renderer.ready());
@@ -316,8 +342,7 @@ TEST(VulkanRenderer, CompileTransactionsRejectStaleContinuationAndKeepCompletedP
     EXPECT_TRUE(renderer.continue_compile(completed_id).is_err());
     EXPECT_FALSE(renderer.cancel_compile(completed_id));
     EXPECT_EQ(renderer.status().id, pending_id);
-    EXPECT_EQ(renderer.continue_compile(pending_id).unwrap_err().stage,
-              vk::GraphExecutionStage::Pending);
+    EXPECT_EQ(renderer.continue_compile(pending_id).unwrap(), vk::CompileProgress::Pending);
     EXPECT_EQ(first->compiled, 2u);
     renderer.continue_compile(pending_id).unwrap();
     EXPECT_EQ(first->compiled, 2u);
@@ -326,7 +351,7 @@ TEST(VulkanRenderer, CompileTransactionsRejectStaleContinuationAndKeepCompletedP
     EXPECT_TRUE(renderer.continue_compile(pending_id).is_err());
 
     second->pending = 1;
-    EXPECT_TRUE(renderer.compile(graph, descriptions(3)).is_err());
+    EXPECT_EQ(renderer.compile(graph, descriptions(3)).unwrap(), vk::CompileProgress::Pending);
     auto replaced_id    = renderer.status().id;
     auto malformed      = descriptions(4);
     malformed[usize(1)] = make_test_pass(
@@ -342,7 +367,7 @@ TEST(VulkanRenderer, CompileTransactionsRejectStaleContinuationAndKeepCompletedP
     EXPECT_EQ(previous.description().scope(), 47u);
 
     second->pending = 1;
-    EXPECT_TRUE(renderer.compile(graph, descriptions(5)).is_err());
+    EXPECT_EQ(renderer.compile(graph, descriptions(5)).unwrap(), vk::CompileProgress::Pending);
     auto cancelled_id = renderer.status().id;
     EXPECT_TRUE(renderer.cancel_compile(cancelled_id));
     EXPECT_EQ(renderer.status().state, vk::CompileState::Cancelled);
@@ -356,14 +381,14 @@ TEST(VulkanRenderer, CompileTransactionsRejectStaleContinuationAndKeepCompletedP
     EXPECT_EQ(renderer.status().state, vk::CompileState::Failed);
     auto failure = renderer.status();
     EXPECT_EQ(failure.error->pass.value, 2u);
-    EXPECT_TRUE(failure.error->preparation);
-    EXPECT_EQ(failure.error->preparation.error().source->as_Native().code, -3);
+    EXPECT_TRUE(failure.error->cause.is_Resource());
+    EXPECT_EQ(failure.error->cause.as_Resource().error.error().source->as_Native().code, -3);
     EXPECT_TRUE(renderer.compiled());
     EXPECT_FALSE(renderer.ready());
     renderer.clear();
     EXPECT_EQ(renderer.status().state, vk::CompileState::Idle);
     EXPECT_FALSE(renderer.compiled());
-    EXPECT_EQ(failure.error->preparation.error().source->as_Native().code, -3);
+    EXPECT_EQ(failure.error->cause.as_Resource().error.error().source->as_Native().code, -3);
     auto before = renderer.status().id;
     EXPECT_TRUE(renderer.continue_compile(failure.id).is_err());
     EXPECT_EQ(renderer.status().id, before);
@@ -383,11 +408,11 @@ TEST(VulkanRenderer, StandalonePassRetainsPendingDescription) {
     auto weak        = description.viewports.downgrade();
     auto result      = renderer.compile_pass(make_test_pass(
         48, 1, vk::PassExecutionInfo { .id = { 1 }, .kind = 7 }, rstd::move(description)));
-    EXPECT_EQ(result.unwrap_err().stage, vk::GraphExecutionStage::Pending);
+    EXPECT_FALSE(result.unwrap().ready());
     EXPECT_EQ(renderer.status().kind, vk::CompileKind::Pass);
     auto id = renderer.status().id;
     EXPECT_TRUE(weak.upgrade());
-    EXPECT_EQ(renderer.continue_compile(id).unwrap_err().stage, vk::GraphExecutionStage::Pending);
+    EXPECT_EQ(renderer.continue_compile(id).unwrap(), vk::CompileProgress::Pending);
     renderer.continue_compile(id).unwrap();
     EXPECT_TRUE(renderer.ready());
     EXPECT_FALSE(renderer.compiled());
@@ -490,7 +515,8 @@ TEST(VulkanRenderer, CopyDescriptionReusesCompiledGraphAcrossFrames) {
                 .instantiate(bindings,
                              {},
                              Box<dyn<vk::GraphicsScopeBackend>>::make(vk::GraphicsScopeCache {}))
-                .unwrap();
+                .unwrap()
+                .take_ready();
         auto work = queue.Begin().unwrap();
         execution.record(work).unwrap();
         queue.wait(queue.Submit(rstd::move(work)).unwrap()).unwrap();
@@ -537,7 +563,8 @@ TEST(VulkanRenderer, ClearGraphicsDescriptionOwnsExecution) {
         renderer.compiled()
             ->instantiate(
                 bindings, {}, Box<dyn<vk::GraphicsScopeBackend>>::make(vk::GraphicsScopeCache {}))
-            .unwrap();
+            .unwrap()
+            .take_ready();
     renderer.clear();
     auto work = queue.Begin().unwrap();
     frame.record(work).unwrap();
@@ -607,9 +634,9 @@ TEST(VulkanRenderer, FramePendingKeepsInputsAndCompletedNativePasses) {
                      resources.clone(), compiled, request(), resources->BeginFrame().unwrap())
                      .unwrap();
     renderer.clear();
-    EXPECT_EQ(frame.record().unwrap_err().stage, vk::GraphExecutionStage::Pending);
-    EXPECT_EQ(frame.advance().unwrap_err().stage, vk::GraphExecutionStage::Pending);
-    EXPECT_EQ(frame.advance().unwrap_err().stage, vk::GraphExecutionStage::Pending);
+    EXPECT_EQ(frame.record().unwrap_err().stage, vk::GraphExecutionStage::Record);
+    EXPECT_EQ(frame.advance().unwrap(), vk::FrameProgress::Pending);
+    EXPECT_EQ(frame.advance().unwrap(), vk::FrameProgress::Pending);
     frame.advance().unwrap();
     EXPECT_EQ(first->instantiated, 1u);
     EXPECT_EQ(second->instantiated, 3u);
@@ -857,7 +884,8 @@ TEST(VulkanRenderer, GraphicsDrawRebindsAndRecompilesRecipeWithDeviceCache) {
                 ->instantiate(bindings,
                               parameters.as_slice(),
                               Box<dyn<vk::GraphicsScopeBackend>>::make(vk::GraphicsScopeCache {}))
-                .unwrap();
+                .unwrap()
+                .take_ready();
         auto work = queue.Begin().unwrap();
         instance.record(work).unwrap();
         queue.wait(queue.Submit(rstd::move(work)).unwrap()).unwrap();
@@ -932,7 +960,7 @@ TEST(VulkanRenderer, TextureRegionSurvivesPendingFailureAndCancellationWithoutCo
     };
     auto update  = region(2);
     auto pending = begin(update);
-    EXPECT_EQ(pending.advance().unwrap_err().stage, vk::GraphExecutionStage::Pending);
+    EXPECT_EQ(pending.advance().unwrap(), vk::FrameProgress::Pending);
     EXPECT_EQ(update.Readiness(Some(pending.receipt())).unwrap(),
               registry::ImageReadiness::Recorded);
     pending.cancel();
@@ -1107,7 +1135,7 @@ struct SharedCompiler {
     using Pass = Native;
     Arc<dyn<vk::VulkanPass>> native;
     auto Compile(const Configuration&, const vk::PassExecutionInfo&, const vk::PassCompileContext&)
-        -> Result<Arc<dyn<vk::VulkanPass>>, vk::GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<vk::VulkanPass>>>, vk::GraphExecutionError> {
         return Ok(native.clone());
     }
 };
@@ -1196,8 +1224,8 @@ TEST(VulkanRenderer, FrameBindingRejectsAnotherCompilationSharingTheSameNativePa
     auto accepted = reused.prepare_frame(bindings, inputs.as_slice(), scopes()).unwrap();
     accepted.advance().unwrap();
     EXPECT_EQ(state->observed, 19u);
-    auto a     = first.compile_pass(prototype.clone()).unwrap();
-    auto b     = second.compile_pass(prototype.clone()).unwrap();
+    auto a     = first.compile_pass(prototype.clone()).unwrap().take_ready();
+    auto b     = second.compile_pass(prototype.clone()).unwrap().take_ready();
     auto queue = vk::TextureContext::create(session).unwrap();
     auto work  = queue.Begin().unwrap();
     EXPECT_TRUE(
@@ -1233,7 +1261,7 @@ TEST(VulkanRenderer, IndexedPendingFramesKeepSeparateInputs) {
     auto first  = capture(11);
     auto second = capture(22);
     renderer.clear();
-    EXPECT_EQ(first.advance().unwrap_err().stage, vk::GraphExecutionStage::Pending);
+    EXPECT_EQ(first.advance().unwrap(), vk::FrameProgress::Pending);
     second.advance().unwrap();
     EXPECT_EQ(state->observed, 22u);
     first.advance().unwrap();

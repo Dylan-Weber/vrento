@@ -59,21 +59,30 @@ public:
                       Vec<resource_registry::PreparedTextureUpdate> regions = {})
         -> Result<GraphFrame, GraphExecutionError> {
         auto uploaded = resources->PreparePendingUploads(work);
-        if (uploaded.is_err())
-            return Err(GraphExecutionError {
-                GraphExecutionStage::Prepare, {}, {}, VK_SUCCESS, Some(uploaded.unwrap_err()) });
+        if (uploaded.is_err()) {
+            GraphExecutionError error { GraphExecutionStage::Prepare };
+            error.cause = vrento::vulkan::GraphExecutionCause::Resource(
+                vrento::resource::ResourceErrorSnapshot(uploaded.unwrap_err()));
+            return Err(rstd::move(error));
+        }
         auto batch = Arc<resource_registry::PreparedResourceUploads>::make(uploaded.unwrap());
         for (auto& region : regions) {
             auto added = batch->Add(rstd::move(region));
             if (added.is_err())
                 return Err(GraphExecutionError {
-                    GraphExecutionStage::Prepare, {}, {}, VK_SUCCESS, Some(added.unwrap_err()) });
+                    GraphExecutionStage::Prepare,
+                    {},
+                    {},
+                    vrento::vulkan::GraphExecutionCause::Texture(added.unwrap_err()) });
         }
         work.retain(batch.clone());
         auto recorded = batch->Record(work);
-        if (recorded.is_err())
-            return Err(GraphExecutionError {
-                GraphExecutionStage::Prepare, {}, {}, VK_SUCCESS, Some(recorded.unwrap_err()) });
+        if (recorded.is_err()) {
+            GraphExecutionError error { GraphExecutionStage::Prepare };
+            error.cause = vrento::vulkan::GraphExecutionCause::Resource(
+                vrento::resource::ResourceErrorSnapshot(recorded.unwrap_err()));
+            return Err(rstd::move(error));
+        }
         for (auto& buffer : request.buffers) {
             auto binding = batch->BufferBinding(buffer.allocation);
             auto existing =
@@ -102,24 +111,23 @@ public:
         return completion_ ? Some(texture::SubmissionToken(*completion_))
                            : None<texture::SubmissionToken>();
     }
-    auto advance() -> Result<empty, GraphExecutionError> {
-        if (state_ == FrameState::Ready) return Ok(empty {});
+    auto advance() -> Result<FrameProgress, GraphExecutionError> {
+        if (state_ == FrameState::Ready) return Ok(FrameProgress::Ready);
         if (state_ != FrameState::Pending)
             return Err(
                 error_.clone().unwrap_or(GraphExecutionError { GraphExecutionStage::Prepare }));
         auto result = preparation_->advance();
         if (result.is_err()) {
-            if (result.as_ref().unwrap_err().stage == GraphExecutionStage::Pending) return result;
-            return fail(result.unwrap_err());
+            auto failed = fail(result.unwrap_err());
+            return Err(failed.unwrap_err());
         }
+        if (*result == FrameProgress::Pending) return Ok(FrameProgress::Pending);
         state_ = FrameState::Ready;
-        return Ok(empty {});
+        return Ok(FrameProgress::Ready);
     }
     auto record() -> Result<empty, GraphExecutionError> {
         if (state_ != FrameState::Ready)
-            return Err(GraphExecutionError { state_ == FrameState::Pending
-                                                 ? GraphExecutionStage::Pending
-                                                 : GraphExecutionStage::Record });
+            return Err(GraphExecutionError { GraphExecutionStage::Record });
         auto result = preparation_->program()->record(*work_);
         if (result.is_err()) return fail(result.unwrap_err());
         state_ = FrameState::Recorded;
@@ -127,12 +135,14 @@ public:
     }
     auto submit() -> Result<texture::SubmissionToken, GraphExecutionError> {
         if (state_ != FrameState::Recorded)
-            return Err(GraphExecutionError { GraphExecutionStage::Record });
+            return Err(GraphExecutionError { GraphExecutionStage::Submit });
         auto result = resources_->SubmitFrame(work_.take().unwrap());
         if (result.is_err()) {
-            auto error = GraphExecutionError {
-                GraphExecutionStage::Record, {}, {}, VK_SUCCESS, Some(result.unwrap_err())
-            };
+            auto error = GraphExecutionError { GraphExecutionStage::Submit,
+                                               {},
+                                               {},
+                                               vrento::vulkan::GraphExecutionCause::Texture(
+                                                   result.unwrap_err()) };
             (void)fail(error);
             return Err(error);
         }

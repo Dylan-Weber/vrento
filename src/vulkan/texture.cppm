@@ -4,12 +4,14 @@ export import :texture.prepare;
 export import :vulkan.device_session;
 import rstd;
 
+using namespace rstd::prelude;
+using namespace rstd::literals;
+using rstd::sync::Arc;
+using rstd::sync::Weak;
+
 export namespace vrento::vulkan
 {
 namespace tex = vrento::texture;
-using namespace rstd::prelude;
-using rstd::sync::Arc;
-using rstd::sync::Weak;
 
 inline auto texture_error(VkResult result) -> tex::Error {
     return { result == VK_ERROR_DEVICE_LOST ? tex::ErrorKind::Lost
@@ -688,8 +690,8 @@ public:
         if (signal->session.lost())
             return Err(tex::Error { tex::ErrorKind::Lost, VK_ERROR_DEVICE_LOST });
         vvk::CommandBuffer commands(command, signal->session.device().handle().Dispatch());
-        if (! uploads.RecordQueuedRegions(commands, recorded_images))
-            return Err(tex::Error { tex::ErrorKind::Backend });
+        auto               recorded = uploads.RecordQueuedRegions(commands, recorded_images);
+        if (recorded.is_err()) return Err(tex::Error::from_backend(recorded.unwrap_err()));
         return Ok(empty {});
     }
     auto RecordAccess(tex::TextureAccess use, bool emit_barrier,
@@ -890,14 +892,12 @@ public:
         auto image              = native_texture(upload.target.texture()).unwrap();
         auto bytes              = slice<rstd::uint8_t>::from_raw_parts(
             reinterpret_cast<const rstd::uint8_t*>(packed.data()), packed.len());
-        if (uploads
-                .QueueRegion(
-                    image,
-                    region,
-                    bytes,
-                    tex::format_layout(upload.target.texture().description().format).block_bytes)
-                .is_none())
-            return Err(tex::Error { tex::ErrorKind::Backend });
+        auto queued = uploads.QueueRegion(
+            image,
+            region,
+            bytes,
+            tex::format_layout(upload.target.texture().description().format).block_bytes);
+        if (queued.is_err()) return Err(tex::Error::from_backend(queued.unwrap_err()));
         return Ok(empty {});
     }
     auto UseSampledView(tex::TextureViewRef view, tex::SamplerRef sampler, tex::Stages stages)
@@ -1346,7 +1346,7 @@ inline auto recordRelease(tex::Submission& work, const DeviceSession& session,
 
 export namespace rstd
 {
-using namespace rstd::prelude;
+
 template<>
 struct Impl<vrento::texture::ResourceStatus, vrento::vulkan::TextureDeviceStatus>
     : ImplBase<vrento::vulkan::TextureDeviceStatus> {
@@ -1555,8 +1555,12 @@ auto TextureContext::CreateTexture(const tex::TextureDesc& desc)
     info.usage       = image_usage(desc.usage);
     if (desc.dimension == tex::Dimension::Cube) info.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     auto allocation = session().device().memory_allocator().create_image(info);
-    if (allocation.is_err())
-        return Err(texture_error(session().observe_result(allocation.unwrap_err().api_result)));
+    if (allocation.is_err()) {
+        auto error = allocation.unwrap_err();
+        session().observe_result(error.api_result);
+        return Err(tex::Error::from_backend(
+            { "allocate texture image"_Str, BackendCause::Memory(error) }));
+    }
     auto image = allocation.unwrap();
     auto owner = Arc<dyn<rstd::any::Any>>::make(NativeTexture(session(), rstd::move(image)));
     tex::TextureRef texture(next_texture_identity(session()), desc, rstd::move(owner));

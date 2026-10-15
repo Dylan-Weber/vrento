@@ -4,11 +4,10 @@ import :resource;
 
 using rstd::collections::HashMap;
 using rstd::sync::Arc;
+using namespace rstd::prelude;
 
 export namespace vrento::resource_registry
 {
-
-using namespace rstd::prelude;
 
 struct ShaderPhysical {
     resource::ShaderArtifact artifact;
@@ -46,7 +45,7 @@ public:
             auto entry = m_entries.get(**existing);
             if (entry.is_none()) {
                 return Err(resource::ResourceError {
-                    .kind    = resource::ResourceErrorKind::BackendFailure,
+                    .kind    = resource::ResourceErrorKind::MissingDefinition,
                     .message = rstd::format("shader registry entry is unavailable"),
                 });
             }

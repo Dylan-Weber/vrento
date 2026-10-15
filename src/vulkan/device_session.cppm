@@ -5,10 +5,11 @@ export import :vulkan.api;
 export import :resource_registry.graphics;
 import rstd;
 
-export namespace vrento::vulkan
-{
 using namespace rstd::prelude;
 using namespace rstd::literals;
+
+export namespace vrento::vulkan
+{
 
 enum class DeviceSessionStage
 {
@@ -19,8 +20,13 @@ enum class DeviceSessionStage
     Lost
 };
 struct DeviceSessionError {
-    DeviceSessionStage stage;
-    VkResult           result { VK_ERROR_INITIALIZATION_FAILED };
+    DeviceSessionStage   stage;
+    VkResult             result { VK_SUCCESS };
+    BackendErrorSnapshot cause;
+    static auto          from(DeviceSessionStage stage, BackendError error) -> DeviceSessionError {
+        auto native = error.cause.native();
+        return { stage, native, BackendErrorSnapshot(rstd::move(error)) };
+    }
 };
 using SurfaceLifetime = rstd::any::Any;
 struct GraphicsResources {
@@ -103,22 +109,31 @@ public:
             return Err(DeviceSessionError { DeviceSessionStage::Invalid });
         auto          state = rstd::sync::Arc<State>::make();
         InstanceLayer layer { true, VALIDATION_LAYER_NAME };
-        auto layers = options.validation ? slice<InstanceLayer>::from_raw_parts(&layer, usize(1))
-                                         : slice<InstanceLayer> {};
-        if (! Instance::Create(
-                state->instance, options.instance_extensions, layers, options.api_version))
-            return Err(DeviceSessionError { DeviceSessionStage::Instance });
+        auto layers   = options.validation ? slice<InstanceLayer>::from_raw_parts(&layer, usize(1))
+                                           : slice<InstanceLayer> {};
+        auto instance = Instance::TryCreate(
+            state->instance, options.instance_extensions, layers, options.api_version);
+        if (instance.is_err())
+            return Err(
+                DeviceSessionError::from(DeviceSessionStage::Instance, instance.unwrap_err()));
         if (options.validation) {
             VkDebugUtilsMessengerCreateInfoEXT info {
                 VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT
             };
-            info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
-            info.messageType     = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
-                                   VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT;
-            info.pfnUserCallback = State::validation;
-            info.pUserData       = &*state;
-            state->debug         = state->instance.inst().CreateDebugUtilsMessenger(info);
-            if (! state->debug) return Err(DeviceSessionError { DeviceSessionStage::Instance });
+            info.messageSeverity              = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+            info.messageType                  = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                                                VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT;
+            info.pfnUserCallback              = State::validation;
+            info.pUserData                    = &*state;
+            const auto&              instance = state->instance.inst();
+            VkDebugUtilsMessengerEXT handle {};
+            auto                     result = instance.Dispatch().vkCreateDebugUtilsMessengerEXT(
+                *instance, &info, nullptr, &handle);
+            if (result != VK_SUCCESS)
+                return Err(DeviceSessionError::from(
+                    DeviceSessionStage::Instance,
+                    { "create validation messenger"_Str, BackendCause::Native(result) }));
+            state->debug = vvk::DebugUtilsMessenger(handle, *instance, instance.Dispatch());
         }
         if (surface) {
             auto created = (*surface)->create(*state->instance.inst());
@@ -132,29 +147,41 @@ public:
         extensions.push({ true, "VK_KHR_timeline_semaphore"_str });
         for (const auto& extension : options.device_extensions)
             extensions.push(Extension(extension));
-        auto check = [&](const vvk::PhysicalDevice& gpu) {
-            return Device::CheckGPU(gpu, extensions.as_slice(), *state->instance.surface());
+        Option<BackendError> rejected;
+        auto                 check = [&](const vvk::PhysicalDevice& gpu) {
+            auto result =
+                Device::ValidateGPU(gpu, extensions.as_slice(), *state->instance.surface());
+            if (result.is_err()) {
+                rejected = Some(result.unwrap_err());
+                return false;
+            }
+            return true;
         };
         auto predicate = CheckGpuOp::from_ref(check);
-        if (! state->instance.ChoosePhysicalDevice(predicate.as_mut_ref(),
-                                                   options.physical_device_uuid))
-            return Err(DeviceSessionError { DeviceSessionStage::Device });
-        // UUID selection bypasses Instance's predicate, but must still meet device requirements.
-        if ((! options.physical_device_uuid.is_empty() && ! check(state->instance.gpu())) ||
-            ! Device::Create(state->instance,
-                             extensions.as_slice(),
-                             options.extent,
-                             state->device,
-                             options.swapchain))
-            return Err(DeviceSessionError { DeviceSessionStage::Device });
+        auto selected  = state->instance.TryChoosePhysicalDevice(predicate.as_mut_ref(),
+                                                                 options.physical_device_uuid);
+        if (selected.is_err()) {
+            if (rejected)
+                return Err(
+                    DeviceSessionError::from(DeviceSessionStage::Device, rejected.take().unwrap()));
+            return Err(DeviceSessionError::from(DeviceSessionStage::Device, selected.unwrap_err()));
+        }
+        auto created = Device::TryCreate(state->instance,
+                                         extensions.as_slice(),
+                                         options.extent,
+                                         state->device,
+                                         options.swapchain);
+        if (created.is_err())
+            return Err(DeviceSessionError::from(DeviceSessionStage::Device, created.unwrap_err()));
         static rstd::uint64_t next_epoch = 1;
         state->epoch                     = __atomic_fetch_add(&next_epoch, 1, __ATOMIC_RELAXED);
         if (! state->epoch) rstd::panic("device session identity exhausted");
         auto cache = state->graphics.pipelines.driver_cache().initialize(
             state->device, options.pipeline_cache_data);
         if (cache.is_err())
-            return Err(
-                DeviceSessionError { DeviceSessionStage::Device, cache.unwrap_err().native });
+            return Err(DeviceSessionError { DeviceSessionStage::Device,
+                                            cache.as_ref().unwrap_err().native,
+                                            cache.unwrap_err().cause });
         return Ok(DeviceSession(rstd::move(state)));
     }
     auto valid() const -> bool { return bool(state_); }
@@ -201,3 +228,30 @@ public:
     }
 };
 } // namespace vrento::vulkan
+
+export namespace rstd
+{
+template<>
+struct Impl<fmt::Display, vrento::vulkan::DeviceSessionError>
+    : ImplBase<vrento::vulkan::DeviceSessionError> {
+    auto fmt(fmt::Formatter& f) const -> bool {
+        return f.write_fmt(fmt::Arguments::make("device session stage={} result={}",
+                                                int(this->self().stage),
+                                                int(this->self().result)));
+    }
+};
+template<>
+struct Impl<fmt::Debug, vrento::vulkan::DeviceSessionError>
+    : ImplBase<vrento::vulkan::DeviceSessionError> {
+    auto fmt(fmt::Formatter& f) const -> bool { return as<fmt::Display>(this->self()).fmt(f); }
+};
+template<>
+struct Impl<error::Error, vrento::vulkan::DeviceSessionError>
+    : ImplBase<vrento::vulkan::DeviceSessionError> {
+    auto source() const noexcept -> Option<error::ErrorRef> {
+        const auto& e = this->self();
+        return e.cause ? Some(dyn<error::Error>::from_ref(e.cause.error()))
+                       : None<error::ErrorRef>();
+    }
+};
+} // namespace rstd

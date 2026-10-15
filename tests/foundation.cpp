@@ -422,3 +422,86 @@ TEST(RenderFoundation, OutputRecipeRetainsShaderFailure) {
     EXPECT_TRUE(error.message.as_str() == "test shader failure"_str);
 }
 } // namespace vrento_test::foundation
+
+TEST(BackendErrors, DispatchSnapshotOwnsCommandAndMemoryDetails) {
+    using Cause = vrento::vulkan::BackendCause;
+    auto make   = [] {
+        auto               command = rstd::ffi::CString::from_raw_parts("vkCreateDevice");
+        vvk::DispatchError failure {};
+        failure.kind       = vvk::DispatchErrorKind::MissingCommand;
+        failure.command    = command.as_ptr();
+        failure.api_result = VK_ERROR_INITIALIZATION_FAILED;
+        return vrento::vulkan::BackendError {
+            "create device"_Str, Cause::Dispatch(vrento::vulkan::DispatchFailure::capture(failure))
+        };
+    };
+    auto error    = make();
+    auto snapshot = vrento::vulkan::BackendErrorSnapshot(error.clone());
+    EXPECT_EQ(snapshot.error().cause.as_Dispatch().error.command.as_str(), "vkCreateDevice"_str);
+    EXPECT_EQ(snapshot.error().cause.native(), VK_ERROR_INITIALIZATION_FAILED);
+    EXPECT_TRUE(as<rstd::error::Error>(snapshot.error()).source().is_some());
+    vvk::MemoryError memory { .kind = vvk::MemoryErrorKind::PoolCapacity, .allocation_size = 4096 };
+    auto             cause = Cause::Memory(memory);
+    EXPECT_EQ(cause.clone().as_Memory().error.allocation_size, 4096u);
+}
+TEST(BackendErrors, MissingExtensionSurvivesSessionFailure) {
+    vrento::vulkan::Extension            extension { true, "VK_VRENTO_missing_extension"_str };
+    vrento::vulkan::DeviceSessionOptions options;
+    options.instance_extensions =
+        slice<vrento::vulkan::Extension>::from_raw_parts(&extension, usize(1));
+    auto result = vrento::vulkan::DeviceSession::create(options);
+    ASSERT_TRUE(result.is_err());
+    auto error = result.unwrap_err();
+    ASSERT_TRUE(error.cause);
+    ASSERT_TRUE(error.cause.error().cause.is_Unsupported());
+    EXPECT_EQ(error.cause.error().cause.as_Unsupported().capability.as_str(), extension.name);
+}
+
+TEST(BackendErrors, BufferRangeBusyAndCancellation) {
+    auto          session = DeviceSession::create({ .validation = true }).unwrap();
+    BufferManager buffers(session.device());
+    EXPECT_TRUE(buffers.TryAllocate({ .size = 16 }).unwrap_err().cause.is_Closed());
+    buffers.init();
+    EXPECT_TRUE(buffers.TryAllocate({ .size = 0 }).unwrap_err().cause.is_Invalid());
+    auto          allocation = buffers.TryAllocate({ .size = 16 }).unwrap();
+    rstd::uint8_t bytes[4] {};
+    auto          data  = slice<rstd::uint8_t>::from_raw_parts(bytes, usize(4));
+    auto          range = buffers.TryQueueWrite(allocation, data, 15).unwrap_err();
+    EXPECT_TRUE(range.cause.is_Range());
+    EXPECT_EQ(range.cause.as_Range().capacity, 16u);
+    buffers.TryQueueWrite(allocation, data).unwrap();
+    RecordedBufferUploads batch;
+    buffers.TryPreparePendingUploads(batch).unwrap();
+    EXPECT_TRUE(buffers.TryQueueWrite(allocation, data).unwrap_err().cause.is_Busy());
+    batch = vrento::vulkan::RecordedBufferUploads {};
+    buffers.TryQueueWrite(allocation, data).unwrap();
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
+TEST(BackendErrors, TextureSnapshotPreservesAllocationFailure) {
+    auto make = [] {
+        vvk::MemoryError memory { .kind            = vvk::MemoryErrorKind::PoolCapacity,
+                                  .allocation_size = 8192 };
+        return vrento::texture::Error::from_backend(
+            { "flush image upload"_Str, vrento::vulkan::BackendCause::Memory(memory) });
+    };
+    auto error    = make();
+    auto wrapped  = vrento::resource::ResourceError::texture(error, "record image upload"_Str);
+    auto snapshot = vrento::resource::ResourceErrorSnapshot(wrapped.clone());
+    wrapped       = {};
+    const auto& retained = snapshot.error().source->as_Texture().source;
+    ASSERT_TRUE(retained.backend);
+    EXPECT_EQ(retained.backend.error().cause.as_Memory().error.allocation_size, 8192u);
+    EXPECT_TRUE(as<rstd::error::Error>(retained).source().is_some());
+}
+TEST(BackendErrors, DriverCacheOwnsIoPath) {
+    vrento::vulkan::Device              device;
+    vrento::vulkan::DriverPipelineCache cache;
+    auto path  = rstd::path::PathBuf::from("/vrento-missing-directory/errors-cache-test"_str);
+    auto error = cache.load(device, path.as_path()).unwrap_err();
+    path       = rstd::path::PathBuf {};
+    ASSERT_TRUE(error.cause);
+    const auto& cause = error.cause.error().cause;
+    ASSERT_TRUE(cause.is_Io());
+    EXPECT_EQ(cause.as_Io().path.as_str(), "/vrento-missing-directory/errors-cache-test"_str);
+    EXPECT_TRUE(as<rstd::error::Error>(cause).source().is_some());
+}

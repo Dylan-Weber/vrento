@@ -104,7 +104,7 @@ public:
         -> Result<resource::DescriptorLayoutHandle, resource::ResourceError> {
         if (info.push_descriptor && ! device.capabilities().push_descriptor) {
             return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::BackendFailure,
+                .kind    = resource::ResourceErrorKind::Unsupported,
                 .message = rstd::format("push descriptors are unavailable"),
             });
         }
@@ -180,7 +180,7 @@ public:
         for (const auto& binding : info.bindings) {
             if (binding.pImmutableSamplers != nullptr) {
                 return Err(resource::ResourceError {
-                    .kind    = resource::ResourceErrorKind::MissingDefinition,
+                    .kind    = resource::ResourceErrorKind::Unsupported,
                     .message = rstd::format("immutable descriptor samplers are not supported"),
                 });
             }
@@ -456,7 +456,7 @@ struct PreparedDescriptorBinding {
         -> Result<empty, resource::ResourceError> {
         if (images.len() != next.len()) {
             return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::MissingDefinition,
+                .kind    = resource::ResourceErrorKind::IncompatibleLayout,
                 .message = rstd::format("descriptor image binding count changed"),
             });
         }
@@ -572,6 +572,7 @@ public:
         -> Result<PreparedDescriptorBinding, resource::ResourceError> {
         if (images.len() != source.images.len())
             return Err(resource::ResourceError {
+                .kind    = resource::ResourceErrorKind::IncompatibleLayout,
                 .message = rstd::format("descriptor image binding count changed") });
         for (const auto& current : source.images) {
             usize matches {};
@@ -579,6 +580,7 @@ public:
                 if (image.binding == current.binding) ++matches;
             if (matches != usize(1))
                 return Err(resource::ResourceError {
+                    .kind    = resource::ResourceErrorKind::IncompatibleLayout,
                     .message = rstd::format("descriptor image bindings changed") });
         }
         if (source.MatchesImages(images)) return Ok(source.clone());
@@ -591,6 +593,7 @@ public:
         auto layout = layouts.Resolve(source.layout);
         if (! layout)
             return Err(resource::ResourceError {
+                .kind    = resource::ResourceErrorKind::MissingDefinition,
                 .message = rstd::format("descriptor replacement layout unavailable") });
         auto replacement = Prepare(device,
                                    source.set_index,
@@ -653,7 +656,7 @@ public:
             if (! HasBinding(
                     layout.schema, image.binding, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)) {
                 return Err(resource::ResourceError {
-                    .kind    = resource::ResourceErrorKind::MissingDefinition,
+                    .kind    = resource::ResourceErrorKind::InvalidUse,
                     .message = rstd::format("descriptor image binding {} is outside the layout",
                                             image.binding),
                 });
@@ -661,7 +664,7 @@ public:
             for (usize previous {}; previous < index; ++previous) {
                 if (images[previous].binding != image.binding) continue;
                 return Err(resource::ResourceError {
-                    .kind    = resource::ResourceErrorKind::MissingDefinition,
+                    .kind    = resource::ResourceErrorKind::DuplicateUse,
                     .message = rstd::format("duplicate descriptor image binding {}", image.binding),
                 });
             }
@@ -671,7 +674,7 @@ public:
                  buffers[index].type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) ||
                 ! HasBinding(layout.schema, buffers[index].binding, buffers[index].type)) {
                 return Err(resource::ResourceError {
-                    .kind    = resource::ResourceErrorKind::MissingDefinition,
+                    .kind    = resource::ResourceErrorKind::InvalidUse,
                     .message = rstd::format("descriptor buffer binding {} is outside the layout",
                                             buffers[index].binding),
                 });
@@ -679,7 +682,7 @@ public:
             for (usize previous {}; previous < index; ++previous) {
                 if (buffers[previous].binding != buffers[index].binding) continue;
                 return Err(resource::ResourceError {
-                    .kind    = resource::ResourceErrorKind::MissingDefinition,
+                    .kind    = resource::ResourceErrorKind::DuplicateUse,
                     .message = rstd::format("duplicate descriptor buffer binding {}",
                                             buffers[index].binding),
                 });
@@ -687,7 +690,7 @@ public:
             for (const auto& image : images) {
                 if (image.binding != buffers[index].binding) continue;
                 return Err(resource::ResourceError {
-                    .kind    = resource::ResourceErrorKind::MissingDefinition,
+                    .kind    = resource::ResourceErrorKind::DuplicateUse,
                     .message = rstd::format("descriptor binding {} has multiple writes",
                                             buffers[index].binding),
                 });
@@ -801,6 +804,8 @@ private:
                 .kind    = resource::ResourceErrorKind::BackendFailure,
                 .message = rstd::format("allocate descriptor set failed: {}",
                                         static_cast<rstd::int32_t>(allocated.api_result)),
+                .source  = Some(resource::ResourceErrorSource::Native(
+                    static_cast<rstd::int32_t>(allocated.api_result))),
             });
         }
         return Ok(rstd::move(allocated.lease));

@@ -4,10 +4,11 @@ import rstd;
 import rstd.test;
 import vrento;
 
+import vrento.tests.pass_set;
+
 using namespace rstd::prelude;
 using namespace rstd::literals;
 using rstd::sync::Arc;
-import vrento.tests.pass_set;
 
 namespace tex      = vrento::texture;
 namespace vk       = vrento::vulkan;
@@ -283,7 +284,8 @@ TEST(RegistryTextureContext, UploadBeforeGraphKeepsDescriptionsAndRequiresSameSu
                           Box<dyn<vk::GraphicsScopeBackend>>::make(vk::GraphicsScopeCache {}),
                           true,
                           &work)
-            .unwrap();
+            .unwrap()
+            .take_ready();
     {
         auto unrelated = textures.Context().Begin().unwrap();
         EXPECT_EQ(frame.record(unrelated).unwrap_err().stage, vk::GraphExecutionStage::Binding);
@@ -307,19 +309,22 @@ TEST(RenderResourceSystem, PreparedUploadsRequireTheirFrame) {
     auto first     = resources.BeginFrame().unwrap();
     auto unrelated = foreign.Begin().unwrap();
     rstd_assert(resources.PreparePendingUploads(unrelated).unwrap_err().kind ==
-                tex::ErrorKind::Invalid);
+                vrento::resource::ResourceErrorKind::Invalid);
     auto cancelled = resources.PreparePendingUploads(first).unwrap();
-    rstd_assert(cancelled.Record(unrelated).unwrap_err().kind == tex::ErrorKind::Invalid);
+    rstd_assert(cancelled.Record(unrelated).unwrap_err().kind ==
+                vrento::resource::ResourceErrorKind::Invalid);
     first.discard();
     auto retry = resources.BeginFrame().unwrap();
-    rstd_assert(cancelled.Record(retry).unwrap_err().kind == tex::ErrorKind::Invalid);
+    rstd_assert(cancelled.Record(retry).unwrap_err().kind ==
+                vrento::resource::ResourceErrorKind::Invalid);
     auto omitted = resources.PreparePendingUploads(retry).unwrap();
     rstd_assert(resources.SubmitFrame(rstd::move(retry)).unwrap_err().kind ==
                 tex::ErrorKind::Invalid);
     auto final = resources.BeginFrame().unwrap();
     auto ready = resources.PreparePendingUploads(final).unwrap();
     ready.Record(final).unwrap();
-    rstd_assert(ready.Record(final).unwrap_err().kind == tex::ErrorKind::Invalid);
+    rstd_assert(ready.Record(final).unwrap_err().kind ==
+                vrento::resource::ResourceErrorKind::Invalid);
     resources.TextureContext().wait(resources.SubmitFrame(rstd::move(final)).unwrap()).unwrap();
     resources.Reset();
     rstd_assert(session.validation_errors() == 0);
@@ -515,9 +520,7 @@ TEST(MediaRegistry, ContinuousPlaybackKeepsStableTexture) {
     auto playback    = Arc<dyn<vrento::VideoPlayback>>::make(control.clone());
     auto preparation = media.Prepare(context, image, Some(playback.clone()));
     if (preparation.is_err())
-        rstd::io::eprintln("media preparation failed: kind={} native={}",
-                           int(preparation.unwrap_err().kind),
-                           preparation.unwrap_err().native);
+        rstd::io::eprintln("media preparation failed: {}", preparation.as_ref().unwrap_err());
     auto prepared = rstd::move(preparation).unwrap();
     auto identity = prepared.view.texture().identity();
     auto initial  = context.Begin().unwrap();
@@ -870,3 +873,46 @@ TEST(RenderResourceSystem, StableReferencesKeepStoragePolicyAndOldPreparedAlloca
     EXPECT_EQ(session.validation_errors(), 0u);
 }
 } // namespace vrento_test::texture_registry
+
+TEST(MediaRegistry, OpenFailureOwnsDecoderDiagnostic) {
+    array<vk::Extension, 2> extensions { vk::Extension { true, "VK_KHR_external_memory_fd"_str },
+                                         vk::Extension { true,
+                                                         "VK_KHR_external_semaphore_fd"_str } };
+    auto session = vk::DeviceSession::create({ .device_extensions = extensions.as_slice(),
+                                               .api_version       = VK_API_VERSION_1_3,
+                                               .validation        = true })
+                       .unwrap();
+    auto context = vk::TextureContext::create(session).unwrap();
+    vk::MediaRegistry media(session, { "none"_Str, {} });
+    auto              dir = rstd::fs::TempDir::make("vrento-invalid-video"_str).unwrap();
+    auto              path =
+        rstd::path::PathBuf::from(dir.path().as_os_str().to_os_string()).join("invalid.bin"_str);
+    rstd::fs::write(path.as_path(), "not a video"_str.as_bytes()).unwrap();
+    auto          file = rstd::fs::File::open(path.as_path()).unwrap();
+    auto          size = file.metadata().unwrap().len();
+    vrento::Image input;
+    input.header.kind = vrento::ImageKind::Video;
+    input.key         = "invalid-video"_Str;
+    vrento::Image::Slot slot;
+    slot.width  = 16;
+    slot.height = 16;
+    vrento::ImageData data;
+    data.width  = 16;
+    data.height = 16;
+    data.video_source =
+        Some(rstd::io::ReadRange::make(rstd::io::SharedReadAt::make(rstd::move(file)), u64(), size)
+                 .unwrap());
+    slot.mipmaps.push(rstd::move(data));
+    input.slots.push(rstd::move(slot));
+    auto failed = media.Prepare(context, input);
+    ASSERT_TRUE(failed.is_err());
+    auto error = failed.unwrap_err();
+    EXPECT_EQ(error.operation, tex::MediaOperation::Open);
+    ASSERT_TRUE(error.cause.is_Decoder());
+    EXPECT_FALSE(error.cause.as_Decoder().message.is_empty());
+    auto snapshot = vrento::resource::ResourceErrorSnapshot(
+        vrento::resource::ResourceError::media(rstd::move(error)));
+    media.Clear();
+    EXPECT_FALSE(snapshot.error().source->as_Media().source.cause.as_Decoder().message.is_empty());
+    EXPECT_EQ(session.validation_errors(), 0u);
+}

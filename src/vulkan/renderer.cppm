@@ -2,6 +2,7 @@ export module vrento:vulkan.renderer;
 export import :vulkan.pass.compiled;
 export import :vulkan.pass.factory;
 import rstd;
+
 using rstd::sync::Arc;
 
 export namespace vrento::vulkan
@@ -93,7 +94,7 @@ public:
                                                    : compiled_pass_.is_some());
     }
     auto compile(GraphInput input, Option<Arc<GraphicsCompileResources>> resources = None())
-        -> Result<empty, GraphExecutionError> {
+        -> Result<CompileProgress, GraphExecutionError> {
         cancel_compile();
         ++statistics_.compile_requests;
         status_ = { ++next_compile_id_,
@@ -105,7 +106,7 @@ public:
     }
     auto compile(fg::FrameGraph graph, Vec<PassInput> descriptions,
                  Option<Arc<GraphicsCompileResources>> resources = None())
-        -> Result<empty, GraphExecutionError> {
+        -> Result<CompileProgress, GraphExecutionError> {
         pass::GraphResourceMap mapping { .scope = graph.scope() };
         for (const auto& node : graph.passes())
             for (const auto& use : node.uses) mapping.externals.push(fg::ResourceUse(use));
@@ -115,31 +116,34 @@ public:
             cancel_compile();
             ++statistics_.compile_requests;
             status_ = { ++next_compile_id_, CompileState::Pending, None(), CompileKind::Graph };
-            return finish_compile(Err(GraphExecutionError { GraphExecutionStage::Schema,
-                                                            input.unwrap_err().pass,
-                                                            input.unwrap_err().resource,
-                                                            VK_SUCCESS,
-                                                            None(),
-                                                            Some(input.unwrap_err()) }));
+            return finish_compile(Err(GraphExecutionError {
+                GraphExecutionStage::Schema,
+                input.unwrap_err().pass,
+                input.unwrap_err().resource,
+                vrento::vulkan::GraphExecutionCause::Graph(input.unwrap_err()) }));
         }
         return compile(input.unwrap(), rstd::move(resources));
     }
-    auto continue_compile(GraphSerial id) -> Result<empty, GraphExecutionError> {
+    auto continue_compile(GraphSerial id) -> Result<CompileProgress, GraphExecutionError> {
         if (id != status_.id || status_.state != CompileState::Pending || ! pending_)
-            return Err(GraphExecutionError { GraphExecutionStage::Prepare });
+            return Err(GraphExecutionError {
+                GraphExecutionStage::Prepare,
+                {},
+                {},
+                GraphExecutionCause::Reason(GraphFailure::StaleTransaction) });
         return finish_compile(advance_compile());
     }
 
 private:
-    auto finish_compile(Result<empty, GraphExecutionError> result)
-        -> Result<empty, GraphExecutionError> {
+    auto finish_compile(Result<CompileProgress, GraphExecutionError> result)
+        -> Result<CompileProgress, GraphExecutionError> {
         if (result.is_ok()) {
-            status_.state = CompileState::Ready;
+            status_.state =
+                *result == CompileProgress::Ready ? CompileState::Ready : CompileState::Pending;
             status_.error = None();
         } else {
             const auto& error = result.as_ref().unwrap_err();
-            status_.state     = error.stage == GraphExecutionStage::Pending ? CompileState::Pending
-                                                                            : CompileState::Failed;
+            status_.state     = CompileState::Failed;
             status_.error     = Some(GraphExecutionError(error));
             if (status_.state == CompileState::Failed) {
                 ++statistics_.compile_failures;
@@ -149,11 +153,16 @@ private:
         return result;
     }
     auto begin_compile(GraphInput input, Option<Arc<GraphicsCompileResources>> resources = None())
-        -> Result<empty, GraphExecutionError> {
+        -> Result<CompileProgress, GraphExecutionError> {
         auto graph        = input.graph();
         auto descriptions = input.descriptions();
         if (! session_.valid() || session_.lost())
-            return Err(GraphExecutionError { GraphExecutionStage::Device });
+            return Err(GraphExecutionError {
+                GraphExecutionStage::Device,
+                {},
+                {},
+                session_.lost() ? GraphExecutionCause::Native(VK_ERROR_DEVICE_LOST)
+                                : GraphExecutionCause::Reason(GraphFailure::Closed) });
         for (usize i {}; i < descriptions.len(); ++i) {
             const auto& input = descriptions[i];
             if (input.scope() != graph.scope() || ! input.revision() ||
@@ -194,7 +203,7 @@ private:
                     else {
                         status_.reason = CompileReason::Reused;
                         ++statistics_.graph_reuses;
-                        return Ok(empty {});
+                        return Ok(CompileProgress::Ready);
                     }
                 }
             }
@@ -209,12 +218,11 @@ private:
         }
         auto set = VulkanPassSet::associate(rstd::move(graph), rstd::move(declarations));
         if (set.is_err())
-            return Err(GraphExecutionError { GraphExecutionStage::Graph,
-                                             set.unwrap_err().pass,
-                                             set.unwrap_err().resource,
-                                             VK_SUCCESS,
-                                             None(),
-                                             Some(set.unwrap_err()) });
+            return Err(GraphExecutionError {
+                GraphExecutionStage::Graph,
+                set.unwrap_err().pass,
+                set.unwrap_err().resource,
+                vrento::vulkan::GraphExecutionCause::Graph(set.unwrap_err()) });
         for (const auto& desc : descriptions) {
             bool found {};
             for (const auto& entry : factories_) found |= entry.type == desc.type();
@@ -230,13 +238,18 @@ private:
 public:
     auto compile_pass(PassInput                             description,
                       Option<Arc<GraphicsCompileResources>> resources = None())
-        -> Result<CompiledPass, GraphExecutionError> {
+        -> Result<Preparation<CompiledPass>, GraphExecutionError> {
         cancel_compile();
         ++statistics_.compile_requests;
         status_ = { ++next_compile_id_, CompileState::Pending, None(),
                     CompileKind::Pass,  description.scope(),   CompileReason::Standalone };
         if (! session_.valid() || session_.lost()) {
-            auto failed = finish_compile(Err(GraphExecutionError { GraphExecutionStage::Device }));
+            auto failed = finish_compile(Err(GraphExecutionError {
+                GraphExecutionStage::Device,
+                {},
+                {},
+                session_.lost() ? GraphExecutionCause::Native(VK_ERROR_DEVICE_LOST)
+                                : GraphExecutionCause::Reason(GraphFailure::Closed) }));
             return Err(failed.unwrap_err());
         }
         if (! description.scope() || ! description.revision()) {
@@ -250,16 +263,20 @@ public:
             PendingCompile { None(), None(), rstd::move(descriptions), {}, rstd::move(resources) });
         auto result = finish_compile(advance_compile());
         if (result.is_err()) return Err(result.unwrap_err());
+        if (*result == CompileProgress::Pending) return Ok(PendingPreparation {});
         return Ok(CompiledPass(*compiled_pass_));
     }
 
 private:
-    auto advance_compile() -> Result<empty, GraphExecutionError> {
+    auto advance_compile() -> Result<CompileProgress, GraphExecutionError> {
         if (! pending_) return Err(GraphExecutionError { GraphExecutionStage::Prepare });
         if (session_.lost()) {
             pending_ = None();
-            return Err(
-                GraphExecutionError { GraphExecutionStage::Device, {}, {}, VK_ERROR_DEVICE_LOST });
+            return Err(GraphExecutionError {
+                GraphExecutionStage::Device,
+                {},
+                {},
+                vrento::vulkan::GraphExecutionCause::Native(VK_ERROR_DEVICE_LOST) });
         }
         ++statistics_.pending_polls;
         auto&              pending = *pending_;
@@ -275,18 +292,20 @@ private:
                     if (result.is_err()) {
                         auto error = result.unwrap_err();
                         error.pass = desc.execution().id;
-                        if (error.stage != GraphExecutionStage::Pending) pending_ = None();
+                        pending_   = None();
                         return Err(error);
                     }
+                    if (! result->ready()) return Ok(CompileProgress::Pending);
+                    auto completed = result->take_ready();
                     ++statistics_.native_completed;
-                    if (result->as_ptr().as_ptr().as_ref().concrete_type_id() !=
+                    if (completed.as_ptr().as_ptr().as_ref().concrete_type_id() !=
                         entry.factory->PassType()) {
                         auto id  = desc.execution().id;
                         pending_ = None();
                         return Err(GraphExecutionError { GraphExecutionStage::Schema, id });
                     }
                     factory = Some(entry.factory.clone());
-                    native  = Some(rstd::move(result).unwrap());
+                    native  = Some(rstd::move(completed));
                     break;
                 }
             if (! native) {
@@ -318,7 +337,7 @@ private:
                                                            execution_.clone())));
         }
         pending_ = None();
-        return Ok(empty {});
+        return Ok(CompileProgress::Ready);
     }
 
 public:

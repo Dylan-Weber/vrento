@@ -9,6 +9,7 @@ module;
 export module vrento:vulkan.media;
 export import :vulkan.texture;
 export import :texture.video_playback;
+export import :texture.media_error;
 import rstd;
 import rstd.log;
 import wavsen.video;
@@ -18,6 +19,9 @@ using namespace rstd::literals;
 using rstd::ffi::CString;
 using rstd::sync::Arc;
 using rstd::sync::Weak;
+
+using vrento::texture::MediaError;
+using vrento::texture::MediaOperation;
 
 export namespace vrento::vulkan
 {
@@ -43,7 +47,7 @@ struct MediaTextureProducer {
     template<typename Self, typename = void>
     struct Api {
         using Trait = MediaTextureProducer;
-        auto Pump(TextureContext& context, double seconds) -> Result<bool, tex::Error> {
+        auto Pump(TextureContext& context, double seconds) -> Result<bool, MediaError> {
             return rstd::trait_call<0>(this, context, seconds);
         }
         auto ContentRevision() const -> u64 { return rstd::trait_call<1>(this); }
@@ -66,9 +70,9 @@ public:
     explicit MediaRegistry(DeviceSession session, MediaDecodeOptions options = {});
     auto Prepare(TextureContext& context, const Image& image,
                  Option<Arc<dyn<VideoPlayback>>> playback = None())
-        -> Result<PreparedMediaTexture, tex::Error>;
-    auto Pump(TextureContext& context, double seconds) -> Result<usize, tex::Error>;
-    auto Drain(u64 timeout_ns) -> Result<empty, tex::Error>;
+        -> Result<PreparedMediaTexture, MediaError>;
+    auto Pump(TextureContext& context, double seconds) -> Result<usize, MediaError>;
+    auto Drain(u64 timeout_ns) -> Result<empty, MediaError>;
     void SetOptions(MediaDecodeOptions options);
     void Clear();
 
@@ -317,7 +321,7 @@ struct MediaRegistry::State {
         Arc<State>                               shared_state;
         Weak<Runtime>                            self { Weak<Runtime>::make() };
         tex::TextureViewRef                      typed_target;
-        Option<tex::Error>                       error;
+        Option<MediaError>                       error;
         bool                                     updated { false };
         u64                                      content_revision {};
         String                                   key;
@@ -350,6 +354,7 @@ struct MediaRegistry::State {
         f64  last_pts { -1.0 };
         bool have_frame { false };
         u64  applied_seek_sequence {};
+        u64  attempted_seek_sequence {};
 
         auto device() const -> const Device& { return shared_state->session.device(); }
         void Pump(TextureContext& context, double dt_seconds);
@@ -372,9 +377,10 @@ struct MediaRegistry::State {
         return producer->get();
     }
 
-    wavsen::video::YuvToRgba* ensureYuv(rstd::uint32_t width, rstd::uint32_t height) {
+    auto ensureYuv(rstd::uint32_t width, rstd::uint32_t height) -> Result<empty, MediaError> {
         const auto& device = session.device();
-        if (yuv.is_some() && width <= yuv_max_width && height <= yuv_max_height) return yuv->get();
+        if (yuv.is_some() && width <= yuv_max_width && height <= yuv_max_height)
+            return Ok(empty {});
         auto next_w = rstd::cmp::max(yuv_max_width, width);
         auto next_h = rstd::cmp::max(yuv_max_height, height);
         auto r      = wavsen::video::YuvToRgba::create(device.instance_dispatch(),
@@ -384,16 +390,14 @@ struct MediaRegistry::State {
                                                        *device.graphics_queue().handle,
                                                        u32(next_w),
                                                        u32(next_h));
-        if (r.is_err()) {
-            rstd_error("MediaRegistry::Prepare: YuvToRgba create failed: {}",
-                       rstd::move(r).unwrap_err().message);
-            return nullptr;
-        }
+        if (r.is_err())
+            return Err(
+                MediaError::decoder(MediaOperation::Prepare, rstd::move(r).unwrap_err().message));
         yuv = rstd::Some(rstd::move(r).unwrap());
         (void)yuv_completion.take();
         yuv_max_width  = next_w;
         yuv_max_height = next_h;
-        return yuv->get();
+        return Ok(empty {});
     }
 };
 
@@ -633,9 +637,9 @@ bool MediaRegistry::State::Runtime::upload_apple_frame(
 
 struct MediaProducerLease {
     Arc<MediaRegistry::State::Runtime> runtime;
-    auto Pump(TextureContext& context, double seconds) -> Result<bool, tex::Error> {
+    auto Pump(TextureContext& context, double seconds) -> Result<bool, MediaError> {
         runtime->Pump(context, seconds);
-        if (runtime->error.is_some()) return Err(*runtime->error);
+        if (runtime->error.is_some()) return Err(runtime->error->clone());
         return Ok(runtime->updated);
     }
     auto ContentRevision() const -> u64 { return runtime->content_revision; }
@@ -659,7 +663,7 @@ template<>
 struct Impl<vrento::vulkan::MediaTextureProducer, vrento::vulkan::MediaProducerLease>
     : ImplBase<vrento::vulkan::MediaProducerLease> {
     auto Pump(vrento::vulkan::TextureContext& context, double seconds)
-        -> Result<bool, vrento::texture::Error> {
+        -> Result<bool, vrento::texture::MediaError> {
         return self().Pump(context, seconds);
     }
     auto ContentRevision() const -> u64 { return self().ContentRevision(); }
@@ -674,7 +678,7 @@ void MediaRegistry::State::Runtime::Pump(TextureContext& context, double dt_seco
     error   = None();
     if (decoder.is_none()) return;
     if (context.session().epoch() != shared_state->session.epoch()) {
-        error = Some(tex::Error { tex::ErrorKind::DeviceMismatch });
+        error = Some(MediaError::texture(tex::Error { tex::ErrorKind::DeviceMismatch }));
         return;
     }
     auto& s            = *this;
@@ -685,17 +689,19 @@ void MediaRegistry::State::Runtime::Pump(TextureContext& context, double dt_seco
     };
     if (s.playback.is_some()) {
         auto state = (*s.playback)->Snapshot();
-        if (state.seek_sequence != s.applied_seek_sequence) {
-            auto seeked             = (*s.decoder)->seek(state.seek_seconds);
-            s.applied_seek_sequence = state.seek_sequence;
+        if (state.seek_sequence != s.attempted_seek_sequence) {
+            auto seeked               = (*s.decoder)->seek(state.seek_seconds);
+            s.attempted_seek_sequence = state.seek_sequence;
             if (seeked.is_err()) {
-                rstd_error("PumpVideoTextures[{}]: seek: {}",
-                           s.key.as_str(),
-                           rstd::move(seeked).unwrap_err().message);
+                error = Some(MediaError::decoder(MediaOperation::Seek,
+                                                 rstd::move(seeked).unwrap_err().message));
+                publish_time();
+                return;
             } else {
-                s.pts_acc    = state.seek_seconds;
-                s.last_pts   = f64(-1.0);
-                s.have_frame = false;
+                s.applied_seek_sequence = state.seek_sequence;
+                s.pts_acc               = state.seek_seconds;
+                s.last_pts              = f64(-1.0);
+                s.have_frame            = false;
             }
         }
         if (! state.playing) {
@@ -709,7 +715,13 @@ void MediaRegistry::State::Runtime::Pump(TextureContext& context, double dt_seco
     const auto                fkind = (*s.decoder)->kind();
     wavsen::video::YuvToRgba* yuv   = nullptr;
     if (fkind != wavsen::video::FrameKind::VideoToolbox) {
-        yuv = shared_state->ensureYuv(s.width, s.height);
+        auto converted = shared_state->ensureYuv(s.width, s.height);
+        if (converted.is_err()) {
+            error = Some(converted.unwrap_err());
+            publish_time();
+            return;
+        }
+        yuv = shared_state->yuv->get();
     }
     if (! yuv && fkind != wavsen::video::FrameKind::VideoToolbox) {
         publish_time();
@@ -764,11 +776,10 @@ void MediaRegistry::State::Runtime::Pump(TextureContext& context, double dt_seco
         case wavsen::video::FrameKind::Sw: r = (*s.decoder)->next_frame(s.nv12_scratch); break;
         }
         if (r.is_err()) {
-            rstd_error("PumpVideoTextures[{}]: decode {}: {}",
-                       s.key.as_str(),
-                       FrameKindLabel(fkind),
-                       rstd::move(r).unwrap_err().message);
-            break;
+            error = Some(
+                MediaError::decoder(MediaOperation::Decode, rstd::move(r).unwrap_err().message));
+            publish_time();
+            return;
         }
         auto kind = r.unwrap();
         if (kind == wavsen::video::NextFrame::Eof) {
@@ -781,8 +792,9 @@ void MediaRegistry::State::Runtime::Pump(TextureContext& context, double dt_seco
         switch (fkind) {
         case wavsen::video::FrameKind::VulkanShared:
             if (vulkan_frame.is_none()) {
-                rstd_error("PumpVideoTextures[{}]: Vulkan decode returned no frame lease",
-                           s.key.as_str());
+                error = Some(MediaError {
+                    MediaOperation::Decode,
+                    tex::MediaCause::Invalid("Vulkan decoder returned no lease"_Str) });
                 publish_time();
                 return;
             }
@@ -790,8 +802,9 @@ void MediaRegistry::State::Runtime::Pump(TextureContext& context, double dt_seco
             break;
         case wavsen::video::FrameKind::VaapiDrm:
             if (vaapi_frame.is_none()) {
-                rstd_error("PumpVideoTextures[{}]: VAAPI decode returned no surface lease",
-                           s.key.as_str());
+                error = Some(
+                    MediaError { MediaOperation::Decode,
+                                 tex::MediaCause::Invalid("VAAPI decoder returned no lease"_Str) });
                 publish_time();
                 return;
             }
@@ -799,8 +812,9 @@ void MediaRegistry::State::Runtime::Pump(TextureContext& context, double dt_seco
             break;
         case wavsen::video::FrameKind::VideoToolbox:
             if (apple_frame.is_none()) {
-                rstd_error("PumpVideoTextures[{}]: VideoToolbox decode returned no frame lease",
-                           s.key.as_str());
+                error = Some(MediaError {
+                    MediaOperation::Decode,
+                    tex::MediaCause::Invalid("VideoToolbox decoder returned no lease"_Str) });
                 publish_time();
                 return;
             }
@@ -848,7 +862,7 @@ void MediaRegistry::State::Runtime::Pump(TextureContext& context, double dt_seco
 
     auto runtime_owner = self.upgrade();
     if (! runtime_owner) {
-        error = Some(tex::Error { tex::ErrorKind::Closed });
+        error = Some(MediaError::texture(tex::Error { tex::ErrorKind::Closed }));
         return;
     }
     auto final         = native_access({ tex::Access::Sampled, tex::Stages::Fragment });
@@ -861,7 +875,7 @@ void MediaRegistry::State::Runtime::Pump(TextureContext& context, double dt_seco
     });
     if (reserved.is_err()) {
         auto failure = reserved.unwrap_err();
-        if (failure.kind != tex::ErrorKind::Busy) error = Some(failure);
+        if (failure.kind != tex::ErrorKind::Busy) error = Some(MediaError::texture(failure));
         return;
     }
     auto        write        = rstd::move(reserved).unwrap();
@@ -869,21 +883,22 @@ void MediaRegistry::State::Runtime::Pump(TextureContext& context, double dt_seco
     if (target_state.initial.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
         (target_state.initial.queue_family != VK_QUEUE_FAMILY_IGNORED &&
          target_state.initial.queue_family != device().graphics_queue().family_index)) {
-        error = Some(tex::Error { tex::ErrorKind::Invalid });
+        error = Some(MediaError::texture(tex::Error { tex::ErrorKind::Invalid }));
         return;
     }
     // wavsen cannot consume target waits; don't overwrite an unfinished renderer read.
     auto ready = target_state.dependency.poll();
     if (ready.is_err()) {
-        error = Some(ready.unwrap_err());
+        error = Some(MediaError::texture(ready.unwrap_err()));
         return;
     }
     if (! ready.unwrap()) return;
     const auto ip = target_state.image;
 
     Option<wavsen::video::ConversionSubmission> converted_frame;
-    bool                                        submit_attempted = false;
-    rstd::Result<int, wavsen::video::Error>     cv               = rstd::Ok(-1);
+    bool                                        submit_attempted  = false;
+    rstd::Result<int, wavsen::video::Error>     cv                = rstd::Ok(-1);
+    auto                                        failure_operation = MediaOperation::Convert;
     switch (fkind) {
     case wavsen::video::FrameKind::VulkanShared: {
         auto reserved = yuv->reserve({
@@ -934,13 +949,15 @@ void MediaRegistry::State::Runtime::Pump(TextureContext& context, double dt_seco
             publish_time();
             return;
         }
-        auto mapped = rstd::move(*vaapi_frame).into_drm();
+        failure_operation = MediaOperation::Import;
+        auto mapped       = rstd::move(*vaapi_frame).into_drm();
         if (mapped.is_err()) {
             cv = Err(rstd::move(mapped).unwrap_err());
             break;
         }
-        submit_attempted = true;
-        auto submitted   = yuv->submit_drm_prime(
+        failure_operation = MediaOperation::Convert;
+        submit_attempted  = true;
+        auto submitted    = yuv->submit_drm_prime(
             rstd::move(*reservation), rstd::move(mapped).unwrap(), color_matrix);
         if (submitted.is_err()) {
             cv = Err(rstd::move(submitted).unwrap_err());
@@ -987,11 +1004,7 @@ void MediaRegistry::State::Runtime::Pump(TextureContext& context, double dt_seco
     }
     if (cv.is_err()) {
         if (submit_attempted) write.uncertain();
-        error = Some(tex::Error { tex::ErrorKind::Backend });
-        rstd_error("PumpVideoTextures[{}]: yuv conversion {}: {}",
-                   s.key.as_str(),
-                   FrameKindLabel(fkind),
-                   rstd::move(cv).unwrap_err().message);
+        error = Some(MediaError::decoder(failure_operation, rstd::move(cv).unwrap_err().message));
         publish_time();
         return;
     }
@@ -1007,7 +1020,7 @@ void MediaRegistry::State::Runtime::Pump(TextureContext& context, double dt_seco
         converted_frame->execution_dependency.signal_queue().device !=
             vvk::OpaqueHandleIdentity(*device().handle())) {
         write.uncertain();
-        error = Some(tex::Error { tex::ErrorKind::Invalid });
+        error = Some(MediaError::texture(tex::Error { tex::ErrorKind::Invalid }));
         publish_time();
         return;
     }
@@ -1019,14 +1032,14 @@ void MediaRegistry::State::Runtime::Pump(TextureContext& context, double dt_seco
                                  rstd::move(completion_owner));
     if (dependency.is_err()) {
         write.uncertain();
-        error = Some(dependency.unwrap_err());
+        error = Some(MediaError::texture(dependency.unwrap_err()));
         publish_time();
         return;
     }
     auto committed = context.CommitProducerWrite(write, rstd::move(dependency).unwrap());
     if (committed.is_err()) {
         write.uncertain();
-        error = Some(committed.unwrap_err());
+        error = Some(MediaError::texture(committed.unwrap_err()));
         publish_time();
         return;
     }
@@ -1041,12 +1054,15 @@ MediaRegistry::MediaRegistry(DeviceSession session, MediaDecodeOptions options)
 
 auto OpenMediaRuntime(Arc<MediaRegistry::State> state, const Image& image, tex::TextureViewRef view,
                       Option<Arc<dyn<VideoPlayback>>> playback)
-    -> Option<Arc<MediaRegistry::State::Runtime>> {
+    -> Result<Arc<MediaRegistry::State::Runtime>, MediaError> {
     if (image.header.kind != ImageKind::Video || image.slots.is_empty() ||
         image.slots[usize()].mipmaps.is_empty())
-        return None();
+        return Err(MediaError { MediaOperation::Open,
+                                tex::MediaCause::Invalid("invalid video input"_Str) });
     const auto& mip = image.slots[usize()].mipmaps[usize()];
-    if (mip.video_source.is_none() || mip.width <= 0 || mip.height <= 0) return None();
+    if (mip.video_source.is_none() || mip.width <= 0 || mip.height <= 0)
+        return Err(MediaError { MediaOperation::Open,
+                                tex::MediaCause::Invalid("invalid video input"_Str) });
     auto                          video_source = mip.video_source->clone();
     auto*                         registry     = rstd::addressof(*state);
     MediaRegistry::State::Runtime runtime(state.clone(), rstd::move(view));
@@ -1057,7 +1073,8 @@ auto OpenMediaRuntime(Arc<MediaRegistry::State> state, const Image& image, tex::
     runtime.height   = extent.height;
     runtime.playback = rstd::move(playback);
 #if ! __is_target_os(macos)
-    if (! registry->ensureYuv(runtime.width, runtime.height)) return None();
+    auto converted = registry->ensureYuv(runtime.width, runtime.height);
+    if (converted.is_err()) return Err(converted.unwrap_err());
 #endif
     auto factory = Box<dyn<FnMut<Box<dyn<wavsen::video::InputStream>>()>>>::make(
         [source = rstd::move(video_source)]() -> Box<dyn<wavsen::video::InputStream>> {
@@ -1084,17 +1101,14 @@ auto OpenMediaRuntime(Arc<MediaRegistry::State> state, const Image& image, tex::
                                                                /*loop=*/true,
                                                                producer,
                                                                opts);
-    if (dec_r.is_err()) {
-        rstd_error("MediaRegistry::Prepare: open_from_stream failed for {}: {}",
-                   image.key,
-                   dec_r.unwrap_err().message);
-        return None();
-    }
+    if (dec_r.is_err())
+        return Err(
+            MediaError::decoder(MediaOperation::Open, rstd::move(dec_r).unwrap_err().message));
     runtime.decoder = rstd::Some(rstd::move(dec_r).unwrap());
 #if __is_target_os(macos)
-    if ((*runtime.decoder)->kind() != wavsen::video::FrameKind::VideoToolbox &&
-        ! registry->ensureYuv(runtime.width, runtime.height)) {
-        return None();
+    if ((*runtime.decoder)->kind() != wavsen::video::FrameKind::VideoToolbox) {
+        auto converted = registry->ensureYuv(runtime.width, runtime.height);
+        if (converted.is_err()) return Err(converted.unwrap_err());
     }
 #endif
     if (runtime.playback.is_some()) {
@@ -1108,35 +1122,36 @@ auto OpenMediaRuntime(Arc<MediaRegistry::State> state, const Image& image, tex::
     auto owned  = Arc<MediaRegistry::State::Runtime>::make(rstd::move(runtime));
     owned->self = owned.downgrade();
     state->runtimes.push(owned.downgrade());
-    return Some(rstd::move(owned));
+    return Ok(rstd::move(owned));
 }
 
 auto MediaRegistry::Prepare(TextureContext& context, const Image& image,
                             Option<Arc<dyn<VideoPlayback>>> playback)
-    -> Result<PreparedMediaTexture, tex::Error> {
+    -> Result<PreparedMediaTexture, MediaError> {
     if (context.session().epoch() != state_->session.epoch())
-        return Err(tex::Error { tex::ErrorKind::DeviceMismatch });
+        return Err(MediaError::texture(tex::Error { tex::ErrorKind::DeviceMismatch }));
     if (image.header.kind != ImageKind::Video || image.slots.is_empty() ||
         image.slots[usize()].mipmaps.is_empty())
-        return Err(tex::Error { tex::ErrorKind::Invalid });
+        return Err(MediaError::texture(tex::Error { tex::ErrorKind::Invalid }));
     const auto& mip = image.slots[usize()].mipmaps[usize()];
     if (mip.video_source.is_none() || mip.width <= 0 || mip.height <= 0)
-        return Err(tex::Error { tex::ErrorKind::Invalid });
+        return Err(MediaError::texture(tex::Error { tex::ErrorKind::Invalid }));
     tex::TextureDesc desc;
     desc.extent = { (tex::Count(mip.width) + 1u) & ~1u, (tex::Count(mip.height) + 1u) & ~1u };
     desc.format = TextureFormat::RGBA8;
     desc.usage  = tex::Usage::Sampled | tex::Usage::Storage | tex::Usage::TransferDestination;
     auto pixels = rstd::uint64_t(desc.extent.width) * rstd::uint64_t(desc.extent.height);
-    if (pixels > usize::MAX.to_primitive() / 4u) return Err(tex::Error { tex::ErrorKind::Invalid });
+    if (pixels > usize::MAX.to_primitive() / 4u)
+        return Err(MediaError::texture(tex::Error { tex::ErrorKind::Invalid }));
     auto texture = context.CreateTexture(desc);
-    if (texture.is_err()) return Err(texture.unwrap_err());
+    if (texture.is_err()) return Err(MediaError::texture(texture.unwrap_err()));
     auto view = context.CreateView(texture.unwrap(), {});
-    if (view.is_err()) return Err(view.unwrap_err());
+    if (view.is_err()) return Err(MediaError::texture(view.unwrap_err()));
     auto target  = rstd::move(view).unwrap();
     auto sampler = context.CreateSampler({ image.header.sample });
-    if (sampler.is_err()) return Err(sampler.unwrap_err());
+    if (sampler.is_err()) return Err(MediaError::texture(sampler.unwrap_err()));
     auto runtime = OpenMediaRuntime(state_.clone(), image, target, rstd::move(playback));
-    if (runtime.is_none()) return Err(tex::Error { tex::ErrorKind::Backend });
+    if (runtime.is_err()) return Err(runtime.unwrap_err());
     tex::TextureUpload upload;
     upload.target = target;
     upload.width  = desc.extent.width;
@@ -1158,9 +1173,9 @@ auto MediaRegistry::Prepare(TextureContext& context, const Image& image,
     });
 }
 
-auto MediaRegistry::Pump(TextureContext& context, double seconds) -> Result<usize, tex::Error> {
+auto MediaRegistry::Pump(TextureContext& context, double seconds) -> Result<usize, MediaError> {
     if (context.session().epoch() != state_->session.epoch())
-        return Err(tex::Error { tex::ErrorKind::DeviceMismatch });
+        return Err(MediaError::texture(tex::Error { tex::ErrorKind::DeviceMismatch }));
     state_->runtimes.retain([](const auto& weak) {
         return ! weak.expired();
     });
@@ -1169,12 +1184,12 @@ auto MediaRegistry::Pump(TextureContext& context, double seconds) -> Result<usiz
         auto runtime = weak.upgrade();
         if (! runtime) continue;
         runtime->Pump(context, seconds);
-        if (runtime->error.is_some()) return Err(*runtime->error);
+        if (runtime->error.is_some()) return Err(runtime->error->clone());
         if (runtime->updated) ++updated;
     }
     return Ok(updated);
 }
-auto MediaRegistry::Drain(u64 timeout_ns) -> Result<empty, tex::Error> {
+auto MediaRegistry::Drain(u64 timeout_ns) -> Result<empty, MediaError> {
     auto started   = rstd::time::Instant::now();
     auto remaining = [&] {
         auto elapsed = rstd::try_from<u64>((rstd::time::Instant::now() - started).as_nanos())
@@ -1197,23 +1212,21 @@ auto MediaRegistry::Drain(u64 timeout_ns) -> Result<empty, tex::Error> {
         return Ok(empty {});
     };
     auto active = drain_slots(state_->runtimes);
-    if (active.is_err()) return Err(active.unwrap_err());
+    if (active.is_err()) return Err(MediaError::texture(active.unwrap_err()));
     auto retired = drain_slots(state_->retiring);
-    if (retired.is_err()) return Err(retired.unwrap_err());
+    if (retired.is_err()) return Err(MediaError::texture(retired.unwrap_err()));
 #endif
     if (state_->yuv.is_none()) return Ok(empty {});
     if (state_->yuv_completion.is_some()) {
         const auto observed = (*state_->yuv)->wait_completion(*state_->yuv_completion, remaining());
         if (! observed.observed() || ! observed.completed.valid() ||
             ! vvk::CompletionCovers(observed.completed, *state_->yuv_completion))
-            return Err(texture_error(observed.api_result == VK_SUCCESS ? VK_TIMEOUT
-                                                                       : observed.api_result));
+            return Err(MediaError::texture(texture_error(
+                observed.api_result == VK_SUCCESS ? VK_TIMEOUT : observed.api_result)));
     }
     auto drained = (*state_->yuv)->drain_submissions(remaining());
     if (drained.is_err()) {
-        rstd_warn("MediaRegistry: conversion drain failed: {}",
-                  rstd::move(drained).unwrap_err().message);
-        return Err(tex::Error { tex::ErrorKind::Backend });
+        return Err(MediaError::decoder(MediaOperation::Convert, drained.unwrap_err().message));
     }
     (void)state_->yuv_completion.take();
     state_->retiring.retain([](const auto& weak) {

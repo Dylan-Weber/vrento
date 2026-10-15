@@ -158,7 +158,7 @@ TEST(DeviceSession, DefaultsAndSharedOwner) {
 
 TEST(DeviceSession, UuidAndApiVersion) {
     Instance probe;
-    rstd_assert(Instance::Create(probe, {}, {}));
+    Instance::TryCreate(probe, {}, {}).unwrap();
     array<Extension, 1> extensions { Extension { true, "VK_KHR_timeline_semaphore"_str } };
     array<rstd::uint8_t, VK_UUID_SIZE> uuid {};
     auto                               api_version = WP_VULKAN_VERSION;

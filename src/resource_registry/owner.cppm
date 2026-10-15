@@ -11,10 +11,11 @@ import :resource_registry.policy;
 import :resource_registry.external;
 import :resource_registry.graphics;
 
+using namespace rstd::prelude;
+using namespace rstd::literals;
+
 export namespace vrento::resource_registry
 {
-
-using namespace rstd::prelude;
 
 class ResourceRegistries {
 public:
@@ -26,13 +27,25 @@ public:
     ResourceRegistries& operator=(ResourceRegistries&&)      = delete;
 
     bool Initialize(vulkan::DeviceSession session) {
-        if (! session.valid() || session.lost()) return false;
-        if (Ready()) return Textures().Context().session().epoch() == session.epoch();
+        return TryInitialize(rstd::move(session)).is_ok();
+    }
+    auto TryInitialize(vulkan::DeviceSession session) -> Result<empty, resource::ResourceError> {
+        if (! session.valid() || session.lost())
+            return Err(resource::ResourceError::backend(vulkan::BackendError {
+                "initialize resource registries"_Str, vulkan::BackendCause::Closed() }));
+        if (Ready()) {
+            if (Textures().Context().session().epoch() == session.epoch()) return Ok(empty {});
+            return Err(resource::ResourceError {
+                .kind    = resource::ResourceErrorKind::Device,
+                .message = "resource registries belong to another device"_Str });
+        }
 
         auto texture_context = vulkan::TextureContext::create(session);
-        if (texture_context.is_err()) return false;
+        if (texture_context.is_err())
+            return Err(resource::ResourceError::texture(texture_context.unwrap_err(),
+                                                        "initialize texture context"_Str));
         auto buffer_manager = rstd::sync::Arc<RegistryBufferOwner>::make(session);
-        if (! buffer_manager->manager.init()) return false;
+        (void)buffer_manager->manager.init();
         m_shared_graphics = Some(mut_ref<vulkan::GraphicsResources>::from_raw_parts(
             rstd::addressof(session.graphics_resources())));
 
@@ -41,7 +54,7 @@ public:
         m_buffer_manager = Some(rstd::move(buffer_manager));
         Textures().SetUploadPublisher(
             dyn<TextureUploadPublisher>::from_ref(m_texture_entries).as_mut_ref());
-        return true;
+        return Ok(empty {});
     }
 
     void Reset() {

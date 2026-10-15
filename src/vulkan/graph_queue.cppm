@@ -141,11 +141,11 @@ public:
                 auto context =
                     TextureContext::create_on_queue(session, *selected, rstd::move(delegate));
                 if (context.is_err())
-                    return Err(GraphExecutionError { GraphExecutionStage::Device,
-                                                     {},
-                                                     {},
-                                                     VK_SUCCESS,
-                                                     Some(context.unwrap_err()) });
+                    return Err(GraphExecutionError {
+                        GraphExecutionStage::Device,
+                        {},
+                        {},
+                        vrento::vulkan::GraphExecutionCause::Texture(context.unwrap_err()) });
                 state->queues.push(Box<TextureContext>::make(context.unwrap()));
             }
             state->mapping.push(usize(index));
@@ -253,7 +253,10 @@ public:
             auto  begun = queue->Begin();
             if (begun.is_err()) {
                 fail(GraphExecutionError {
-                    GraphExecutionStage::Record, {}, {}, VK_SUCCESS, Some(begun.unwrap_err()) });
+                    GraphExecutionStage::Record,
+                    {},
+                    {},
+                    vrento::vulkan::GraphExecutionCause::Texture(begun.unwrap_err()) });
                 break;
             }
             auto work     = begun.unwrap();
@@ -274,8 +277,11 @@ public:
                     if (waited.is_err()) wait_error = Some(waited.unwrap_err());
                 }
             if (wait_error) {
-                fail(GraphExecutionError {
-                    GraphExecutionStage::Access, {}, {}, VK_SUCCESS, rstd::move(wait_error) });
+                fail(GraphExecutionError { GraphExecutionStage::Access,
+                                           {},
+                                           {},
+                                           vrento::vulkan::GraphExecutionCause::Texture(
+                                               (rstd::move(wait_error)).unwrap()) });
                 break;
             }
             auto recorded = state_->program.record_batch(index, work);
@@ -301,11 +307,11 @@ public:
             auto receipt   = work.receipt();
             auto submitted = queue->Submit(rstd::move(work));
             if (submitted.is_err()) {
-                fail(GraphExecutionError { GraphExecutionStage::Record,
+                fail(GraphExecutionError { GraphExecutionStage::Submit,
                                            {},
                                            {},
-                                           VK_SUCCESS,
-                                           Some(submitted.unwrap_err()) },
+                                           vrento::vulkan::GraphExecutionCause::Texture(
+                                               submitted.unwrap_err()) },
                      receipt.uncertain());
                 break;
             }

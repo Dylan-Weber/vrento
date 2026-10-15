@@ -16,6 +16,7 @@ import :texture.video_playback;
 
 // Export Vulkan FFI symbols for backend consumers.
 export import vvk;
+export import :vulkan.error;
 
 export import :vulkan.shader_compile;
 
@@ -428,9 +429,11 @@ public:
 
     void Destroy();
 
-    static bool Create(Instance&, slice<Extension>, slice<InstanceLayer>,
-                       rstd::uint32_t api_version = WP_VULKAN_VERSION);
-    bool        ChoosePhysicalDevice(mut_ref<CheckGpuOp> checkgpu, slice<rstd::uint8_t> uuid = {});
+    static auto TryCreate(Instance&, slice<Extension>, slice<InstanceLayer>,
+                          rstd::uint32_t api_version = WP_VULKAN_VERSION)
+        -> Result<empty, BackendError>;
+    auto TryChoosePhysicalDevice(mut_ref<CheckGpuOp> checkgpu, slice<rstd::uint8_t> uuid = {})
+        -> Result<rstd::empty, BackendError>;
 
     const vvk::Instance&       inst() const;
     const vvk::PhysicalDevice& gpu() const;
@@ -653,9 +656,10 @@ public:
     void destroy();
 
     auto QueueRegion(VkImage image, VkBufferImageCopy region, slice<rstd::uint8_t> bytes,
-                     rstd::uint32_t block_bytes = 4) -> Option<ImageUploadTicket>;
+                     rstd::uint32_t block_bytes = 4) -> Result<ImageUploadTicket, BackendError>;
     bool HasPendingUploads() const noexcept;
-    bool RecordQueuedRegions(vvk::CommandBuffer& command, RecordedImageUploads& recorded);
+    auto RecordQueuedRegions(vvk::CommandBuffer& command, RecordedImageUploads& recorded)
+        -> Result<rstd::empty, BackendError>;
     auto CommitRecordedUploads(RecordedImageUploads&& recorded) -> Option<ImageUploadBatchLease>;
     void CancelRecordedUploads(const Arc<RecordedImageUploads::State>& state);
     void DiscardPendingUploads();
@@ -731,8 +735,10 @@ public:
     Device();
     ~Device();
 
-    static bool Create(Instance&, slice<Extension> exts, VkExtent2D extent, Device&,
-                       SwapchainOptions = {});
+    static auto TryCreate(Instance&, slice<Extension>, VkExtent2D, Device&, SwapchainOptions = {})
+        -> Result<empty, BackendError>;
+    static auto ValidateGPU(vvk::PhysicalDevice, slice<Extension>, VkSurfaceKHR)
+        -> Result<empty, BackendError>;
     static bool CheckGPU(vvk::PhysicalDevice gpu, slice<Extension> exts, VkSurfaceKHR surface);
 
     void Destroy();
@@ -775,7 +781,7 @@ public:
     auto         MemoryBudget() const -> MemoryBudgetSnapshot;
 
 private:
-    Vec<VkDeviceQueueCreateInfo> ChooseDeviceQueue(VkSurfaceKHR = {});
+    auto ChooseDeviceQueue(VkSurfaceKHR = {}) -> Result<Vec<VkDeviceQueueCreateInfo>, BackendError>;
 
     const vvk::InstanceDispatch* m_instance_dispatch {};
     vvk::DeviceDispatch          dld;
@@ -951,6 +957,13 @@ public:
     bool init();
     void destroy();
 
+    auto TryAllocate(const BufferAllocationRequest& request)
+        -> Result<BufferAllocation, BackendError>;
+    auto TryQueueWrite(BufferAllocation&, slice<rstd::uint8_t>, VkDeviceSize destination_offset = 0)
+        -> Result<BufferUploadTicket, BackendError>;
+    auto TryPreparePendingUploads(RecordedBufferUploads&) -> Result<empty, BackendError>;
+    auto TryRecordUploads(vvk::CommandBuffer&, RecordedBufferUploads&)
+        -> Result<empty, BackendError>;
     Option<BufferAllocation>   Allocate(const BufferAllocationRequest& request);
     Option<BufferUploadTicket> QueueWrite(BufferAllocation& allocation, slice<rstd::uint8_t> data,
                                           VkDeviceSize destination_offset = 0);
@@ -979,13 +992,13 @@ struct BufferBackend {
         using Trait = BufferBackend;
 
         auto AllocateBuffer(const BufferAllocationRequest& request)
-            -> rstd::Option<BufferAllocation> {
+            -> Result<BufferAllocation, BackendError> {
             return rstd::trait_call<0>(this, request);
         }
 
         auto QueueBufferWrite(rstd::mut_ref<BufferAllocation> allocation,
                               rstd::slice<rstd::u8> content, VkDeviceSize destination_offset = 0)
-            -> rstd::Option<BufferUploadTicket> {
+            -> Result<BufferUploadTicket, BackendError> {
             return rstd::trait_call<1>(this, allocation, content, destination_offset);
         }
     };
@@ -1288,14 +1301,14 @@ template<>
 struct Impl<vrento::vulkan::BufferBackend, vrento::vulkan::BufferManager>
     : ImplBase<vrento::vulkan::BufferManager> {
     auto AllocateBuffer(const vrento::vulkan::BufferAllocationRequest& request)
-        -> Option<vrento::vulkan::BufferAllocation> {
-        return this->self().Allocate(request);
+        -> Result<vrento::vulkan::BufferAllocation, vrento::vulkan::BackendError> {
+        return this->self().TryAllocate(request);
     }
 
     auto QueueBufferWrite(mut_ref<vrento::vulkan::BufferAllocation> allocation, slice<u8> content,
                           VkDeviceSize destination_offset)
-        -> Option<vrento::vulkan::BufferUploadTicket> {
-        return this->self().QueueWrite(
+        -> Result<vrento::vulkan::BufferUploadTicket, vrento::vulkan::BackendError> {
+        return this->self().TryQueueWrite(
             *allocation,
             slice<rstd::uint8_t>::from_raw_parts(
                 reinterpret_cast<const rstd::uint8_t*>(content.as_raw_ptr()), content.len()),

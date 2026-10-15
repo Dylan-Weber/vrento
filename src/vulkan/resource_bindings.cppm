@@ -31,11 +31,11 @@ inline auto capture_resources(const pass::GraphResourceMap&                   ma
             return Err(GraphExecutionError { GraphExecutionStage::Binding, {}, version.resource });
         auto selected = (**value).ActiveTexture();
         if (selected.is_err())
-            return Err(GraphExecutionError { GraphExecutionStage::Binding,
-                                             {},
-                                             version.resource,
-                                             VK_SUCCESS,
-                                             Some(selected.unwrap_err()) });
+            return Err(GraphExecutionError {
+                GraphExecutionStage::Binding,
+                {},
+                version.resource,
+                vrento::vulkan::GraphExecutionCause::Texture(selected.unwrap_err()) });
         auto view = selected->view;
         bool overridden {};
         for (const auto& selection : selections)

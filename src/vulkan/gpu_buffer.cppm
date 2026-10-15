@@ -2,6 +2,8 @@ export module vrento:vulkan.gpu_buffer;
 export import :vulkan.texture;
 import :vulkan.graph;
 import rstd;
+using namespace rstd::prelude;
+using namespace rstd::literals;
 
 namespace vrento::vulkan
 {
@@ -135,7 +137,12 @@ public:
         info.size       = bytes;
         info.usage      = usage;
         auto allocation = session.device().memory_allocator().create_buffer(info, memory);
-        if (allocation.is_err()) return Err(tex::Error { tex::ErrorKind::Backend });
+        if (allocation.is_err()) {
+            auto error = allocation.unwrap_err();
+            session.observe_result(error.api_result);
+            return Err(tex::Error::from_backend(
+                { "allocate GPU buffer"_Str, BackendCause::Memory(error) }));
+        }
         return Ok(GpuBuffer(Arc<GpuBufferState>::make(session, allocation.unwrap(), bytes, usage)));
     }
     auto identity() const -> tex::Identity { return state_->identity; }
@@ -334,8 +341,14 @@ public:
                 return Err(tex::Error { tex::ErrorKind::Invalid });
         auto allocation = state_->allocation.allocation();
         auto mapped     = allocation.map();
-        if (mapped.is_err() || allocation.invalidate().is_err())
-            return Err(tex::Error { tex::ErrorKind::Backend });
+        if (mapped.is_err())
+            return Err(tex::Error::from_backend(
+                { "map readback buffer"_Str, BackendCause::Memory(mapped.unwrap_err()) }));
+        auto invalidated = allocation.invalidate();
+        if (invalidated.is_err())
+            return Err(
+                tex::Error::from_backend({ "invalidate readback buffer"_Str,
+                                           BackendCause::Memory(invalidated.unwrap_err()) }));
         auto    memory = mapped.unwrap();
         Vec<u8> bytes;
         for (VkDeviceSize i {}; i < size(); ++i)
@@ -394,22 +407,22 @@ public:
                         { use.range.offset, use.range.size, access, stages, write, ! write },
                         reader_ ? Some(reader_->clone()) : None<Arc<BufferReadReservation>>());
         if (result.is_err())
-            return Err(GraphExecutionError { GraphExecutionStage::Access,
-                                             {},
-                                             use.resource,
-                                             VK_SUCCESS,
-                                             Some(result.unwrap_err()) });
+            return Err(GraphExecutionError {
+                GraphExecutionStage::Access,
+                {},
+                use.resource,
+                vrento::vulkan::GraphExecutionCause::Texture(result.unwrap_err()) });
         return Ok(empty {});
     }
     auto Release(tex::Submission& work, rstd::uint32_t family, const PassResourceUse& next) const
         -> Result<empty, GraphExecutionError> {
         auto result = buffer_.release(work, next.range.offset, next.range.size, family);
         if (result.is_err())
-            return Err(GraphExecutionError { GraphExecutionStage::Access,
-                                             {},
-                                             next.resource,
-                                             VK_SUCCESS,
-                                             Some(result.unwrap_err()) });
+            return Err(GraphExecutionError {
+                GraphExecutionStage::Access,
+                {},
+                next.resource,
+                vrento::vulkan::GraphExecutionCause::Texture(result.unwrap_err()) });
         return Ok(empty {});
     }
 };
@@ -446,7 +459,10 @@ auto GraphGpuBufferBinding::Freeze(bool read_only) const
         auto lease = buffer_.reserve_read();
         if (lease.is_err())
             return Err(GraphExecutionError {
-                GraphExecutionStage::Binding, {}, {}, VK_SUCCESS, Some(lease.unwrap_err()) });
+                GraphExecutionStage::Binding,
+                {},
+                {},
+                vrento::vulkan::GraphExecutionCause::Texture(lease.unwrap_err()) });
         result.reader_ = Some(lease.unwrap());
     }
     return Ok(Arc<dyn<GraphBinding>>::make(rstd::move(result)));

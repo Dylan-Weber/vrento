@@ -14,7 +14,6 @@ import :resource_registry.external;
 
 using rstd::collections::HashMap;
 using rstd::sync::Arc;
-
 using namespace rstd::prelude;
 using namespace rstd::literals;
 
@@ -742,16 +741,26 @@ public:
             });
         }
         auto loaded = (*content)->LoadBuffer(entry.request());
-        if (loaded.is_err()) return Err(rstd::move(loaded).unwrap_err_unchecked());
+        if (loaded.is_err()) {
+            auto error = loaded.unwrap_err();
+            error.contexts.push(resource::ResourceErrorContext::Buffer(
+                entry.definition.id(), entry.definition.revision(), entry.handle));
+            return Err(rstd::move(error));
+        }
         auto prepared =
             m_buffers.Ensure(entry.definition.clone(), loaded.unwrap_unchecked(), m_buffer_backend);
-        if (prepared.is_err()) return Err(rstd::move(prepared).unwrap_err_unchecked());
+        if (prepared.is_err()) {
+            auto error = prepared.unwrap_err();
+            error.contexts.push(resource::ResourceErrorContext::Buffer(
+                entry.definition.id(), entry.definition.revision(), entry.handle));
+            return Err(rstd::move(error));
+        }
         if (! table.Insert(PreparedBufferUse {
                 .use    = entry.handle,
                 .buffer = rstd::move(prepared).unwrap_unchecked(),
             })) {
             return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::BackendFailure,
+                .kind    = resource::ResourceErrorKind::DuplicateUse,
                 .message = rstd::format("duplicate buffer use {}", entry.handle.index),
             });
         }
@@ -769,13 +778,18 @@ public:
             });
         }
         auto prepared = m_shaders.Prepare(entry.request.clone(), *provider);
-        if (prepared.is_err()) return Err(rstd::move(prepared).unwrap_err_unchecked());
+        if (prepared.is_err()) {
+            auto error = prepared.unwrap_err();
+            error.contexts.push(
+                resource::ResourceErrorContext::Shader(entry.handle, entry.request.name.clone()));
+            return Err(rstd::move(error));
+        }
         if (! table.Insert(PreparedShaderUse {
                 .use    = entry.handle,
                 .shader = rstd::move(prepared).unwrap_unchecked(),
             })) {
             return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::BackendFailure,
+                .kind    = resource::ResourceErrorKind::DuplicateUse,
                 .message = rstd::format("duplicate shader use {}", entry.handle.index),
             });
         }
@@ -931,7 +945,7 @@ public:
         auto pool = builder.build();
         if (pool.is_err()) {
             return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::BackendFailure,
+                .kind    = resource::ResourceErrorKind::Worker,
                 .message = "create texture decode thread pool failed"_Str,
                 .source  = Some(resource::ResourceErrorSource::Io(pool.unwrap_err())),
             });
@@ -941,7 +955,7 @@ public:
             session.m_pool->handle(), worker_count);
         if (tasks.is_err()) {
             return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::BackendFailure,
+                .kind    = resource::ResourceErrorKind::Worker,
                 .message = "create texture decode task set failed"_Str,
             });
         }
@@ -965,14 +979,14 @@ public:
             decode_trace.Finish();
             if (completion.is_none()) {
                 return Err(resource::ResourceError {
-                    .kind    = resource::ResourceErrorKind::BackendFailure,
+                    .kind    = resource::ResourceErrorKind::Closed,
                     .message = "texture decode task set closed early"_Str,
                 });
             }
             auto decoded = rstd::move(*completion).into_value();
             if (decoded.is_none()) {
                 return Err(resource::ResourceError {
-                    .kind    = resource::ResourceErrorKind::BackendFailure,
+                    .kind    = resource::ResourceErrorKind::Cancelled,
                     .message = "texture decode task cancelled"_Str,
                 });
             }
@@ -987,7 +1001,7 @@ public:
             }
             if (m_textures_backend.is_none()) {
                 return Err(resource::ResourceError {
-                    .kind    = resource::ResourceErrorKind::BackendFailure,
+                    .kind    = resource::ResourceErrorKind::Closed,
                     .message = "texture backend unavailable"_Str,
                 });
             }
@@ -1046,7 +1060,7 @@ private:
                     break;
                 }
                 return Err(resource::ResourceError {
-                    .kind    = resource::ResourceErrorKind::BackendFailure,
+                    .kind    = resource::ResourceErrorKind::Worker,
                     .message = "submit texture decode task failed"_Str,
                 });
             }
@@ -1069,7 +1083,7 @@ private:
         -> Result<Arc<TextureAllocation>, resource::ResourceError> {
         if (m_textures_backend.is_none()) {
             return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::BackendFailure,
+                .kind    = resource::ResourceErrorKind::Closed,
                 .message = rstd::format("texture backend unavailable"),
             });
         }
@@ -1088,7 +1102,7 @@ private:
         -> Result<PreparedImageAllocation, resource::ResourceError> {
         if (m_textures_backend.is_none()) {
             return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::BackendFailure,
+                .kind    = resource::ResourceErrorKind::Closed,
                 .message = rstd::format("texture backend unavailable"),
             });
         }
@@ -1166,7 +1180,7 @@ private:
                 .completion          = completion,
             })) {
             return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::BackendFailure,
+                .kind    = resource::ResourceErrorKind::DuplicateUse,
                 .message = rstd::format("duplicate texture use {}", use.index),
             });
         }

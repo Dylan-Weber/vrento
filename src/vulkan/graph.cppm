@@ -123,11 +123,11 @@ public:
                 if (view) {
                     auto recorded = texture_recorded_in(work, session, *view);
                     if (recorded.is_err())
-                        return Err(GraphExecutionError { GraphExecutionStage::Binding,
-                                                         pass.id,
-                                                         entry.id,
-                                                         VK_SUCCESS,
-                                                         Some(recorded.unwrap_err()) });
+                        return Err(GraphExecutionError {
+                            GraphExecutionStage::Binding,
+                            pass.id,
+                            entry.id,
+                            vrento::vulkan::GraphExecutionCause::Texture(recorded.unwrap_err()) });
                     read_only = ! recorded.unwrap();
                 }
             }
@@ -192,11 +192,11 @@ public:
                 if (auto view = entry.binding->Texture()) {
                     auto recorded = texture_recorded_in(*work, session, *view);
                     if (recorded.is_err())
-                        return Err(GraphExecutionError { GraphExecutionStage::Binding,
-                                                         {},
-                                                         entry.id,
-                                                         VK_SUCCESS,
-                                                         Some(recorded.unwrap_err()) });
+                        return Err(GraphExecutionError {
+                            GraphExecutionStage::Binding,
+                            {},
+                            entry.id,
+                            vrento::vulkan::GraphExecutionCause::Texture(recorded.unwrap_err()) });
                     read_only = ! recorded.unwrap();
                 }
             }
@@ -248,11 +248,12 @@ public:
                             slice<fg::AllocationSlot> allocations = {}) const
         -> Result<empty, GraphExecutionError> {
         if (! session.valid() || session.lost())
-            return Err(GraphExecutionError { GraphExecutionStage::Device,
-                                             {},
-                                             {},
-                                             session.lost() ? VK_ERROR_DEVICE_LOST
-                                                            : VK_ERROR_INITIALIZATION_FAILED });
+            return Err(GraphExecutionError {
+                GraphExecutionStage::Device,
+                {},
+                {},
+                session.lost() ? GraphExecutionCause::Native(VK_ERROR_DEVICE_LOST)
+                               : GraphExecutionCause::Reason(GraphFailure::Closed) });
         auto slot = [&](const GraphBindingEntry& entry) -> Option<fg::Index> {
             Option<fg::Index> selected;
             for (const auto& allocation : allocations) {
@@ -374,11 +375,11 @@ public:
               next.access == GraphAccess::Read },
             family);
         if (result.is_err())
-            return Err(GraphExecutionError { GraphExecutionStage::Access,
-                                             {},
-                                             next.resource,
-                                             VK_SUCCESS,
-                                             Some(result.unwrap_err()) });
+            return Err(GraphExecutionError {
+                GraphExecutionStage::Access,
+                {},
+                next.resource,
+                vrento::vulkan::GraphExecutionCause::Texture(result.unwrap_err()) });
         return Ok(empty {});
     }
     auto Info() const -> GraphBindingInfo {
@@ -406,11 +407,11 @@ public:
             auto attached =
                 attach_prepared_texture_read(work, native.unwrap()->session, reservation_->clone());
             if (attached.is_err())
-                return Err(GraphExecutionError { GraphExecutionStage::Access,
-                                                 {},
-                                                 use.resource,
-                                                 VK_SUCCESS,
-                                                 Some(attached.unwrap_err()) });
+                return Err(GraphExecutionError {
+                    GraphExecutionStage::Access,
+                    {},
+                    use.resource,
+                    vrento::vulkan::GraphExecutionCause::Texture(attached.unwrap_err()) });
         }
         auto resolved = graph_texture_access(use);
         if (! resolved)
@@ -430,11 +431,11 @@ public:
                                           use.range.layer_count }),
               use.access == GraphAccess::Read });
         if (used.is_err())
-            return Err(GraphExecutionError { GraphExecutionStage::Access,
-                                             {},
-                                             use.resource,
-                                             VK_SUCCESS,
-                                             Some(used.unwrap_err()) });
+            return Err(GraphExecutionError {
+                GraphExecutionStage::Access,
+                {},
+                use.resource,
+                vrento::vulkan::GraphExecutionCause::Texture(used.unwrap_err()) });
         return Ok(empty {});
     }
 };
@@ -492,11 +493,11 @@ public:
             return Err(GraphExecutionError { GraphExecutionStage::Unsupported, {}, use.resource });
         auto recording = native_recording(work, session_);
         if (recording.is_err())
-            return Err(GraphExecutionError { GraphExecutionStage::Access,
-                                             {},
-                                             use.resource,
-                                             VK_SUCCESS,
-                                             Some(recording.unwrap_err()) });
+            return Err(GraphExecutionError {
+                GraphExecutionStage::Access,
+                {},
+                use.resource,
+                vrento::vulkan::GraphExecutionCause::Texture(recording.unwrap_err()) });
         return Ok(empty {});
     }
 };
@@ -559,7 +560,8 @@ struct GraphicsScopeBackend {
     struct Api {
         using Trait = GraphicsScopeBackend;
         auto Prepare(const GraphicsDescription& description, const GraphPrepareContext& context)
-            -> Result<rstd::sync::Arc<dyn<PreparedGraphicsScope>>, GraphExecutionError> {
+            -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<PreparedGraphicsScope>>>,
+                      GraphExecutionError> {
             return rstd::trait_call<0>(this, description, context);
         }
     };
@@ -573,7 +575,8 @@ struct VulkanPassBackend {
     struct Api {
         using Trait = VulkanPassBackend;
         auto Prepare(const PassExecutionInfo& pass, const GraphPrepareContext& context)
-            -> Result<rstd::sync::Arc<dyn<VulkanPass>>, GraphExecutionError> {
+            -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<VulkanPass>>>,
+                      GraphExecutionError> {
             return rstd::trait_call<0>(this, pass, context);
         }
     };
@@ -592,7 +595,8 @@ class VulkanPassBackends {
 public:
     void set_scopes(Box<dyn<GraphicsScopeBackend>> scopes) { scopes_ = Some(rstd::move(scopes)); }
     auto prepare_scope(const GraphicsDescription& description, const GraphPrepareContext& context)
-        -> Result<rstd::sync::Arc<dyn<PreparedGraphicsScope>>, GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<PreparedGraphicsScope>>>,
+                  GraphExecutionError> {
         if (scopes_.is_none()) return Err(GraphExecutionError { GraphExecutionStage::Unsupported });
         return (*scopes_)->Prepare(description, context);
     }
@@ -624,14 +628,16 @@ public:
         return Ok(rstd::sync::Arc<Vec<usize>>::make(rstd::move(routes)));
     }
     auto prepare_at(usize slot, const PassExecutionInfo& pass, const GraphPrepareContext& context)
-        -> Result<rstd::sync::Arc<dyn<VulkanPass>>, GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<VulkanPass>>>,
+                  GraphExecutionError> {
         if (slot >= entries_.len() || entries_[slot].kind != pass.kind ||
             entries_[slot].schema != pass.schema_version)
             return Err(GraphExecutionError { GraphExecutionStage::Schema, pass.id });
         return entries_[slot].backend->Prepare(pass, context);
     }
     auto prepare(const PassExecutionInfo& pass, const GraphPrepareContext& context)
-        -> Result<rstd::sync::Arc<dyn<VulkanPass>>, GraphExecutionError> {
+        -> Result<vrento::vulkan::Preparation<rstd::sync::Arc<dyn<VulkanPass>>>,
+                  GraphExecutionError> {
         for (usize i {}; i < entries_.len(); ++i)
             if (entries_[i].kind == pass.kind && entries_[i].schema == pass.schema_version)
                 return prepare_at(i, pass, context);
@@ -668,7 +674,10 @@ inline auto record_prepared_pass(const DeviceSession& session, const PassExecuti
     auto recording = native_recording(work, session);
     if (recording.is_err())
         return fail(GraphExecutionError {
-            GraphExecutionStage::Record, {}, {}, VK_SUCCESS, Some(recording.unwrap_err()) });
+            GraphExecutionStage::Record,
+            {},
+            {},
+            vrento::vulkan::GraphExecutionCause::Texture(recording.unwrap_err()) });
     auto queue = native_queue(work, session).unwrap();
     if ((pass.queue.capability == QueueClass::Graphics &&
          ! (queue.flags & VK_QUEUE_GRAPHICS_BIT)) ||
@@ -725,11 +734,11 @@ inline auto record_prepared_pass(const DeviceSession& session, const PassExecuti
             if (view.is_none()) return fail(GraphExecutionError { GraphExecutionStage::Binding });
             auto discarded = discard_texture_contents(work, session, *view);
             if (discarded.is_err())
-                return fail(GraphExecutionError { GraphExecutionStage::Access,
-                                                  {},
-                                                  (**attachment).resource,
-                                                  VK_SUCCESS,
-                                                  Some(discarded.unwrap_err()) });
+                return fail(GraphExecutionError {
+                    GraphExecutionStage::Access,
+                    {},
+                    (**attachment).resource,
+                    vrento::vulkan::GraphExecutionCause::Texture(discarded.unwrap_err()) });
         }
     }
     return Ok(empty {});
@@ -738,8 +747,8 @@ template<typename Backends>
 inline auto record_vulkan_pass(DeviceSession session, PassExecutionInfo pass,
                                const GraphBindings& bindings, Backends& backends,
                                graph_texture::Submission& work)
-    -> Result<empty, GraphExecutionError> {
-    auto fail = [&](GraphExecutionError error) -> Result<empty, GraphExecutionError> {
+    -> Result<FrameProgress, GraphExecutionError> {
+    auto fail = [&](GraphExecutionError error) -> Result<FrameProgress, GraphExecutionError> {
         error.pass = pass.id;
         work.discard();
         return Err(error);
@@ -747,8 +756,11 @@ inline auto record_vulkan_pass(DeviceSession session, PassExecutionInfo pass,
     auto resources = bindings.descriptions();
     auto valid     = validate_pass_execution(pass, resources.as_slice());
     if (valid.is_err())
-        return fail(GraphExecutionError {
-            GraphExecutionStage::Graph, {}, {}, VK_SUCCESS, None(), Some(valid.unwrap_err()) });
+        return fail(
+            GraphExecutionError { GraphExecutionStage::Graph,
+                                  {},
+                                  {},
+                                  vrento::vulkan::GraphExecutionCause::Graph(valid.unwrap_err()) });
     auto checked = bindings.validate_resources(resources.as_slice(), session);
     if (checked.is_err()) return fail(checked.unwrap_err());
     auto flags = session.device().graphics_queue().flags;
@@ -758,7 +770,8 @@ inline auto record_vulkan_pass(DeviceSession session, PassExecutionInfo pass,
     if (pass.graphics) {
         auto scope = backends.prepare_scope(*pass.graphics, context);
         if (scope.is_err()) return fail(scope.unwrap_err());
-        context.scope = Some(rstd::move(scope).unwrap());
+        if (! scope->ready()) return Ok(FrameProgress::Pending);
+        context.scope = Some(scope->take_ready());
     }
     auto prepared = backends.prepare(pass, context);
     if (prepared.is_err()) return fail(prepared.unwrap_err());
@@ -768,9 +781,12 @@ inline auto record_vulkan_pass(DeviceSession session, PassExecutionInfo pass,
         rstd::sync::Arc<dyn<VulkanPass>>                    pass;
         Option<rstd::sync::Arc<dyn<PreparedGraphicsScope>>> scope;
     };
-    auto instance = rstd::move(prepared).unwrap();
+    if (! prepared->ready()) return Ok(FrameProgress::Pending);
+    auto instance = prepared->take_ready();
     work.retain(Lease { session, bindings.clone(), instance.clone(), context.scope.clone() });
-    return record_prepared_pass(session, pass, bindings, instance, context.scope, work);
+    auto recorded = record_prepared_pass(session, pass, bindings, instance, context.scope, work);
+    if (recorded.is_err()) return Err(recorded.unwrap_err());
+    return Ok(FrameProgress::Ready);
 }
 inline auto merge_graphics(const PassExecutionInfo& previous, const PassExecutionInfo& next)
     -> bool {
@@ -844,7 +860,10 @@ public:
         auto plan = graph.compile();
         if (plan.is_err())
             return Err(GraphExecutionError {
-                GraphExecutionStage::Graph, {}, {}, VK_SUCCESS, None(), Some(plan.unwrap_err()) });
+                GraphExecutionStage::Graph,
+                {},
+                {},
+                vrento::vulkan::GraphExecutionCause::Graph(plan.unwrap_err()) });
         auto frozen = bindings.freeze(graph, session, work);
         if (frozen.is_err()) return Err(frozen.unwrap_err());
         auto data = rstd::sync::Arc<Data>::make(rstd::move(session),
@@ -856,9 +875,13 @@ public:
         return Ok(PreparedGraphProgram(rstd::move(data)));
     }
     template<typename Backends>
-    auto continue_prepare(Backends& backends) -> Result<empty, GraphExecutionError> {
+    auto continue_prepare(Backends& backends) -> Result<FrameProgress, GraphExecutionError> {
         auto& data = *data_;
-        if (data.session.lost()) return Err(GraphExecutionError { GraphExecutionStage::Device });
+        if (data.session.lost())
+            return Err(GraphExecutionError { GraphExecutionStage::Device,
+                                             {},
+                                             {},
+                                             GraphExecutionCause::Native(VK_ERROR_DEVICE_LOST) });
         if (data.receipt &&
             (data.receipt->cancelled() || data.receipt->submitted() || data.receipt->uncertain()))
             return Err(GraphExecutionError { GraphExecutionStage::Prepare });
@@ -893,7 +916,8 @@ public:
                         error.pass = pass.id;
                         return Err(error);
                     }
-                    data.group_scope = Some(scope.unwrap());
+                    if (! scope->ready()) return Ok(FrameProgress::Pending);
+                    data.group_scope = Some(scope->take_ready());
                     ++data.scope_count;
                 }
                 data.group_end   = last;
@@ -907,7 +931,8 @@ public:
                 error.pass = pass.id;
                 return Err(error);
             }
-            data.passes.push(prepared.unwrap());
+            if (! prepared->ready()) return Ok(FrameProgress::Pending);
+            data.passes.push(prepared->take_ready());
             data.scopes.push(data.group_scope.clone());
             data.ends.push(usize(data.group_end));
             if (position == data.group_end) {
@@ -915,7 +940,7 @@ public:
                 data.group_scope = None();
             }
         }
-        return Ok(empty {});
+        return Ok(FrameProgress::Ready);
     }
     static auto prepare(DeviceSession session, VulkanPassSet graph, const GraphBindings& bindings,
                         VulkanPassBackends& backends, bool merge_scopes = true,
@@ -942,7 +967,7 @@ public:
     }
     auto record_batch(usize batch, graph_texture::Submission& work) const
         -> Result<empty, GraphExecutionError> {
-        if (! ready()) return Err(GraphExecutionError { GraphExecutionStage::Pending });
+        if (! ready()) return Err(GraphExecutionError { GraphExecutionStage::Record });
         if (data_->receipt && ! data_->receipt->same(work.receipt()))
             return Err(GraphExecutionError { GraphExecutionStage::Binding });
         if (batch >= data_->plan.batches.len() ||
@@ -959,16 +984,22 @@ public:
                                     work);
     }
     auto record(graph_texture::Submission& work) const -> Result<empty, GraphExecutionError> {
-        if (! ready()) return Err(GraphExecutionError { GraphExecutionStage::Pending });
+        if (! ready()) return Err(GraphExecutionError { GraphExecutionStage::Record });
         if (data_->receipt && ! data_->receipt->same(work.receipt()))
             return Err(GraphExecutionError { GraphExecutionStage::Binding });
         if (data_->session.lost())
-            return Err(
-                GraphExecutionError { GraphExecutionStage::Device, {}, {}, VK_ERROR_DEVICE_LOST });
+            return Err(GraphExecutionError {
+                GraphExecutionStage::Device,
+                {},
+                {},
+                vrento::vulkan::GraphExecutionCause::Native(VK_ERROR_DEVICE_LOST) });
         auto recording = native_recording(work, data_->session);
         if (recording.is_err())
             return Err(GraphExecutionError {
-                GraphExecutionStage::Record, {}, {}, VK_SUCCESS, Some(recording.unwrap_err()) });
+                GraphExecutionStage::Record,
+                {},
+                {},
+                vrento::vulkan::GraphExecutionCause::Texture(recording.unwrap_err()) });
         // Hold the whole execution snapshot even if a later recorder fails.
         work.retain(data_.clone());
         for (usize first {}; first < data_->plan.order.len();) {
@@ -1065,7 +1096,10 @@ auto GraphTextureBinding::Freeze(bool read_only) const
         auto reserved = reserve_texture_read(native.unwrap()->session, view_);
         if (reserved.is_err())
             return Err(GraphExecutionError {
-                GraphExecutionStage::Binding, {}, {}, VK_SUCCESS, Some(reserved.unwrap_err()) });
+                GraphExecutionStage::Binding,
+                {},
+                {},
+                vrento::vulkan::GraphExecutionCause::Texture(reserved.unwrap_err()) });
         snapshot.reservation_ = Some(rstd::move(reserved).unwrap());
     }
     return Ok(rstd::sync::Arc<dyn<GraphBinding>>::make(rstd::move(snapshot)));

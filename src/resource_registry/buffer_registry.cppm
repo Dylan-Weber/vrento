@@ -9,7 +9,6 @@ import :vulkan.api;
 
 using rstd::collections::HashMap;
 using rstd::sync::Arc;
-
 using namespace rstd::prelude;
 
 export namespace vrento::resource_registry
@@ -114,10 +113,11 @@ public:
             .alignment = static_cast<VkDeviceSize>(request.definition.alignment.to_primitive()),
             .usage     = AllocationUsage(request.definition.usage),
         });
-        if (allocated.is_none()) {
+        if (allocated.is_err()) {
             return Err(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::BackendFailure,
                 .message = rstd::format("allocate buffer {} failed", request.name.as_str()),
+                .source  = Some(resource::ResourceErrorSource::Backend(allocated.unwrap_err())),
             });
         }
 
@@ -211,12 +211,13 @@ private:
         auto allocation =
             mut_ref<vulkan::BufferAllocation>::from_raw_parts(rstd::addressof(physical->buffer));
         auto ticket = backend->QueueBufferWrite(allocation, content);
-        if (ticket.is_none()) {
+        if (ticket.is_err()) {
             return Err(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::BackendFailure,
                 .message = rstd::format("queue {} buffer bytes into {} byte allocation failed",
                                         content.len(),
                                         physical->buffer.size()),
+                .source  = Some(resource::ResourceErrorSource::Backend(ticket.unwrap_err())),
             });
         }
         physical->source_generation = source_generation;

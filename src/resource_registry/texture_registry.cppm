@@ -9,7 +9,6 @@ export import :resource_registry.texture;
 using rstd::collections::HashMap;
 using rstd::collections::HashSet;
 using rstd::sync::Arc;
-
 using namespace rstd::prelude;
 using namespace rstd::literals;
 
@@ -159,7 +158,7 @@ public:
             if (texture->definition.revision() > definition.revision() ||
                 (texture->definition.revision() == definition.revision() &&
                  ! SameTextureRequest(texture->request(), request)))
-                return Err(ResourceError { ResourceErrorKind::BackendFailure,
+                return Err(ResourceError { ResourceErrorKind::RevisionMismatch,
                                            "conflicting texture definition revision"_Str });
         }
         TextureRegistryIdentity identity {
@@ -311,10 +310,7 @@ public:
             if (! pumped.insert(identity)) continue;
             auto result = physical->allocation->Pump(context, seconds);
             if (result.is_err()) {
-                resource::ResourceError error {
-                    .message = "advance video texture failed"_Str,
-                    .source  = Some(resource::ResourceErrorSource::Texture(result.unwrap_err()))
-                };
+                auto error = result.unwrap_err();
                 for (const auto& [logical_handle, shared] : m_resources.iter()) {
                     if (! Arc<resource_registry::TextureAllocation>::ptr_eq(physical->allocation,
                                                                             shared->allocation))

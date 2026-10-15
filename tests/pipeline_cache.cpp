@@ -6,12 +6,13 @@ import rstd.test;
 import vrento;
 import vrento.tests.shaders;
 
-namespace vrento_test::pipeline_cache
-{
 using namespace rstd::prelude;
 using namespace rstd::literals;
 using namespace vrento::vulkan;
 using namespace vrento::resource_registry;
+
+namespace vrento_test::pipeline_cache
+{
 
 template<rstd::size_t N>
 auto stage(const unsigned (&words)[N], vrento::ShaderType type) -> Uni_ShaderSpv {
@@ -240,15 +241,14 @@ TEST(PipelineCache, ResourcePreparationPending) {
     vrento::resource::PipelineUseHandle   use { u64(1), u64(1) };
     vrento::resource::RenderPassUseHandle pass { u64(1), u64(1) };
     auto pending = resources.PreparePipeline(use, pass, session.device(), request(layout.handle));
-    rstd_assert(pending.is_err() &&
-                pending.unwrap_err().kind == vrento::resource::ResourceErrorKind::Pending);
+    rstd_assert(pending.is_ok() && ! pending->ready());
     rstd_assert(resources.Prepared().Resolve(use).is_none());
     auto start = rstd::time::Instant::now();
     for (;;) {
         auto result =
             resources.PreparePipeline(use, pass, session.device(), request(layout.handle));
-        if (result.is_ok()) break;
-        rstd_assert(result.unwrap_err().kind == vrento::resource::ResourceErrorKind::Pending);
+        rstd_assert(result.is_ok());
+        if (result->ready()) break;
         rstd_assert(start.elapsed().as_secs() < u64(5));
         rstd::thread::sleep(rstd::time::Duration::from_millis(u64(1)));
     }
@@ -256,7 +256,7 @@ TEST(PipelineCache, ResourcePreparationPending) {
     rstd_assert(graphics.pipelines.stats().creations == u64(1));
     auto repeated = resources.PreparePipeline(use, pass, session.device(), request(layout.handle));
     rstd_assert(repeated.is_ok());
-    rstd_assert(repeated->physical->pipeline.handle);
+    rstd_assert(repeated->take_ready().physical->pipeline.handle);
     rstd_assert(graphics.pipelines.stats().creations == u64(1));
     auto cold            = request(layout.handle);
     cold.raster.cullMode = VK_CULL_MODE_FRONT_BIT;
@@ -264,7 +264,7 @@ TEST(PipelineCache, ResourcePreparationPending) {
     vrento::resource::RenderPassUseHandle second_pass { u64(2), u64(1) };
     auto                                  cancelled =
         resources.PreparePipeline(second, second_pass, session.device(), rstd::move(cold));
-    rstd_assert(cancelled.unwrap_err().kind == vrento::resource::ResourceErrorKind::Pending);
+    rstd_assert(cancelled.is_ok() && ! cancelled->ready());
     resources.AbortPreparePlan();
     rstd_assert(resources.Prepared().Resolve(second).is_none());
     resources.Reset();
@@ -366,11 +366,11 @@ TEST(PipelineCache, PendingUseDoesNotPublishPreviousRecipe) {
     vrento::resource::PipelineUseHandle   use { u64(1), u64(1) };
     vrento::resource::RenderPassUseHandle pass { u64(1), u64(1) };
     auto pending = resources.PreparePipeline(use, pass, session.device(), request(layout.handle));
-    ASSERT_TRUE(pending.is_err());
-    EXPECT_EQ(pending.unwrap_err().kind, vrento::resource::ResourceErrorKind::Pending);
+    ASSERT_TRUE(pending.is_ok());
+    EXPECT_FALSE(pending->ready());
     auto changed = resources.PreparePipeline(use, pass, session.device(), rstd::move(replacement));
     ASSERT_TRUE(changed.is_ok());
-    EXPECT_EQ(changed->resource, expected.handle);
+    EXPECT_EQ(changed->take_ready().resource, expected.handle);
     EXPECT_EQ(resources.Prepared().Resolve(use).unwrap()->resource, expected.handle);
     resources.Reset();
     EXPECT_EQ(session.validation_errors(), 0u);

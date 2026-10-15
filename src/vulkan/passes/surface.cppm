@@ -64,17 +64,19 @@ struct SurfacePass {
     PassExecutionInfo declaration;
     bool              transfer {};
     auto              Instantiate(const GraphPrepareContext&, Arc<SurfaceFrameData>) const
-        -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError>;
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError>;
 };
 struct SurfaceTransferFactory {
     using Pass = SurfacePass;
     auto Compile(const SurfaceTransferDesc&, const PassExecutionInfo& pass,
-                 const PassCompileContext&) -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError>;
+                 const PassCompileContext&)
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError>;
 };
 struct SurfaceReleaseFactory {
     using Pass = SurfacePass;
     auto Compile(const SurfaceReleaseDesc&, const PassExecutionInfo& pass,
-                 const PassCompileContext&) -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError>;
+                 const PassCompileContext&)
+        -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError>;
 };
 } // namespace vrento::vulkan
 export namespace rstd
@@ -84,7 +86,7 @@ export namespace rstd
 namespace vrento::vulkan
 {
 auto SurfacePass::Instantiate(const GraphPrepareContext& context, Arc<SurfaceFrameData> data) const
-    -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError> {
     const auto& frame = data;
     if (! frame->lease.valid())
         return Err(GraphExecutionError { GraphExecutionStage::Binding, declaration.id });
@@ -93,7 +95,7 @@ auto SurfacePass::Instantiate(const GraphPrepareContext& context, Arc<SurfaceFra
 }
 auto SurfaceTransferFactory::Compile(const SurfaceTransferDesc&, const PassExecutionInfo& pass,
                                      const PassCompileContext&)
-    -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError> {
     if (pass.kind != surface_transfer_kind || pass.graphics || ! pass.parameters.is_empty() ||
         pass.uses.len() != usize(2) || pass.uses[usize()].access != GraphAccess::Read ||
         pass.uses[usize(1)].access != GraphAccess::Write ||
@@ -104,7 +106,7 @@ auto SurfaceTransferFactory::Compile(const SurfaceTransferDesc&, const PassExecu
 }
 auto SurfaceReleaseFactory::Compile(const SurfaceReleaseDesc&, const PassExecutionInfo& pass,
                                     const PassCompileContext&)
-    -> Result<Arc<dyn<VulkanPass>>, GraphExecutionError> {
+    -> Result<vrento::vulkan::Preparation<Arc<dyn<VulkanPass>>>, GraphExecutionError> {
     if (pass.kind != surface_release_kind || pass.graphics || ! pass.parameters.is_empty() ||
         pass.uses.len() != usize(1) || pass.uses[usize()].access != GraphAccess::Read ||
         pass.uses[usize()].usage != PassUsage::Release)
