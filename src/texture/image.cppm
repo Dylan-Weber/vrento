@@ -64,6 +64,11 @@ struct ImageHeader {
     TextureSample sample;
 };
 
+struct ImageSlotDescription {
+    rstd::int32_t width {}, height {};
+    usize         mip_count {};
+};
+
 struct Image {
     Image()                        = default;
     Image(const Image&)            = delete;
@@ -85,3 +90,9 @@ struct Image {
 };
 
 } // namespace vrento
+
+export namespace rstd
+{
+template<>
+struct Impl<Copy, vrento::ImageSlotDescription> {};
+} // namespace rstd

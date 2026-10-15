@@ -5,22 +5,40 @@ import rstd;
 
 export namespace vrento::texture
 {
+inline auto describe_image_slot(const ImageHeader& header, ImageSlotDescription slot)
+    -> Result<TextureDesc, Error> {
+    if (slot.width <= 0 || slot.height <= 0 || slot.mip_count == usize() ||
+        slot.mip_count > usize(32))
+        return Err(Error { ErrorKind::Invalid });
+    TextureDesc desc;
+    desc.extent     = { Count(slot.width), Count(slot.height) };
+    desc.mip_levels = header.kind == ImageKind::Video ? 1 : Count(slot.mip_count.to_primitive());
+    desc.format     = header.kind == ImageKind::Video ? TextureFormat::RGBA8 : header.format;
+    auto checked    = validate(desc);
+    if (checked.is_err()) return Err(checked.unwrap_err());
+    return Ok(rstd::move(desc));
+}
+
+inline auto describe_image(const ImageHeader& header, slice<ImageSlotDescription> slots)
+    -> Result<Vec<TextureDesc>, Error> {
+    if (slots.is_empty()) return Err(Error { ErrorKind::Invalid });
+    Vec<TextureDesc> result;
+    for (const auto& slot : slots) {
+        auto desc = describe_image_slot(header, slot);
+        if (desc.is_err()) return Err(desc.unwrap_err());
+        result.push(rstd::move(desc).unwrap());
+    }
+    return Ok(rstd::move(result));
+}
+
 inline auto describe_image(const vrento::Image& image) -> Result<Vec<TextureDesc>, Error> {
     if (image.slots.is_empty()) return Err(Error { ErrorKind::Invalid });
     Vec<TextureDesc> result;
     for (const auto& slot : image.slots) {
-        if (slot.width <= 0 || slot.height <= 0 || slot.mipmaps.is_empty() ||
-            slot.mipmaps.len().to_primitive() > 32)
-            return Err(Error { ErrorKind::Invalid });
-        TextureDesc desc;
-        desc.extent = { Count(slot.width), Count(slot.height) };
-        desc.mip_levels =
-            image.header.kind == ImageKind::Video ? 1 : Count(slot.mipmaps.len().to_primitive());
-        desc.format =
-            image.header.kind == ImageKind::Video ? TextureFormat::RGBA8 : image.header.format;
-        auto checked = validate(desc);
-        if (checked.is_err()) return Err(checked.unwrap_err());
-        result.push(rstd::move(desc));
+        auto desc =
+            describe_image_slot(image.header, { slot.width, slot.height, slot.mipmaps.len() });
+        if (desc.is_err()) return Err(desc.unwrap_err());
+        result.push(rstd::move(desc).unwrap());
     }
     return Ok(rstd::move(result));
 }

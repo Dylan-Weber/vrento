@@ -286,6 +286,40 @@ TEST(Texture, PublicApi) {
         rstd::as<TextureContentPreparer>(preparer).PrepareImage(oversized).unwrap_err().kind ==
         ErrorKind::Invalid);
 }
+TEST(Texture, MetadataAndContentDescriptionsAgree) {
+    for (auto kind : array<ImageKind, 2> { ImageKind::Pixels, ImageKind::Video }) {
+        Image image;
+        image.header = { .kind = kind, .format = TextureFormat::BC3 };
+        Vec<ImageSlotDescription> slots;
+        for (int index {}; index < 2; ++index) {
+            Image::Slot slot;
+            slot.width  = 64 >> index;
+            slot.height = 32 >> index;
+            for (int mip {}; mip < 3; ++mip)
+                slot.mipmaps.push(
+                    ImageData { .width = slot.width >> mip, .height = slot.height >> mip });
+            slots.push({ slot.width, slot.height, slot.mipmaps.len() });
+            image.slots.push(rstd::move(slot));
+        }
+        auto metadata = describe_image(image.header, slots.as_slice()).unwrap();
+        auto content  = describe_image(image).unwrap();
+        ASSERT_EQ(metadata.len(), content.len());
+        for (usize index {}; index < content.len(); ++index)
+            EXPECT_EQ(metadata[index], content[index]);
+        EXPECT_EQ(metadata[usize()].mip_levels, kind == ImageKind::Video ? 1u : 3u);
+        EXPECT_EQ(metadata[usize()].format,
+                  kind == ImageKind::Video ? TextureFormat::RGBA8 : TextureFormat::BC3);
+        for (auto count : array<usize, 2> { usize(), usize(33) }) {
+            slots[usize()].mip_count = count;
+            EXPECT_TRUE(describe_image(image.header, slots.as_slice()).is_err());
+        }
+        slots[usize()].mip_count = usize(3);
+        slots[usize()].width     = 0;
+        EXPECT_TRUE(describe_image(image.header, slots.as_slice()).is_err());
+        EXPECT_TRUE(describe_image(image.header, {}).is_err());
+    }
+}
+
 TEST(Texture, ImageUploadsOwnEveryMipPayload) {
     FakeDevice          device;
     auto                api = dyn<TextureDevice>::from_ref(device);
