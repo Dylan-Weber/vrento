@@ -6,6 +6,7 @@ export import :vulkan.device_session;
 export import :vulkan.texture;
 export import :vulkan.gpu_buffer;
 export import :vulkan.graph;
+export import :vulkan.host_buffer;
 export import :vulkan.renderer;
 export import :vulkan.frame;
 export import :vulkan.passes.graphics;
