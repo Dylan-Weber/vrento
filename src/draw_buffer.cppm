@@ -69,6 +69,8 @@ class RenderBufferResolver {
 public:
     explicit RenderBufferResolver(const resource_registry::PreparedResourceTable& resources)
         : m_resources(resources) {}
+    auto tryPrepareDrawBuffers(const DrawBufferRequest&)
+        -> Result<DrawBufferRefs, resource::ResourceError>;
     auto        prepareDrawBuffers(const DrawBufferRequest&) -> Option<DrawBufferRefs>;
     static auto updateDrawBuffers(const DrawBufferRequest&, DrawBufferRefs&,
                                   mut_ref<dyn<resource::BufferContentWriter>>)

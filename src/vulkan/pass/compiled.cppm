@@ -327,8 +327,8 @@ public:
     auto advance() -> Result<empty, GraphExecutionError> {
         if (failure_) return Err(*failure_);
         auto result = program_.continue_prepare(backend_);
-        if (result.is_err() && result.unwrap_err().stage != GraphExecutionStage::Pending)
-            failure_ = Some(result.unwrap_err());
+        if (result.is_err() && result.as_ref().unwrap_err().stage != GraphExecutionStage::Pending)
+            failure_ = Some(GraphExecutionError(result.as_ref().unwrap_err()));
         return result;
     }
     auto ready() const -> bool { return ! failure_ && program_.ready(); }

@@ -43,7 +43,7 @@ class GraphFrame {
           work_(Some(rstd::move(work))),
           receipt_(work_->receipt()) {}
     auto fail(GraphExecutionError error) -> Result<empty, GraphExecutionError> {
-        error_ = Some(error);
+        error_ = Some(GraphExecutionError(error));
         state_ = receipt_.uncertain() ? FrameState::Uncertain : FrameState::Failed;
         if (work_) work_->discard();
         work_        = None();
@@ -96,7 +96,7 @@ public:
         return Ok(GraphFrame(rstd::move(resources), started.unwrap(), rstd::move(work)));
     }
     auto state() const -> FrameState { return state_; }
-    auto error() const -> Option<GraphExecutionError> { return error_; }
+    auto error() const -> Option<GraphExecutionError> { return error_.clone(); }
     auto receipt() const -> texture::SubmissionReceipt { return receipt_; }
     auto completion() const -> Option<texture::SubmissionToken> {
         return completion_ ? Some(texture::SubmissionToken(*completion_))
@@ -105,10 +105,11 @@ public:
     auto advance() -> Result<empty, GraphExecutionError> {
         if (state_ == FrameState::Ready) return Ok(empty {});
         if (state_ != FrameState::Pending)
-            return Err(error_.unwrap_or(GraphExecutionError { GraphExecutionStage::Prepare }));
+            return Err(
+                error_.clone().unwrap_or(GraphExecutionError { GraphExecutionStage::Prepare }));
         auto result = preparation_->advance();
         if (result.is_err()) {
-            if (result.unwrap_err().stage == GraphExecutionStage::Pending) return result;
+            if (result.as_ref().unwrap_err().stage == GraphExecutionStage::Pending) return result;
             return fail(result.unwrap_err());
         }
         state_ = FrameState::Ready;

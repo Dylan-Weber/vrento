@@ -29,8 +29,8 @@ inline VkShaderStageFlagBits ToVkType(vrento::ShaderType stage) {
     }
 }
 
-inline Option<vvk::ShaderModule> CreateShaderModule(const vvk::Device& device,
-                                                    const ShaderSpv&   spv) {
+inline Result<vvk::ShaderModule, vrento::resource::ResourceError>
+CreateShaderModule(const vvk::Device& device, const ShaderSpv& spv) {
     auto&                    data = spv.spirv;
     VkShaderModuleCreateInfo ci {
         .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -39,8 +39,13 @@ inline Option<vvk::ShaderModule> CreateShaderModule(const vvk::Device& device,
         .pCode    = data.data(),
     };
     vvk::ShaderModule sm;
-    VVK_CHECK_ACT(return None(), device.CreateShaderModule(ci, sm));
-    return Some(rstd::move(sm));
+    auto              created = device.CreateShaderModule(ci, sm);
+    if (created != VK_SUCCESS)
+        return Err(vrento::resource::ResourceError {
+            .message = "create shader module failed"_Str,
+            .source  = Some(vrento::resource::ResourceErrorSource::Native(
+                static_cast<rstd::int32_t>(created))) });
+    return Ok(rstd::move(sm));
 }
 
 } // namespace
@@ -192,8 +197,9 @@ GraphicsPipeline& GraphicsPipeline::setSampleCount(VkSampleCountFlagBits s) {
     return *this;
 }
 
-bool GraphicsPipeline::create(const Device& device, VkRenderPass pass, VkPipelineLayout layout,
-                              PipelineParameters& pipeline, VkPipelineCache cache) {
+auto GraphicsPipeline::tryCreate(const Device& device, VkRenderPass pass, VkPipelineLayout layout,
+                                 PipelineParameters& pipeline, VkPipelineCache cache)
+    -> Result<empty, vrento::resource::ResourceError> {
     VkPipelineDynamicStateCreateInfo dynamic_info {
         .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
         .pNext             = nullptr,
@@ -208,7 +214,9 @@ bool GraphicsPipeline::create(const Device& device, VkRenderPass pass, VkPipelin
     for (const auto& [stage, value] : m_stage_spv_map.iter()) {
         const auto& spv   = *value;
         auto        entry = CString::make(Vec<u8>::from(spv->entry_point.as_str().as_bytes()));
-        if (entry.is_err()) return false;
+        if (entry.is_err())
+            return Err(
+                vrento::resource::ResourceError { .message = "invalid shader entry point"_Str });
         entry_names.push(rstd::move(entry).unwrap());
         VkPipelineShaderStageCreateInfo info {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -216,11 +224,11 @@ bool GraphicsPipeline::create(const Device& device, VkRenderPass pass, VkPipelin
             .stage = ::ToVkType(spv->stage),
             .pName = entry_names.last().unwrap()->as_ptr()
         };
-        if (auto opt = CreateShaderModule(device.handle(), *spv); opt.is_some()) {
+        if (auto opt = CreateShaderModule(device.handle(), *spv); opt.is_ok()) {
             shader_modules.push(rstd::move(opt).unwrap());
             info.module = *shader_modules.last().unwrap().get();
         } else
-            return false;
+            return Err(rstd::move(opt).unwrap_err());
 
         shaderStages.push(rstd::move(info));
     }
@@ -247,7 +255,9 @@ bool GraphicsPipeline::create(const Device& device, VkRenderPass pass, VkPipelin
             raster_state.pNext = &clip_state;
         } else {
             // Without independent clipping, preserve clipping rather than clamping.
-            if (! *depth_clip && ! device.capabilities().depth_clamp) return false;
+            if (! *depth_clip && ! device.capabilities().depth_clamp)
+                return Err(
+                    vrento::resource::ResourceError { .message = "depth clamp unsupported"_Str });
             raster_state.depthClampEnable = ! *depth_clip;
         }
     }
@@ -269,6 +279,16 @@ bool GraphicsPipeline::create(const Device& device, VkRenderPass pass, VkPipelin
         .renderPass          = pass,
         .subpass             = m_subpass,
     };
-    VVK_CHECK_BOOL_RE(device.handle().CreateGraphicsPipeline(create, pipeline.handle, cache));
-    return true;
+    auto created = device.handle().CreateGraphicsPipeline(create, pipeline.handle, cache);
+    if (created != VK_SUCCESS)
+        return Err(vrento::resource::ResourceError {
+            .message = "create graphics pipeline failed"_Str,
+            .source  = Some(vrento::resource::ResourceErrorSource::Native(
+                static_cast<rstd::int32_t>(created))) });
+    return Ok(empty {});
+}
+
+bool GraphicsPipeline::create(const Device& device, VkRenderPass pass, VkPipelineLayout layout,
+                              PipelineParameters& pipeline, VkPipelineCache cache) {
+    return tryCreate(device, pass, layout, pipeline, cache).is_ok();
 }

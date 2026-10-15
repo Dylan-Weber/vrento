@@ -301,16 +301,35 @@ public:
         });
     }
 
-    auto Pump(vulkan::TextureContext& context, double seconds) -> Result<empty, texture::Error> {
+    auto Pump(vulkan::TextureContext& context, double seconds)
+        -> Result<empty, resource::ResourceError> {
         rstd::collections::HashSet<texture::Serial> pumped;
-        auto                                        resources = m_resources.values();
-        for (auto item = resources.next(); item.is_some(); item = resources.next()) {
-            auto slots = (**item).allocation->Slots();
+        for (const auto& [handle, physical] : m_resources.iter()) {
+            auto slots = physical->allocation->Slots();
             if (slots.is_empty()) continue;
             auto identity = slots[usize()].view.texture().identity().resource;
             if (! pumped.insert(identity)) continue;
-            auto result = (**item).allocation->Pump(context, seconds);
-            if (result.is_err()) return result;
+            auto result = physical->allocation->Pump(context, seconds);
+            if (result.is_err()) {
+                resource::ResourceError error {
+                    .message = "advance video texture failed"_Str,
+                    .source  = Some(resource::ResourceErrorSource::Texture(result.unwrap_err()))
+                };
+                for (const auto& [logical_handle, shared] : m_resources.iter()) {
+                    if (! Arc<resource_registry::TextureAllocation>::ptr_eq(physical->allocation,
+                                                                            shared->allocation))
+                        continue;
+                    auto logical = m_textures.get(*logical_handle);
+                    if (logical && (**logical).definition.valid()) {
+                        const auto& definition = (**logical).definition;
+                        error.textures.push({ definition.id(),
+                                              definition.revision(),
+                                              {},
+                                              definition.definition().name.clone() });
+                    }
+                }
+                return Err(rstd::move(error));
+            }
         }
         return Ok(empty {});
     }

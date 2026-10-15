@@ -335,7 +335,8 @@ public:
         -> Result<PreparedImageAllocation, resource::ResourceError> {
         if (image->header.kind == ImageKind::Video) {
             auto window = MakeRoom();
-            if (window.is_err()) return Failure("texture upload window failed");
+            if (window.is_err())
+                return Failure("texture upload window failed", Some(window.unwrap_err()));
             if (m_producers.is_some()) {
                 auto result = (*m_producers)->Create(rstd::move(image), rstd::move(playback));
                 if (result.is_err()) return Err(rstd::move(result).unwrap_err_unchecked());
@@ -346,7 +347,8 @@ public:
                              rstd::move(prepared.producer));
             }
             auto result = m_media.Prepare(m_context, *image, rstd::move(playback));
-            if (result.is_err()) return Failure("prepare texture producer failed");
+            if (result.is_err())
+                return Failure("prepare texture producer failed", Some(result.unwrap_err()));
             auto             media = rstd::move(result).unwrap_unchecked();
             Vec<TextureSlot> slots;
             slots.push({ rstd::move(media.view), rstd::move(media.sampler) });
@@ -368,12 +370,14 @@ public:
             }
         }
         auto window = MakeRoom();
-        if (window.is_err()) return Failure("texture upload window failed");
+        if (window.is_err())
+            return Failure("texture upload window failed", Some(window.unwrap_err()));
         auto                         device = dyn<texture::TextureDevice>::from_ref(m_context);
         texture::ImagePrepareContext preparer(device.as_mut_ref());
         auto content = dyn<texture::TextureContentPreparer>::from_ref(preparer);
         auto result  = content->PrepareImage(*image);
-        if (result.is_err()) return Failure("prepare texture pixels failed");
+        if (result.is_err())
+            return Failure("prepare texture pixels failed", Some(result.unwrap_err()));
         ++statistics_.image_preparations;
         auto                        prepared = rstd::move(result).unwrap_unchecked();
         Vec<TextureSlot>            slots;
@@ -393,16 +397,18 @@ public:
         if (m_recording && ! m_recording->cancelled()) return Ok(false);
         auto polled = Poll();
         if (polled.is_err())
-            return Err(
-                resource::ResourceError { .message = rstd::format("poll image uploads failed") });
+            return Err(resource::ResourceError {
+                .message = rstd::format("poll image uploads failed"),
+                .source  = Some(resource::ResourceErrorSource::Texture(polled.unwrap_err())) });
         if (m_in_flight.len() >= MaxUploadBatches || m_pending.len() >= MaxPendingContents)
             return Ok(false);
         auto prepared = CreateImportedTexture(rstd::move(image), None());
         if (prepared.is_err()) return Err(prepared.unwrap_err());
         auto flushed = Flush();
         if (flushed.is_err())
-            return Err(
-                resource::ResourceError { .message = rstd::format("submit image uploads failed") });
+            return Err(resource::ResourceError {
+                .message = rstd::format("submit image uploads failed"),
+                .source  = Some(resource::ResourceErrorSource::Texture(flushed.unwrap_err())) });
         return Ok(true);
     }
 
@@ -411,7 +417,8 @@ public:
         if (definition.width <= i32() || definition.height <= i32())
             return Failure("invalid texture extent");
         auto window = MakeRoom();
-        if (window.is_err()) return Failure("texture upload window failed");
+        if (window.is_err())
+            return Failure("texture upload window failed", Some(window.unwrap_err()));
         texture::TextureDesc desc;
         desc.extent     = { texture::Count(definition.width.to_primitive()),
                             texture::Count(definition.height.to_primitive()) };
@@ -434,16 +441,19 @@ public:
                             ! texture::has(desc.usage, texture::Usage::TransferDestination)))
             return Failure("texture cannot be initialized transparent");
         auto support = m_context.QuerySupport(desc);
-        if (support.is_err()) return Failure("texture definition unsupported");
+        if (support.is_err())
+            return Failure("texture definition unsupported", Some(support.unwrap_err()));
         auto allocated = m_context.CreateTexture(desc);
-        if (allocated.is_err()) return Failure("allocate texture failed");
+        if (allocated.is_err())
+            return Failure("allocate texture failed", Some(allocated.unwrap_err()));
         ++statistics_.target_allocations;
         auto storage = rstd::move(allocated).unwrap_unchecked();
         auto view    = m_context.CreateView(
             storage, { texture::Dimension::D2, { texture::format_layout(desc.format).aspect } });
-        if (view.is_err()) return Failure("create texture view failed");
+        if (view.is_err()) return Failure("create texture view failed", Some(view.unwrap_err()));
         auto sampler = m_context.CreateSampler({ definition.sample });
-        if (sampler.is_err()) return Failure("create texture sampler failed");
+        if (sampler.is_err())
+            return Failure("create texture sampler failed", Some(sampler.unwrap_err()));
         texture::TextureViewRef attachment;
         if (texture::has(desc.usage, texture::Usage::ColorAttachment) ||
             texture::has(desc.usage, texture::Usage::DepthAttachment)) {
@@ -451,7 +461,8 @@ public:
                 storage,
                 { texture::Dimension::D2,
                   { texture::format_layout(desc.format).aspect, 0, 1, 0, 1 } });
-            if (bound.is_err()) return Failure("create texture attachment view failed");
+            if (bound.is_err())
+                return Failure("create texture attachment view failed", Some(bound.unwrap_err()));
             attachment = rstd::move(bound).unwrap_unchecked();
         }
         Vec<TextureSlot> slots;
@@ -595,9 +606,12 @@ private:
         bool                        transparent;
     };
     template<rstd::size_t N>
-    static auto Failure(const char (&message)[N])
+    static auto Failure(const char (&message)[N], Option<texture::Error> source = None())
         -> Result<PreparedImageAllocation, resource::ResourceError> {
-        return Err(resource::ResourceError { .message = rstd::format("{}", message) });
+        return Err(resource::ResourceError {
+            .message = rstd::format("{}", message),
+            .source  = source ? Some(resource::ResourceErrorSource::Texture(*source))
+                              : None<resource::ResourceErrorSource>() });
     }
     auto MakeRoom() -> Result<empty, texture::Error> {
         if (m_recording.is_some()) {

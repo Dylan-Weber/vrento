@@ -4,6 +4,7 @@ export module vrento:vulkan.shader_compile;
 export import vvk;
 export import :types.shader;
 import rstd;
+import :resource.error;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
@@ -111,8 +112,9 @@ struct ShaderBackend {
             return rstd::trait_call<0>(this, src, stage, lang, out);
         }
 
-        bool CompileAndLinkShaderUnits(slice<ShaderCompUnit> units, const ShaderCompOpt& opt,
-                                       Vec<Uni_ShaderSpv>& spvs) const {
+        auto CompileAndLinkShaderUnits(slice<ShaderCompUnit> units, const ShaderCompOpt& opt,
+                                       Vec<Uni_ShaderSpv>& spvs) const
+            -> Result<empty, resource::ResourceError> {
             return rstd::trait_call<1>(this, units, opt, spvs);
         }
 

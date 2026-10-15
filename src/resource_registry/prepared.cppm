@@ -782,6 +782,16 @@ public:
         return Ok(empty {});
     }
 
+    static auto TextureFailure(resource::ResourceError             error,
+                               const resource::TextureResourceRef& definition,
+                               resource::TextureUseHandle          use) -> resource::ResourceError {
+        if (definition.valid())
+            error.textures.push({ definition.id(),
+                                  definition.revision(),
+                                  use,
+                                  definition.definition().name.clone() });
+        return error;
+    }
     auto BeginTextures(slice<resource::TexturePlanEntry> entries, ResourcePrepareSession& session,
                        Option<mut_ref<dyn<resource::TextureContentProvider>>> content,
                        Option<mut_ref<dyn<resource::TexturePrepareObserver>>> observer)
@@ -801,7 +811,9 @@ public:
                     return Err(
                         resource::ResourceError { resource::ResourceErrorKind::MissingContent });
                 auto resolved = (*content)->ResolveTextureContent(source_request);
-                if (resolved.is_err()) return Err(resolved.unwrap_err());
+                if (resolved.is_err())
+                    return Err(TextureFailure(
+                        rstd::move(resolved).unwrap_err(), entry.definition, entry.handle));
                 imported_content = Some(resolved.unwrap());
             }
             auto registered = m_textures.RegisterResource(
@@ -810,7 +822,9 @@ public:
                 entry.allocation_key.is_empty() ? None<ref<str>>()
                                                 : Some(entry.allocation_key.as_str()),
                 entry.preserve_contents);
-            if (registered.is_err()) return Err(registered.unwrap_err());
+            if (registered.is_err())
+                return Err(TextureFailure(
+                    rstd::move(registered).unwrap_err(), entry.definition, entry.handle));
             auto handle = registered.unwrap();
             if (! handle.Valid()) {
                 return Err(resource::ResourceError {
@@ -829,7 +843,9 @@ public:
             if (physical.is_some()) {
                 auto inserted = InsertPrepared(
                     entry.handle, handle, entry.definition.clone(), **physical, session.m_table);
-                if (inserted.is_err()) return inserted;
+                if (inserted.is_err())
+                    return Err(TextureFailure(
+                        rstd::move(inserted).unwrap_err(), entry.definition, entry.handle));
                 continue;
             }
 
@@ -844,7 +860,8 @@ public:
                 if (initialize_transparent) {
                     auto prepared = AllocateTransparentTexture(allocation_request);
                     if (prepared.is_err()) {
-                        return Err(rstd::move(prepared).unwrap_err_unchecked());
+                        return Err(TextureFailure(
+                            rstd::move(prepared).unwrap_err(), entry.definition, entry.handle));
                     }
                     auto allocation = rstd::move(prepared).unwrap_unchecked();
                     auto published  = PublishPrepared(entry.handle,
@@ -854,12 +871,15 @@ public:
                                                       allocation.upload,
                                                       session.m_table);
                     if (published.is_err()) {
-                        return Err(rstd::move(published).unwrap_err_unchecked());
+                        return Err(TextureFailure(
+                            rstd::move(published).unwrap_err(), entry.definition, entry.handle));
                     }
                     continue;
                 }
                 auto allocated = AllocateTexture(allocation_request);
-                if (allocated.is_err()) return Err(rstd::move(allocated).unwrap_err_unchecked());
+                if (allocated.is_err())
+                    return Err(TextureFailure(
+                        rstd::move(allocated).unwrap_err(), entry.definition, entry.handle));
                 auto published = PublishPrepared(entry.handle,
                                                  handle,
                                                  entry.definition.clone(),
@@ -867,7 +887,8 @@ public:
                                                  None<vulkan::ImageUploadTicket>(),
                                                  session.m_table);
                 if (published.is_err()) {
-                    return Err(rstd::move(published).unwrap_err_unchecked());
+                    return Err(TextureFailure(
+                        rstd::move(published).unwrap_err(), entry.definition, entry.handle));
                 }
                 continue;
             }
@@ -912,6 +933,7 @@ public:
             return Err(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::BackendFailure,
                 .message = "create texture decode thread pool failed"_Str,
+                .source  = Some(resource::ResourceErrorSource::Io(pool.unwrap_err())),
             });
         }
         session.m_pool = Some(rstd::move(pool).unwrap_unchecked());
@@ -954,9 +976,14 @@ public:
                     .message = "texture decode task cancelled"_Str,
                 });
             }
-            auto item = rstd::move(decoded).unwrap_unchecked();
+            auto item    = rstd::move(decoded).unwrap_unchecked();
+            auto failure = [&](resource::ResourceError error) {
+                for (const auto& use : session.m_pending[item.index].uses)
+                    error = TextureFailure(rstd::move(error), use.definition, use.use);
+                return Err(rstd::move(error));
+            };
             if (item.image.is_err()) {
-                return Err(rstd::move(item.image).unwrap_err_unchecked());
+                return failure(rstd::move(item.image).unwrap_err_unchecked());
             }
             if (m_textures_backend.is_none()) {
                 return Err(resource::ResourceError {
@@ -973,18 +1000,19 @@ public:
                                     : None<Arc<rstd::dyn<VideoPlayback>>>();
                 auto created = (*m_textures_backend)
                                    ->CreateImportedTexture(rstd::move(image), rstd::move(playback));
-                if (created.is_err()) return Err(rstd::move(created).unwrap_err_unchecked());
+                if (created.is_err()) return failure(rstd::move(created).unwrap_err_unchecked());
                 auto prepared   = rstd::move(created).unwrap_unchecked();
                 auto allocation = rstd::move(prepared.allocation);
                 for (auto& use : session.m_pending[item.index].uses) {
                     auto published = PublishPrepared(use.use,
                                                      use.resource,
-                                                     rstd::move(use.definition),
+                                                     use.definition.clone(),
                                                      allocation.clone(),
                                                      prepared.upload,
                                                      session.m_table);
                     if (published.is_err()) {
-                        return Err(rstd::move(published).unwrap_err_unchecked());
+                        return Err(TextureFailure(
+                            rstd::move(published).unwrap_err(), use.definition, use.use));
                     }
                 }
                 upload_trace.Finish();

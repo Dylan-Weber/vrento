@@ -1029,6 +1029,9 @@ public:
     ~GraphicsPipeline();
 
     void toDefault();
+    auto tryCreate(const Device&, VkRenderPass, VkPipelineLayout, PipelineParameters&,
+                   VkPipelineCache cache = VK_NULL_HANDLE)
+        -> Result<empty, resource::ResourceError>;
     bool create(const Device&, VkRenderPass, VkPipelineLayout, PipelineParameters&,
                 VkPipelineCache cache = VK_NULL_HANDLE);
 

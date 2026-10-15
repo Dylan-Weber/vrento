@@ -281,3 +281,26 @@ struct Impl<hash::Hash, vrento::fg::PassId> : ImplBase<vrento::fg::PassId> {
     }
 };
 } // namespace rstd
+
+export namespace rstd
+{
+template<>
+struct Impl<fmt::Display, vrento::fg::Error> : ImplBase<vrento::fg::Error> {
+    auto fmt(fmt::Formatter& formatter) const -> bool {
+        const auto& value = this->self();
+        return formatter.write_str((rstd::format("frame graph error kind={} pass={} resource={}",
+                                                 int(value.kind),
+                                                 value.pass.value,
+                                                 value.resource.value))
+                                       .as_str());
+    }
+};
+template<>
+struct Impl<fmt::Debug, vrento::fg::Error> : ImplBase<vrento::fg::Error> {
+    auto fmt(fmt::Formatter& formatter) const -> bool {
+        return as<fmt::Display>(this->self()).fmt(formatter);
+    }
+};
+template<>
+struct Impl<error::Error, vrento::fg::Error> : DefaultInImpl<error::Error, vrento::fg::Error> {};
+} // namespace rstd

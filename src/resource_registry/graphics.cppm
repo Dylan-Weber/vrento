@@ -202,10 +202,13 @@ public:
             .pPushConstantRanges = vk_push_constants.data(),
         };
         vvk::PipelineLayout layout;
-        if (device.handle().CreatePipelineLayout(create_info, layout) != VK_SUCCESS) {
+        auto                created = device.handle().CreatePipelineLayout(create_info, layout);
+        if (created != VK_SUCCESS) {
             return Err(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::BackendFailure,
                 .message = rstd::format("create pipeline layout failed"),
+                .source  = Some(
+                    resource::ResourceErrorSource::Native(static_cast<rstd::int32_t>(created))),
             });
         }
 
@@ -364,10 +367,12 @@ private:
 
 class FramebufferRegistry {
 public:
-    auto Ensure(const Device& device, const FramebufferResourceRequest& request)
-        -> Option<FramebufferResourceResult> {
+    auto TryEnsure(const Device& device, const FramebufferResourceRequest& request)
+        -> Result<FramebufferResourceResult, resource::ResourceError> {
         if (request.render_pass == VK_NULL_HANDLE || request.attachments.is_empty()) {
-            return None();
+            return Err(resource::ResourceError {
+                .kind    = resource::ResourceErrorKind::MissingDefinition,
+                .message = "framebuffer render pass or attachments unavailable"_Str });
         }
 
         auto desc = MakeFramebufferResourceDesc(request);
@@ -375,7 +380,7 @@ public:
         auto slot = m_entries.get_mut(key);
         if (slot.is_some()) {
             ++(**slot).observed_count;
-            return Some(FramebufferResourceResult {
+            return Ok(FramebufferResourceResult {
                 .framebuffer          = (**slot).framebuffer.clone(),
                 .handle               = (**slot).handle,
                 .cache_key            = rstd::move(key),
@@ -400,9 +405,12 @@ public:
             .layers          = desc.layers,
         };
         vvk::Framebuffer framebuffer;
-        if (device.handle().CreateFramebuffer(info, framebuffer) != VK_SUCCESS) {
-            return None();
-        }
+        auto             created = device.handle().CreateFramebuffer(info, framebuffer);
+        if (created != VK_SUCCESS)
+            return Err(
+                resource::ResourceError { .message = "create framebuffer failed"_Str,
+                                          .source  = Some(resource::ResourceErrorSource::Native(
+                                              static_cast<rstd::int32_t>(created))) });
         auto shared = Arc<vvk::Framebuffer>::make(rstd::move(framebuffer));
         auto handle = NextHandle();
         (void)m_handles.insert(handle, shared.downgrade());
@@ -412,7 +420,7 @@ public:
                                    .handle         = handle,
                                    .observed_count = u64(1),
                                });
-        return Some(FramebufferResourceResult {
+        return Ok(FramebufferResourceResult {
             .framebuffer          = rstd::move(shared),
             .handle               = handle,
             .cache_key            = rstd::move(key),
@@ -421,6 +429,10 @@ public:
         });
     }
 
+    auto Ensure(const Device& device, const FramebufferResourceRequest& request)
+        -> Option<FramebufferResourceResult> {
+        return TryEnsure(device, request).ok();
+    }
     void PruneExpired() {
         m_entries.retain([&](const FramebufferCacheKey&, Entry& entry) {
             if (entry.framebuffer.strong_count() > usize(1)) return true;
@@ -485,18 +497,20 @@ struct RenderPassResourceResult {
 
 class RenderPassRegistry {
 public:
-    auto Ensure(const Device& device, const RenderPassResourceDesc& desc)
-        -> Option<RenderPassResourceResult> {
+    auto TryEnsure(const Device& device, const RenderPassResourceDesc& desc)
+        -> Result<RenderPassResourceResult, resource::ResourceError> {
         if ((desc.has_color_attachment && desc.color_load_op == VK_ATTACHMENT_LOAD_OP_LOAD &&
              desc.color_initial_layout == VK_IMAGE_LAYOUT_UNDEFINED) ||
             (desc.has_depth_attachment && desc.depth_load_op == VK_ATTACHMENT_LOAD_OP_LOAD &&
              desc.depth_initial_layout == VK_IMAGE_LAYOUT_UNDEFINED))
-            return None();
+            return Err(resource::ResourceError {
+                .kind    = resource::ResourceErrorKind::MissingDefinition,
+                .message = "render pass loads undefined attachment"_Str });
         auto key  = MakeRenderPassCacheKey(desc);
         auto slot = m_entries.get_mut(key);
         if (slot.is_some()) {
             ++(**slot).observed_count;
-            return Some(RenderPassResourceResult {
+            return Ok(RenderPassResourceResult {
                 .render_pass          = (**slot).render_pass.clone(),
                 .handle               = (**slot).handle,
                 .cache_key            = rstd::move(key),
@@ -506,7 +520,7 @@ public:
         }
 
         auto created = CreateRenderPass(device, desc);
-        if (created.is_none()) return None();
+        if (created.is_err()) return Err(rstd::move(created).unwrap_err());
         auto shared = Arc<vvk::RenderPass>::make(rstd::move(*created));
         auto handle = NextHandle();
         (void)m_handles.insert(handle, shared.downgrade());
@@ -516,7 +530,7 @@ public:
                                    .handle         = handle,
                                    .observed_count = u64(1),
                                });
-        return Some(RenderPassResourceResult {
+        return Ok(RenderPassResourceResult {
             .render_pass          = rstd::move(shared),
             .handle               = handle,
             .cache_key            = rstd::move(key),
@@ -525,6 +539,10 @@ public:
         });
     }
 
+    auto Ensure(const Device& device, const RenderPassResourceDesc& desc)
+        -> Option<RenderPassResourceResult> {
+        return TryEnsure(device, desc).ok();
+    }
     auto Ensure(const Device& device, const PipelineResourceRequest& request)
         -> Option<RenderPassResourceResult> {
         return Ensure(device, MakeRenderPassResourceDesc(request));
@@ -570,7 +588,7 @@ private:
     using HandleMap = HashMap<resource::RenderPassHandle, Weak<vvk::RenderPass>>;
 
     static auto CreateRenderPass(const Device& device, const RenderPassResourceDesc& desc)
-        -> Option<vvk::RenderPass> {
+        -> Result<vvk::RenderPass, resource::ResourceError> {
         const bool              has_color   = desc.has_color_attachment;
         const bool              has_resolve = has_color && desc.has_resolve_attachment;
         VkAttachmentDescription color {
@@ -661,8 +679,13 @@ private:
             .pDependencies   = &dependency,
         };
         vvk::RenderPass pass;
-        if (device.handle().CreateRenderPass(create, pass) != VK_SUCCESS) return None();
-        return Some(rstd::move(pass));
+        auto            created = device.handle().CreateRenderPass(create, pass);
+        if (created != VK_SUCCESS)
+            return Err(
+                resource::ResourceError { .message = "create render pass failed"_Str,
+                                          .source  = Some(resource::ResourceErrorSource::Native(
+                                              static_cast<rstd::int32_t>(created))) });
+        return Ok(rstd::move(pass));
     }
 
     HashMap<RenderPassCacheKey, Entry, rstd::hash::RandomState, RenderPassCacheKeyEqual> m_entries;
@@ -671,11 +694,11 @@ private:
     HandleMap m_handles;
 };
 
-inline auto create_pipeline_resource(const Device& device, const PipelineResourceDesc& desc,
-                                     const RenderPassResourceDesc&           signature,
-                                     const vvk::RenderPass&                  pass,
-                                     const Arc<PipelineLayoutResourceEntry>& layout,
-                                     VkPipelineCache cache) -> Option<Arc<PipelineResourceEntry>> {
+inline auto
+create_pipeline_resource(const Device& device, const PipelineResourceDesc& desc,
+                         const RenderPassResourceDesc& signature, const vvk::RenderPass& pass,
+                         const Arc<PipelineLayoutResourceEntry>& layout, VkPipelineCache cache)
+    -> Result<Arc<PipelineResourceEntry>, resource::ResourceError> {
     auto               started = rstd::time::Instant::now();
     GraphicsPipeline   pipeline;
     PipelineParameters pipeline_parameters;
@@ -701,10 +724,9 @@ inline auto create_pipeline_resource(const Device& device, const PipelineResourc
     for (const auto& spv : desc.shader_stages) {
         pipeline.addStage(Box<ShaderSpv>::make(spv.clone()));
     }
-    if (! pipeline.create(device, *pass, *layout->layout, pipeline_parameters, cache)) {
-        return None();
-    }
-    return Some(Arc<PipelineResourceEntry>::make(PipelineResourceEntry {
+    auto created = pipeline.tryCreate(device, *pass, *layout->layout, pipeline_parameters, cache);
+    if (created.is_err()) return Err(rstd::move(created).unwrap_err());
+    return Ok(Arc<PipelineResourceEntry>::make(PipelineResourceEntry {
         .creation_nanoseconds = u64(rstd::uint64_t(started.elapsed().as_nanos().to_primitive())),
         .pipeline             = rstd::move(pipeline_parameters),
         .layout               = layout.clone(),
@@ -722,6 +744,7 @@ class PipelineBuild {
         PipelineReadiness                  status { PipelineReadiness::Pending };
         Option<Arc<PipelineResourceEntry>> result;
         bool                               started {};
+        Option<resource::ResourceError>    error;
     };
     Option<PipelineResourceDesc>             desc_;
     Option<Arc<vvk::RenderPass>>             pass_;
@@ -744,10 +767,23 @@ public:
         auto state = outcome_.lock().unwrap();
         return state->status == PipelineReadiness::Ready ? Some(state->result->clone()) : None();
     }
+    auto error() const -> Option<resource::ResourceError> {
+        auto state = outcome_.lock().unwrap();
+        return state->error ? Some(state->error->clone()) : None<resource::ResourceError>();
+    }
+    void fail(resource::ResourceError error) {
+        auto state = outcome_.lock().unwrap();
+        if (state->started || state->status != PipelineReadiness::Pending) return;
+        state->status = PipelineReadiness::Failed;
+        state->error  = Some(rstd::move(error));
+    }
     void cancel() {
         auto state = outcome_.lock().unwrap();
-        if (! state->started && state->status == PipelineReadiness::Pending)
+        if (! state->started && state->status == PipelineReadiness::Pending) {
             state->status = PipelineReadiness::Failed;
+            state->error  = Some(resource::ResourceError {
+                .message = "pipeline build cancelled before execution"_Str });
+        }
     }
     void execute(const Device& device) {
         {
@@ -755,14 +791,29 @@ public:
             if (state->started || state->status != PipelineReadiness::Pending) return;
             state->started = true;
         }
-        auto created  = device.lost()
-                            ? None<Arc<PipelineResourceEntry>>()
-                            : create_pipeline_resource(
-                                  device, *desc_, desc_->render_pass, **pass_, *layout_, ***cache_);
-        auto state    = outcome_.lock().unwrap();
-        state->status = created.is_some() && ! device.lost() ? PipelineReadiness::Ready
-                                                             : PipelineReadiness::Failed;
-        if (state->status == PipelineReadiness::Ready) state->result = rstd::move(created);
+        auto created = [&]() -> Result<Arc<PipelineResourceEntry>, resource::ResourceError> {
+            if (device.lost())
+                return Err(resource::ResourceError {
+                    .message = "pipeline device lost"_Str,
+                    .source  = Some(resource::ResourceErrorSource::Native(
+                        static_cast<rstd::int32_t>(VK_ERROR_DEVICE_LOST))) });
+            return create_pipeline_resource(
+                device, *desc_, desc_->render_pass, **pass_, *layout_, ***cache_);
+        }();
+        auto state = outcome_.lock().unwrap();
+        if (created.is_err()) {
+            state->status = PipelineReadiness::Failed;
+            state->error  = Some(rstd::move(created).unwrap_err());
+        } else if (device.lost()) {
+            state->status = PipelineReadiness::Failed;
+            state->error  = Some(
+                resource::ResourceError { .message = "pipeline device lost"_Str,
+                                          .source  = Some(resource::ResourceErrorSource::Native(
+                                              static_cast<rstd::int32_t>(VK_ERROR_DEVICE_LOST))) });
+        } else {
+            state->status = PipelineReadiness::Ready;
+            state->result = Some(rstd::move(created).unwrap());
+        }
     }
 };
 struct PipelineBuildRequest {
@@ -786,27 +837,42 @@ public:
     auto driver_cache() -> DriverPipelineCache& { return m_driver; }
     auto RequestRecipe(const Device& device, resource::PipelineRecipeHandle recipe,
                        const RenderPassResourceDesc& render_pass, RenderPassRegistry& passes,
-                       bool retry = false) -> Option<PipelineBuildRequest> {
-        if (! BindDevice(device)) return None();
+                       bool retry = false)
+        -> Result<PipelineBuildRequest, resource::ResourceError> {
+        if (! BindDevice(device))
+            return Err(resource::ResourceError { .kind    = resource::ResourceErrorKind::Device,
+                                                 .message = "pipeline device mismatch"_Str });
         auto found = m_recipes.get(recipe);
         if (found.is_none() ||
             render_pass.samples != (**found).desc.multisample.rasterizationSamples)
-            return None();
+            return Err(resource::ResourceError {
+                .kind    = resource::ResourceErrorKind::MissingDefinition,
+                .message = "pipeline recipe missing or incompatible"_Str });
         auto key    = MakePipelineVariantKey((**found).state_key, render_pass);
         auto cached = m_entries.get(key);
         if (cached)
-            return Some(PipelineBuildRequest {
-                Arc<PipelineBuild>::make((**cached).pipeline.clone()), false });
+            return Ok(PipelineBuildRequest { Arc<PipelineBuild>::make((**cached).pipeline.clone()),
+                                             false });
         auto pending = m_pending.get(key);
         if (pending) {
             if (! retry || (**pending)->status() != PipelineReadiness::Failed)
-                return Some(PipelineBuildRequest { (**pending).clone(), false });
+                return Ok(PipelineBuildRequest { (**pending).clone(), false });
             (void)m_pending.remove(key);
         }
-        if (m_pending.len() >= m_limits.max_entries || device.lost()) return None();
-        auto pass = passes.Ensure(device, render_pass);
-        if (pass.is_none()) return None();
-        if (! m_driver.handle(device) && m_driver.initialize(device).is_err()) return None();
+        if (m_pending.len() >= m_limits.max_entries || device.lost())
+            return Err(
+                resource::ResourceError { .message = "pipeline queue limit or device lost"_Str });
+        auto pass = passes.TryEnsure(device, render_pass);
+        if (pass.is_err()) return Err(rstd::move(pass).unwrap_err());
+        if (! m_driver.handle(device)) {
+            auto initialized = m_driver.initialize(device);
+            if (initialized.is_err())
+                return Err(resource::ResourceError {
+                    .message = rstd::format("initialize pipeline cache stage={}",
+                                            int(initialized.unwrap_err().stage)),
+                    .source  = Some(resource::ResourceErrorSource::Native(
+                        static_cast<rstd::int32_t>(initialized.unwrap_err().native))) });
+        }
         auto desc        = (**found).desc.clone();
         desc.render_pass = render_pass;
         auto work        = Arc<PipelineBuild>::make(rstd::move(desc),
@@ -815,17 +881,22 @@ public:
                                                     m_driver.lease(device));
         ++m_stats.misses;
         (void)m_pending.insert(rstd::move(key), work.clone());
-        return Some(PipelineBuildRequest { rstd::move(work), true });
+        return Ok(PipelineBuildRequest { rstd::move(work), true });
     }
-    auto Ensure(const Device& device, PipelineResourceRequest request,
-                RenderPassRegistry& render_pass_cache, PipelineLayoutRegistry& pipeline_layouts)
-        -> Option<PipelineResourceResult> {
+    auto TryEnsure(const Device& device, PipelineResourceRequest request,
+                   RenderPassRegistry& render_pass_cache, PipelineLayoutRegistry& pipeline_layouts)
+        -> Result<PipelineResourceResult, resource::ResourceError> {
         auto desc  = MakePipelineResourceDesc(request);
         auto state = InternState(MakePipelineStateKey(desc));
-        if (state.is_none()) return None();
+        if (state.is_none())
+            return Err(resource::ResourceError { .message = "pipeline state limit reached"_Str });
         auto key = MakePipelineVariantKey(StateReferenceKey(*state), desc.render_pass);
         return EnsureDescription(
             device, desc, desc.render_pass, rstd::move(key), render_pass_cache, pipeline_layouts);
+    }
+    auto Ensure(const Device& device, PipelineResourceRequest request, RenderPassRegistry& passes,
+                PipelineLayoutRegistry& layouts) -> Option<PipelineResourceResult> {
+        return TryEnsure(device, rstd::move(request), passes, layouts).ok();
     }
     auto RegisterRecipe(PipelineResourceRequest request, const PipelineLayoutRegistry& layouts)
         -> Option<resource::PipelineRecipeHandle> {
@@ -840,16 +911,24 @@ public:
             Recipe { rstd::move(desc), StateReferenceKey(*state), rstd::move(layout).unwrap() });
         return Some(handle);
     }
-    auto EnsureRecipe(const Device& device, resource::PipelineRecipeHandle recipe,
-                      const RenderPassResourceDesc& render_pass, RenderPassRegistry& passes,
-                      PipelineLayoutRegistry& layouts) -> Option<PipelineResourceResult> {
+    auto TryEnsureRecipe(const Device& device, resource::PipelineRecipeHandle recipe,
+                         const RenderPassResourceDesc& render_pass, RenderPassRegistry& passes,
+                         PipelineLayoutRegistry& layouts)
+        -> Result<PipelineResourceResult, resource::ResourceError> {
         auto found = m_recipes.get(recipe);
         if (found.is_none() ||
             render_pass.samples != (**found).desc.multisample.rasterizationSamples)
-            return None();
+            return Err(resource::ResourceError {
+                .kind    = resource::ResourceErrorKind::MissingDefinition,
+                .message = "pipeline recipe missing or incompatible"_Str });
         auto key = MakePipelineVariantKey((**found).state_key, render_pass);
         return EnsureDescription(
             device, (**found).desc, render_pass, rstd::move(key), passes, layouts);
+    }
+    auto EnsureRecipe(const Device& device, resource::PipelineRecipeHandle recipe,
+                      const RenderPassResourceDesc& render_pass, RenderPassRegistry& passes,
+                      PipelineLayoutRegistry& layouts) -> Option<PipelineResourceResult> {
+        return TryEnsureRecipe(device, recipe, render_pass, passes, layouts).ok();
     }
     auto MatchesRecipe(resource::PipelineRecipeHandle recipe,
                        const PipelineResourceRequest& request) const -> bool {
@@ -870,16 +949,17 @@ private:
                            const RenderPassResourceDesc& render_pass_desc, PipelineCacheKey key,
                            RenderPassRegistry&     render_pass_cache,
                            PipelineLayoutRegistry& pipeline_layouts)
-        -> Option<PipelineResourceResult> {
-        if (! BindDevice(device)) return None();
-        auto render_pass = render_pass_cache.Ensure(device, render_pass_desc);
-        if (render_pass.is_none()) return None();
+        -> Result<PipelineResourceResult, resource::ResourceError> {
+        if (! BindDevice(device))
+            return Err(resource::ResourceError { .message = "pipeline device mismatch"_Str });
+        auto render_pass = render_pass_cache.TryEnsure(device, render_pass_desc);
+        if (render_pass.is_err()) return Err(rstd::move(render_pass).unwrap_err());
         auto slot = m_entries.get_mut(key);
         if (slot.is_some()) {
             ++m_stats.hits;
             ++(**slot).observed_count;
             (**slot).last_used = m_collection;
-            return Some(PipelineResourceResult {
+            return Ok(PipelineResourceResult {
                 .pipeline                         = (**slot).pipeline.clone(),
                 .handle                           = (**slot).handle,
                 .render_pass                      = render_pass->handle,
@@ -896,22 +976,39 @@ private:
         Option<Arc<PipelineResourceEntry>> created;
         if (pending) {
             created = (**pending)->result();
-            if (created.is_none() || device.lost()) return None();
+            if (created.is_none() || device.lost()) {
+                auto error = (**pending)->error();
+                if (error) return Err(rstd::move(*error));
+                return Err(resource::ResourceError { .kind = resource::ResourceErrorKind::Pending,
+                                                     .message = "pipeline build pending"_Str });
+            }
             (void)m_pending.remove(key);
         } else {
             ++m_stats.misses;
             auto pipeline_layout = pipeline_layouts.Resolve(desc.pipeline_layout);
-            if (pipeline_layout.is_none()) return None();
-            if (! m_driver.handle(device) && m_driver.initialize(device).is_err()) return None();
+            if (pipeline_layout.is_none())
+                return Err(
+                    resource::ResourceError { .message = "pipeline layout unavailable"_Str });
+            if (! m_driver.handle(device)) {
+                auto initialized = m_driver.initialize(device);
+                if (initialized.is_err())
+                    return Err(resource::ResourceError {
+                        .message = "initialize pipeline cache failed"_Str,
+                        .source  = Some(resource::ResourceErrorSource::Native(
+                            static_cast<rstd::int32_t>(initialized.unwrap_err().native))) });
+            }
 
-            created = create_pipeline_resource(device,
-                                               desc,
-                                               render_pass_desc,
-                                               *render_pass->render_pass,
-                                               *pipeline_layout,
-                                               m_driver.handle(device));
+            auto compiled = create_pipeline_resource(device,
+                                                     desc,
+                                                     render_pass_desc,
+                                                     *render_pass->render_pass,
+                                                     *pipeline_layout,
+                                                     m_driver.handle(device));
+            if (compiled.is_err()) return Err(rstd::move(compiled).unwrap_err());
+            created = Some(rstd::move(compiled).unwrap());
         }
-        if (created.is_none()) return None();
+        if (created.is_none())
+            return Err(resource::ResourceError { .message = "pipeline result unavailable"_Str });
         auto entry = rstd::move(created).unwrap();
         ++m_stats.creations;
         m_stats.creation_nanoseconds += entry->creation_nanoseconds;
@@ -928,7 +1025,7 @@ private:
                                    .last_used            = m_collection,
                                });
         m_stats.peak_entries = rstd::cmp::max(m_stats.peak_entries, m_entries.len());
-        return Some(PipelineResourceResult {
+        return Ok(PipelineResourceResult {
             .pipeline                         = rstd::move(entry),
             .handle                           = handle,
             .render_pass                      = render_pass->handle,
@@ -1084,13 +1181,19 @@ public:
           m_diagnostics(
               mut_ref<FramebufferCacheDiagnostics>::from_raw_parts(rstd::addressof(diagnostics))) {}
 
-    auto CreateFramebuffer(const FramebufferResourceRequest& request)
-        -> Option<FramebufferResourceResult> {
+    auto TryCreateFramebuffer(const FramebufferResourceRequest& request)
+        -> Result<FramebufferResourceResult, resource::ResourceError> {
         if (request.render_pass == VK_NULL_HANDLE || request.attachments.is_empty()) {
-            return None();
+            return Err(resource::ResourceError {
+                .kind    = resource::ResourceErrorKind::MissingDefinition,
+                .message = "framebuffer render pass or attachments unavailable"_Str });
         }
         m_diagnostics->Record(MakeFramebufferCacheKey(request));
-        return m_cache->Ensure(*m_device, request);
+        return m_cache->TryEnsure(*m_device, request);
+    }
+    auto CreateFramebuffer(const FramebufferResourceRequest& request)
+        -> Option<FramebufferResourceResult> {
+        return TryCreateFramebuffer(request).ok();
     }
 
 private:
@@ -1112,6 +1215,11 @@ public:
           m_render_pass_cache(mut_ref<RenderPassResourceCache>::from_raw_parts(
               rstd::addressof(render_pass_cache))) {}
 
+    auto TryCreateGraphicsPipeline(PipelineResourceRequest request)
+        -> Result<PipelineResourceResult, resource::ResourceError> {
+        return m_pipeline_cache->TryEnsure(
+            *m_device, rstd::move(request), *m_render_pass_cache, *m_pipeline_layouts);
+    }
     auto CreateGraphicsPipeline(PipelineResourceRequest request) -> Option<PipelineResourceResult> {
         return m_pipeline_cache->Ensure(
             *m_device, rstd::move(request), *m_render_pass_cache, *m_pipeline_layouts);

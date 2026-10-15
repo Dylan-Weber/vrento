@@ -150,17 +150,20 @@ struct FakeShaderBackend {
         return true;
     }
 
-    bool CompileAndLinkShaderUnits(slice<ShaderCompUnit> units, const ShaderCompOpt& options,
-                                   Vec<Uni_ShaderSpv>& output) const {
+    auto CompileAndLinkShaderUnits(slice<ShaderCompUnit> units, const ShaderCompOpt& options,
+                                   Vec<Uni_ShaderSpv>& output) const
+        -> Result<empty, vrento::resource::ResourceError> {
         ++counts->compile;
+        if (counts->fail)
+            return Err(vrento::resource::ResourceError {
+                .message = String::make("test shader failure"_str) });
         rstd_assert(units.len() == usize(1) && options.target == VulkanTarget::Vulkan_1_1);
-        if (counts->fail) return false;
         auto stage         = Box<ShaderSpv>::make();
         stage->stage       = units[usize()].stage;
         stage->entry_point = units[usize()].entry_point.clone();
         stage->spirv.push(0x07230203u);
         output.push(rstd::move(stage));
-        return true;
+        return Ok(empty {});
     }
 
     bool GenReflect(slice<ShaderCode> codes, Vec<Uni_ShaderSpv>&, ShaderReflected& output) const {
@@ -200,8 +203,9 @@ struct Impl<ShaderBackend, vrento_test::foundation::FakeShaderBackend>
     bool Preprocess(ref<str> source, ShaderType stage, SourceLang lang, String& output) const {
         return this->self().Preprocess(source, stage, lang, output);
     }
-    bool CompileAndLinkShaderUnits(slice<ShaderCompUnit> units, const ShaderCompOpt& options,
-                                   Vec<Uni_ShaderSpv>& output) const {
+    auto CompileAndLinkShaderUnits(slice<ShaderCompUnit> units, const ShaderCompOpt& options,
+                                   Vec<Uni_ShaderSpv>& output) const
+        -> Result<empty, vrento::resource::ResourceError> {
         return this->self().CompileAndLinkShaderUnits(units, options, output);
     }
     bool GenReflect(slice<ShaderCode> codes, Vec<Uni_ShaderSpv>& stages,
@@ -387,7 +391,8 @@ TEST(Foundation, Resources) {
             ShaderCompUnit { ShaderType::FRAGMENT, "source"_Str, "entry"_Str, SourceLang::Hlsl },
         };
         Vec<Uni_ShaderSpv> stages;
-        rstd_assert(view->CompileAndLinkShaderUnits(units.as_slice(), ShaderCompOpt {}, stages));
+        rstd_assert(
+            view->CompileAndLinkShaderUnits(units.as_slice(), ShaderCompOpt {}, stages).is_ok());
         rstd_assert(stages.len() == usize(1) &&
                     stages[usize()]->entry_point.as_str() == "entry"_str);
         Vec<ShaderCode> codes;
@@ -398,11 +403,22 @@ TEST(Foundation, Resources) {
         counts.fail = true;
         rstd_assert(
             ! view->Preprocess("source"_str, ShaderType::FRAGMENT, SourceLang::Hlsl, preprocessed));
-        rstd_assert(! view->CompileAndLinkShaderUnits(units.as_slice(), ShaderCompOpt {}, stages));
+        rstd_assert(
+            ! view->CompileAndLinkShaderUnits(units.as_slice(), ShaderCompOpt {}, stages).is_ok());
         rstd_assert(! view->GenReflect(codes.as_slice(), stages, reflected));
         rstd_assert(counts.destroyed == 0);
     }
     rstd_assert(counts.preprocess == 2 && counts.compile == 2 && counts.reflect == 2);
     rstd_assert(counts.destroyed == 1);
+}
+TEST(RenderFoundation, OutputRecipeRetainsShaderFailure) {
+    Counts counts;
+    counts.fail  = true;
+    auto backend = Box<dyn<ShaderBackend>>::make(FakeShaderBackend(counts));
+    auto result =
+        texture_output_recipe(backend.as_ref(), {}, {}, {}, VK_FORMAT_R8G8B8A8_UNORM, true);
+    ASSERT_TRUE(result.is_err());
+    auto error = rstd::move(result).unwrap_err();
+    EXPECT_TRUE(error.message.as_str() == "test shader failure"_str);
 }
 } // namespace vrento_test::foundation

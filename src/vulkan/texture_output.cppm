@@ -61,13 +61,11 @@ void main() {
         ShaderCompUnit { ShaderType::FRAGMENT, rstd::move(fragment) }
     };
     Vec<Uni_ShaderSpv> stages;
-    if (! backend->CompileAndLinkShaderUnits(
-            units.as_slice(),
-            ShaderCompOpt { .target = VulkanTarget::Vulkan_1_1, .optimize = true },
-            stages))
-        return Err(
-            resource::ResourceError { .kind    = resource::ResourceErrorKind::MissingContent,
-                                      .message = "texture output shader compilation failed"_Str });
+    auto               compiled = backend->CompileAndLinkShaderUnits(
+        units.as_slice(),
+        ShaderCompOpt { .target = VulkanTarget::Vulkan_1_1, .optimize = true },
+        stages);
+    if (compiled.is_err()) return Err(rstd::move(compiled).unwrap_err());
     GraphicsPipeline defaults;
     defaults.toDefault();
     PipelineResourceRequest request {

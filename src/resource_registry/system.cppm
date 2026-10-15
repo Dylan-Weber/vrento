@@ -216,11 +216,7 @@ struct ResourcePrepareStatus {
     resource::ResourcePlanSections  sections {};
     Option<resource::ResourceError> error;
     auto                            clone() const -> ResourcePrepareStatus {
-        return { id,
-                 state,
-                 sections,
-                 error ? Some(resource::ResourceError { error->kind, error->message.clone() })
-                       : None() };
+        return { id, state, sections, error ? Some(error->clone()) : None() };
     }
 };
 
@@ -247,9 +243,7 @@ public:
             return Err(resource::ResourceError { resource::ResourceErrorKind::BackendFailure,
                                                  rstd::format("pipeline preparation is busy") });
         auto created = vulkan::PipelinePreparationQueue::create(TextureContext().session(), mode);
-        if (created.is_err())
-            return Err(resource::ResourceError { resource::ResourceErrorKind::BackendFailure,
-                                                 rstd::format("pipeline worker unavailable") });
+        if (created.is_err()) return Err(rstd::move(created).unwrap_err());
         m_pipeline_preparation = Some(created.unwrap());
         return Ok(empty {});
     }
@@ -369,8 +363,7 @@ public:
                 .message = rstd::format("texture prepare transaction is already active")
             };
             m_prepare_status.state = ResourcePrepareState::Failed;
-            m_prepare_status.error =
-                Some(resource::ResourceError { error.kind, error.message.clone() });
+            m_prepare_status.error = Some(error.clone());
             return Err(rstd::move(error));
         }
         auto image_backend  = dyn<TexturePrepareBackend>::from_ref(m_registries.Textures());
@@ -469,9 +462,12 @@ public:
         if (id != m_prepare_status.id || m_prepare_status.state != ResourcePrepareState::Prepared)
             return Err(resource::ResourceError {
                 .message = rstd::format("resource prepare transaction is not prepared") });
-        if (! CommitUploads()) {
-            auto error = resource::ResourceError { .message = rstd::format(
-                                                       "submit prepared uploads failed") };
+        auto submitted = TryCommitUploads();
+        if (submitted.is_err()) {
+            auto error = resource::ResourceError {
+                .message = rstd::format("submit prepared uploads failed"),
+                .source  = Some(resource::ResourceErrorSource::Texture(submitted.unwrap_err()))
+            };
             FailPreparePlan(error);
             return Err(rstd::move(error));
         }
@@ -545,10 +541,9 @@ public:
             }
             auto& entry    = m_pipeline_recipes[index];
             auto  prepared = m_pipeline_preparation->prepare(entry.recipe, entry.signature);
-            if (prepared.is_err())
-                return Err(resource::ResourceError { resource::ResourceErrorKind::BackendFailure,
-                                                     rstd::format("pipeline task failed") });
-            auto value = prepared.unwrap();
+            if (prepared.is_err()) return Err(rstd::move(prepared).unwrap_err());
+            auto value = rstd::move(prepared).unwrap();
+            if (value.error) return Err(rstd::move(*value.error));
             if (value.status == PipelineReadiness::Pending)
                 return Err(resource::ResourceError { resource::ResourceErrorKind::Pending,
                                                      rstd::format("pipeline is pending") });
@@ -560,7 +555,9 @@ public:
                                           m_registries.PipelineLayouts(),
                                           m_registries.PipelineCache(),
                                           m_registries.RenderPassCache());
-            result = system.CreateGraphicsPipeline(rstd::move(request));
+            auto                   prepared = system.TryCreateGraphicsPipeline(rstd::move(request));
+            if (prepared.is_err()) return Err(rstd::move(prepared).unwrap_err());
+            result = Some(rstd::move(prepared).unwrap());
         }
         if (result.is_none()) {
             return Err(resource::ResourceError {
@@ -604,18 +601,13 @@ public:
         }
         FramebufferResourceSystem system(
             device, m_registries.FramebufferCache(), m_registries.FramebufferDiagnostics());
-        auto result = system.CreateFramebuffer(vulkan::FramebufferResourceRequest {
+        auto result = system.TryCreateFramebuffer(vulkan::FramebufferResourceRequest {
             .render_pass     = **(**render_pass).physical,
             .render_pass_key = (**render_pass).cache_key.clone(),
             .attachments     = rstd::move(attachments),
             .extent          = extent,
         });
-        if (result.is_none()) {
-            return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::BackendFailure,
-                .message = rstd::format("prepare framebuffer failed"),
-            });
-        }
+        if (result.is_err()) return Err(rstd::move(result).unwrap_err());
         if (! m_prepared.Insert(PreparedFramebuffer {
                 .use      = framebuffer_use,
                 .resource = result->handle,
@@ -637,13 +629,8 @@ public:
     auto PrepareRenderPass(resource::RenderPassUseHandle use, const vulkan::Device& device,
                            const vulkan::RenderPassResourceDesc& desc)
         -> Result<RenderPassPreparation, resource::ResourceError> {
-        auto result = m_registries.RenderPasses().Ensure(device, desc);
-        if (result.is_none()) {
-            return Err(resource::ResourceError {
-                .kind    = resource::ResourceErrorKind::BackendFailure,
-                .message = rstd::format("prepare render pass failed"),
-            });
-        }
+        auto result = m_registries.RenderPasses().TryEnsure(device, desc);
+        if (result.is_err()) return Err(rstd::move(result).unwrap_err());
         if (! m_prepared.Insert(PreparedRenderPass {
                 .use       = use,
                 .resource  = result->handle,
@@ -835,13 +822,14 @@ public:
         return Ok(rstd::move(token));
     }
 
-    bool CommitUploads() {
-        if (! Ready()) return false;
+    auto TryCommitUploads() -> Result<empty, texture::Error> {
+        if (! Ready()) return Err(texture::Error { texture::ErrorKind::Closed });
         m_registries.TextureEntries().ReservePublications();
         auto result = m_registries.Textures().Flush();
         m_registries.TextureEntries().PublishSubmitted();
-        return result.is_ok();
+        return result;
     }
+    bool CommitUploads() { return TryCommitUploads().is_ok(); }
 
     bool WaitSubmission(const texture::SubmissionToken& token,
                         texture::Serial                 timeout = 5'000'000'000) {
@@ -849,9 +837,14 @@ public:
         return m_registries.Textures().Poll().is_ok();
     }
 
+    auto TryWaitForUploads(texture::Serial timeout = 5'000'000'000)
+        -> Result<empty, texture::Error> {
+        auto committed = TryCommitUploads();
+        if (committed.is_err()) return committed;
+        return m_registries.Textures().WaitForUploads(timeout);
+    }
     bool WaitForUploads(texture::Serial timeout = 5'000'000'000) {
-        if (! CommitUploads()) return false;
-        return m_registries.Textures().WaitForUploads(timeout).is_ok();
+        return TryWaitForUploads(timeout).is_ok();
     }
 
     bool UseTexture(texture::Submission& work, resource::TextureUseHandle use,
@@ -922,9 +915,10 @@ public:
         (void)m_registries.Textures().Poll();
     }
 
-    bool PumpVideoTextures(double seconds) {
-        return m_registries.TextureEntries().Pump(TextureContext(), seconds).is_ok();
+    auto TryPumpVideoTextures(double seconds) -> Result<empty, resource::ResourceError> {
+        return m_registries.TextureEntries().Pump(TextureContext(), seconds);
     }
+    bool PumpVideoTextures(double seconds) { return TryPumpVideoTextures(seconds).is_ok(); }
     void SetVideoDecodeOptions(vulkan::MediaDecodeOptions options) {
         if (Ready())
             m_registries.Textures().SetVideoDecodeOptions(rstd::move(options));
@@ -1045,8 +1039,7 @@ private:
     void FailPreparePlan(const resource::ResourceError& error) {
         AbortPreparePlan();
         m_prepare_status.state = ResourcePrepareState::Failed;
-        m_prepare_status.error =
-            Some(resource::ResourceError { error.kind, error.message.clone() });
+        m_prepare_status.error = Some(error.clone());
     }
     struct PipelineRecipeEntry {
         resource::PipelineUseHandle    use;

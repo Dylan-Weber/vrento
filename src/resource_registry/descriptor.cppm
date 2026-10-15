@@ -134,10 +134,13 @@ public:
             .pBindings    = bindings.data(),
         };
         vvk::DescriptorSetLayout layout;
-        if (device.handle().CreateDescriptorSetLayout(create_info, layout) != VK_SUCCESS) {
+        auto created = device.handle().CreateDescriptorSetLayout(create_info, layout);
+        if (created != VK_SUCCESS) {
             return Err(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::BackendFailure,
                 .message = rstd::format("create descriptor set layout failed"),
+                .source  = Some(
+                    resource::ResourceErrorSource::Native(static_cast<rstd::int32_t>(created))),
             });
         }
 
@@ -828,6 +831,8 @@ private:
                 .kind    = resource::ResourceErrorKind::BackendFailure,
                 .message = rstd::format("create descriptor pool failed: {}",
                                         static_cast<rstd::int32_t>(created.api_result)),
+                .source  = Some(resource::ResourceErrorSource::Native(
+                    static_cast<rstd::int32_t>(created.api_result))),
             });
         }
         return Ok(rstd::move(*created.arena));

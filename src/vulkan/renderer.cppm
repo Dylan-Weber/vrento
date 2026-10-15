@@ -83,7 +83,10 @@ public:
         factories_.push({ type, rstd::move(factory) });
         return Ok(empty {});
     }
-    auto status() const -> CompileStatus { return status_; }
+    auto status() const -> CompileStatus {
+        return { status_.id,   status_.state, status_.error.clone(),
+                 status_.kind, status_.scope, status_.reason };
+    }
     auto ready() const -> bool {
         return session_.valid() && ! session_.lost() && status_.state == CompileState::Ready &&
                (status_.kind == CompileKind::Graph ? compiled_.is_some()
@@ -134,10 +137,10 @@ private:
             status_.state = CompileState::Ready;
             status_.error = None();
         } else {
-            auto error    = result.unwrap_err();
-            status_.state = error.stage == GraphExecutionStage::Pending ? CompileState::Pending
-                                                                        : CompileState::Failed;
-            status_.error = Some(error);
+            const auto& error = result.as_ref().unwrap_err();
+            status_.state     = error.stage == GraphExecutionStage::Pending ? CompileState::Pending
+                                                                            : CompileState::Failed;
+            status_.error     = Some(GraphExecutionError(error));
             if (status_.state == CompileState::Failed) {
                 ++statistics_.compile_failures;
                 pending_ = None();

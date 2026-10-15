@@ -220,7 +220,8 @@ TEST(PipelineCache, AsyncPreparation) {
     rstd_assert(again.pipeline->handle == ready.pipeline->handle);
     rstd_assert(graphics.pipelines.stats().creations == u64(2));
     rstd_assert(preparer.poll(low)->status == PipelineReadiness::Failed);
-    rstd_assert(preparer.request(high_recipe, scope).unwrap_err() == PipelinePrepareError::Closed);
+    rstd_assert(preparer.request(high_recipe, scope).unwrap_err().kind ==
+                vrento::resource::ResourceErrorKind::Closed);
     auto retry   = PipelinePreparer::create(session).unwrap();
     auto retried = retry.request(low_recipe, scope, 0, true).unwrap();
     retry.advance();
@@ -281,7 +282,8 @@ TEST(PipelineCache, PreparationDeviceLoss) {
     session.observe_result(VK_ERROR_DEVICE_LOST);
     rstd_assert(worker.poll(queued)->status == PipelineReadiness::Failed);
     rstd_assert(queued.build->status() == PipelineReadiness::Failed);
-    rstd_assert(worker.request(recipe, signature).unwrap_err() == PipelinePrepareError::Device);
+    rstd_assert(worker.request(recipe, signature).unwrap_err().kind ==
+                vrento::resource::ResourceErrorKind::Device);
     worker.close();
     rstd_assert(graphics.pipelines.stats().creations == u64());
 }

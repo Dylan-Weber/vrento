@@ -665,3 +665,25 @@ struct SubmissionQueue {
     using Funcs = rstd::TraitFuncs<&T::Begin, &T::Submit, &T::Poll>;
 };
 } // namespace vrento::texture
+
+export namespace rstd
+{
+template<>
+struct Impl<fmt::Display, vrento::texture::Error> : ImplBase<vrento::texture::Error> {
+    auto fmt(fmt::Formatter& formatter) const -> bool {
+        const auto& value = this->self();
+        return formatter.write_str(
+            (rstd::format("texture error kind={} native={}", int(value.kind), value.native))
+                .as_str());
+    }
+};
+template<>
+struct Impl<fmt::Debug, vrento::texture::Error> : ImplBase<vrento::texture::Error> {
+    auto fmt(fmt::Formatter& formatter) const -> bool {
+        return as<fmt::Display>(this->self()).fmt(formatter);
+    }
+};
+template<>
+struct Impl<error::Error, vrento::texture::Error>
+    : DefaultInImpl<error::Error, vrento::texture::Error> {};
+} // namespace rstd

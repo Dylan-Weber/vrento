@@ -89,10 +89,22 @@ TEST(RenderResourceSystem, OwnsPreparationAndRejectsStaleCommitOrCancel) {
     invalid.DeclareTexture({ .kind = vrento::resource::TextureRequestKind::RenderTarget,
                              .name = "missing-definition"_Str },
                            vrento::resource::ResourceAccess::Write);
-    EXPECT_TRUE(resources.BeginPreparePlan(invalid, {}).is_err());
+    auto rejected = resources.BeginPreparePlan(invalid, {});
+    ASSERT_TRUE(rejected.is_err());
+    auto reason = rstd::move(rejected).unwrap_err();
+    ASSERT_EQ(reason.textures.len(), usize(1));
+    EXPECT_TRUE(reason.textures[usize()].name.as_str() == "missing-definition"_str);
+    auto logical = reason.textures[usize()].resource;
+    EXPECT_TRUE(logical.Valid());
+    auto saved = resources.PrepareStatus().clone();
+    ASSERT_TRUE(saved.error);
+    EXPECT_EQ(saved.error->textures[usize()].resource, logical);
     EXPECT_EQ(resources.PrepareStatus().state, registry::ResourcePrepareState::Failed);
     EXPECT_TRUE(resources.PrepareStatus().error);
     EXPECT_EQ(resources.Prepared().Generation(), u64(31));
+    resources.AbortPreparePlan();
+    EXPECT_EQ(saved.error->textures[usize()].resource, logical);
+    EXPECT_TRUE(reason.textures[usize()].name.as_str() == "missing-definition"_str);
     auto retry = begin(u64(34)).unwrap();
     resources.ContinuePreparePlan(retry).unwrap();
     resources.CommitPreparePlan(retry).unwrap();

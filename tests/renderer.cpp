@@ -145,7 +145,14 @@ auto Compiler::Compile(const Configuration& desc, const vk::PassExecutionInfo&,
         --desc.state->pending;
         return Err(vk::GraphExecutionError { vk::GraphExecutionStage::Pending });
     }
-    if (desc.state->fail) return Err(vk::GraphExecutionError { vk::GraphExecutionStage::Prepare });
+    if (desc.state->fail) {
+        vk::GraphExecutionError error { vk::GraphExecutionStage::Prepare };
+        error.preparation =
+            vrento::resource::ResourceErrorSnapshot(vrento::resource::ResourceError {
+                .message = String::make("native factory failure"_str),
+                .source  = Some(vrento::resource::ResourceErrorSource::Native(-3)) });
+        return Err(rstd::move(error));
+    }
     return Ok(Arc<dyn<vk::VulkanPass>>::make(Native { desc.state.clone() }));
 }
 TEST(VulkanRenderer, TypedDescriptionPendingAndFrameRevision) {
@@ -347,12 +354,20 @@ TEST(VulkanRenderer, CompileTransactionsRejectStaleContinuationAndKeepCompletedP
     EXPECT_EQ(renderer.compile(graph, descriptions(7)).unwrap_err().stage,
               vk::GraphExecutionStage::Prepare);
     EXPECT_EQ(renderer.status().state, vk::CompileState::Failed);
-    EXPECT_EQ(renderer.status().error->pass.value, 2u);
+    auto failure = renderer.status();
+    EXPECT_EQ(failure.error->pass.value, 2u);
+    EXPECT_TRUE(failure.error->preparation);
+    EXPECT_EQ(failure.error->preparation.error().source->as_Native().code, -3);
     EXPECT_TRUE(renderer.compiled());
     EXPECT_FALSE(renderer.ready());
     renderer.clear();
     EXPECT_EQ(renderer.status().state, vk::CompileState::Idle);
     EXPECT_FALSE(renderer.compiled());
+    EXPECT_EQ(failure.error->preparation.error().source->as_Native().code, -3);
+    auto before = renderer.status().id;
+    EXPECT_TRUE(renderer.continue_compile(failure.id).is_err());
+    EXPECT_EQ(renderer.status().id, before);
+    EXPECT_EQ(renderer.status().state, vk::CompileState::Idle);
 }
 
 TEST(VulkanRenderer, StandalonePassRetainsPendingDescription) {

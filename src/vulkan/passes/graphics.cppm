@@ -352,15 +352,13 @@ auto GraphicsDrawFactory::Compile(const GraphicsDrawDesc& desc, const PassExecut
     auto prepared =
         (*resources)->Prepare(desc.pipeline, desc.render_pass, desc.request, context.session);
     if (prepared.is_err()) {
-        if (prepared.unwrap_err().kind != resource::ResourceErrorKind::Pending)
-            rstd::io::eprintln("graphics pass {} preparation failed: {}",
-                               pass.id.value,
-                               prepared.unwrap_err().message);
-        return Err(
-            GraphExecutionError { prepared.unwrap_err().kind == resource::ResourceErrorKind::Pending
-                                      ? GraphExecutionStage::Pending
-                                      : GraphExecutionStage::Prepare,
-                                  pass.id });
+        auto                source = rstd::move(prepared).unwrap_err();
+        GraphExecutionError error { source.kind == resource::ResourceErrorKind::Pending
+                                        ? GraphExecutionStage::Pending
+                                        : GraphExecutionStage::Prepare,
+                                    pass.id };
+        error.preparation = resource::ResourceErrorSnapshot(rstd::move(source));
+        return Err(rstd::move(error));
     }
     return Ok(Arc<dyn<VulkanPass>>::make(
         GraphicsDrawPass { context.session, prepared->physical.clone() }));
