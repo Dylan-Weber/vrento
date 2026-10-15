@@ -720,3 +720,141 @@ TEST(RenderResourceSystem, RefreshesOnlyDependentDescriptorsAndRollsBackReplacem
     EXPECT_EQ(session.validation_errors(), 0u);
 }
 } // namespace vrento_test::texture_registry
+
+namespace vrento_test::texture_registry
+{
+TEST(TextureRegistry, StableReferencesSeparateNamesStorageAndRevisions) {
+    vrento::resource::TextureRegistry textures;
+    vrento::resource::TextureRequest  request {
+        .kind = vrento::resource::TextureRequestKind::RenderTarget,
+        .name = "same"_Str,
+        .definition =
+            Some(vrento::resource::TextureDefinition { .width = i32(8), .height = i32(8) })
+    };
+    vrento::resource::TextureResourceRef first(request.clone()), other(request.clone());
+    auto                                 a = textures.RegisterResource(first.clone()).unwrap();
+    auto                                 b = textures.RegisterResource(other.clone()).unwrap();
+    EXPECT_NE(a, b);
+    EXPECT_EQ(textures.RegisterResource(first.clone()).unwrap(), a);
+    EXPECT_TRUE(textures.Find(request.kind, request.name.as_str()).is_none());
+    auto separate =
+        textures.RegisterResource(first.clone(), None(), Some("other-storage"_str)).unwrap();
+    EXPECT_NE(separate, a);
+    auto old                  = first.clone();
+    request.definition->width = i32(16);
+    auto updated              = first.with_definition(request.clone());
+    EXPECT_EQ(textures.RegisterResource(updated.clone()).unwrap(), a);
+    EXPECT_EQ(old.definition().definition->width, i32(8));
+    request.definition->width = i32(32);
+    auto conflict             = first.with_definition(request.clone());
+    EXPECT_TRUE(textures.RegisterResource(conflict).is_err());
+    EXPECT_TRUE(textures.RegisterResource(old).is_err());
+    ASSERT_TRUE(textures.BeginPrepareTransaction());
+    auto next = updated.with_definition(request.clone());
+    textures.RegisterResource(next).unwrap();
+    auto cancelled =
+        textures.RegisterResource(vrento::resource::TextureResourceRef(request.clone())).unwrap();
+    textures.AbortPrepareTransaction();
+    EXPECT_FALSE(textures.ResolveTexture(cancelled));
+    auto fresh =
+        textures.RegisterResource(vrento::resource::TextureResourceRef(request.clone())).unwrap();
+    EXPECT_NE(fresh, cancelled);
+    EXPECT_EQ((*textures.ResolveTexture(a))->definition.revision(), updated.revision());
+    array<vrento::resource::TextureHandle, 1> active { a };
+    textures.RetainActive(active.as_slice());
+    EXPECT_EQ(textures.Size(), usize(1));
+    textures.Reset();
+    EXPECT_FALSE(textures.ResolveTexture(a));
+    auto restored = textures.RegisterResource(updated).unwrap();
+    EXPECT_NE(restored, a);
+    for (unsigned iteration {}; iteration < 100; ++iteration) {
+        auto temporary =
+            textures.RegisterResource(vrento::resource::TextureResourceRef(request.clone()))
+                .unwrap();
+        array<vrento::resource::TextureHandle, 2> live { restored, temporary };
+        textures.RetainActive(live.as_slice());
+        EXPECT_EQ(textures.Size(), usize(2));
+        EXPECT_TRUE(textures.ResolveTexture(restored));
+    }
+}
+} // namespace vrento_test::texture_registry
+
+namespace vrento_test::texture_registry
+{
+TEST(TextureRegistry, SharesCompatibleContentButSeparatesSourceScopes) {
+    namespace resource = vrento::resource;
+    auto session       = vk::DeviceSession::create({ .validation = true }).unwrap();
+    registry::RegistryTextureContext context(vk::TextureContext::create(session).unwrap());
+    auto                             image = PixelImage();
+    context.TryPrepareImage(image.clone()).unwrap();
+    auto allocation = context.CreateImportedTexture(rstd::move(image), None()).unwrap().allocation;
+    resource::TextureRegistry textures;
+    resource::TextureRequest  request { .kind = resource::TextureRequestKind::Imported,
+                                        .name = "shared"_Str };
+    resource::ImportedTextureContentIdentity content { .key      = "pixels"_Str,
+                                                       .revision = u64(1),
+                                                       .scope    = u64(1) };
+    auto                                     a =
+        textures
+            .RegisterResource(resource::TextureResourceRef(request.clone()), Some(content.clone()))
+            .unwrap();
+    textures.Publish(a, allocation.clone()).unwrap();
+    auto b =
+        textures
+            .RegisterResource(resource::TextureResourceRef(request.clone()), Some(content.clone()))
+            .unwrap();
+    EXPECT_TRUE(textures.ReusePhysical(b));
+    EXPECT_TRUE(Arc<registry::TextureAllocation>::ptr_eq((*textures.ResolveCurrent(b))->allocation,
+                                                         allocation));
+    content.scope = u64(2);
+    auto c =
+        textures
+            .RegisterResource(resource::TextureResourceRef(request.clone()), Some(content.clone()))
+            .unwrap();
+    EXPECT_FALSE(textures.ReusePhysical(c));
+    textures.RetainActive(array<resource::TextureHandle, 1> { b }.as_slice());
+    EXPECT_EQ(textures.Size(), usize(1));
+    EXPECT_TRUE(textures.ResolveCurrent(b));
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
+TEST(RenderResourceSystem, StableReferencesKeepStoragePolicyAndOldPreparedAllocations) {
+    namespace resource = vrento::resource;
+    auto session       = vk::DeviceSession::create({ .validation = true }).unwrap();
+    registry::RenderResourceSystem resources;
+    ASSERT_TRUE(resources.Initialize(session));
+    resource::TextureRequest     request { .kind       = resource::TextureRequestKind::RenderTarget,
+                                           .name       = "target"_Str,
+                                           .definition = Some(resource::TextureDefinition {
+                                               .width = i32(8), .height = i32(8) }),
+                                           .lifetime = resource::TextureLifetimeClass::FrameLocal };
+    resource::TextureResourceRef first(request.clone()), second(request.clone());
+    auto                         plan = [&](u64 generation, ref<str> slot) {
+        resource::ResourcePlan result { .generation = generation };
+        result.textures.push({ .handle         = { u64(0), generation },
+                               .definition     = first.clone(),
+                               .allocation_key = String::make(slot) });
+        result.textures.push({ .handle         = { u64(1), generation },
+                               .definition     = second.clone(),
+                               .allocation_key = String::make(slot) });
+        result.textures.push({ .handle         = { u64(2), generation },
+                               .definition     = first.clone(),
+                               .allocation_key = "separate"_Str });
+        return result;
+    };
+    auto before = plan(u64(1), "graph1:slot"_str);
+    resources.PreparePlan(before, {}).unwrap();
+    auto retained = resources.Prepared().clone();
+    auto a        = (*retained.Resolve(before.textures[usize(0)].handle))->physical.clone();
+    auto b        = (*retained.Resolve(before.textures[usize(1)].handle))->physical.clone();
+    auto c        = (*retained.Resolve(before.textures[usize(2)].handle))->physical.clone();
+    EXPECT_TRUE(Arc<registry::TextureAllocation>::ptr_eq(a, b));
+    EXPECT_FALSE(Arc<registry::TextureAllocation>::ptr_eq(a, c));
+    auto after = plan(u64(2), "graph2:slot"_str);
+    resources.PreparePlan(after, {}).unwrap();
+    auto d = (*resources.Prepared().Resolve(after.textures[usize(0)].handle))->physical.clone();
+    EXPECT_FALSE(Arc<registry::TextureAllocation>::ptr_eq(a, d));
+    EXPECT_TRUE(a->Slots()[usize()].view.texture().check().is_ok());
+    EXPECT_EQ((*retained.Resolve(before.textures[usize(0)].handle))->definition.id(), first.id());
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
+} // namespace vrento_test::texture_registry

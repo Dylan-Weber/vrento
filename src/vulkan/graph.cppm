@@ -289,6 +289,11 @@ public:
                     if (previous.id == entry.id) continue;
                     if (previous.binding->Info().kind == info.kind &&
                         previous.binding->Info().identity == info.identity) {
+                        bool shared_import = false;
+                        if (! allocations.is_empty() && resource.read_only_import)
+                            for (const auto& other : resources)
+                                if (other.id == previous.id) shared_import = other.read_only_import;
+                        if (shared_import) continue;
                         auto current_slot = slot(entry), previous_slot = slot(previous);
                         if (! current_slot || ! previous_slot || *current_slot != *previous_slot)
                             return Err(GraphExecutionError {

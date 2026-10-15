@@ -317,3 +317,38 @@ TEST(FrameGraphResources, BuildsTextureAndBufferMappingWithoutDevice) {
     EXPECT_TRUE(resources.bindings(rstd::move(other).finish().unwrap(), prepared_plan).is_err());
 }
 } // namespace vrento_test::frame_graph
+
+namespace vrento_test::frame_graph
+{
+TEST(FrameGraphResources, StableIdentityKeepsGraphPolicyOutsideDefinition) {
+    vrento::resource::TextureResourceRef definition(vrento::resource::TextureRequest {
+        .kind = vrento::resource::TextureRequestKind::RenderTarget,
+        .name = "history"_Str,
+        .definition =
+            Some(vrento::resource::TextureDefinition { .width = i32(8), .height = i32(8) }),
+        .lifetime = vrento::resource::TextureLifetimeClass::FrameLocal });
+    Option<vrento::pass::ContentRef>     previous;
+    for (Serial scope : array<Serial, 2> { Serial(101), Serial(102) }) {
+        FrameGraphBuilder            graph(scope);
+        vrento::pass::GraphResources resources { u64(scope) };
+        auto                         input =
+            resources.initial(graph, { .key = "history"_Str, .definition = definition.clone() })
+                .unwrap();
+        resources.import_history(graph, input).unwrap();
+        auto pass   = graph.add_pass({ 1 }).unwrap();
+        auto output = resources.output(graph, pass, input).unwrap();
+        graph.write_range(pass, output.version()).unwrap();
+        resources.handle(output).unwrap();
+        if (previous) EXPECT_TRUE(previous->resolve(graph).is_err());
+        previous      = Some(output.clone());
+        auto compiled = rstd::move(graph).finish().unwrap();
+        auto plan     = resources.resourcePlan(compiled).unwrap();
+        for (const auto& entry : plan.textures) {
+            EXPECT_EQ(entry.definition.id(), definition.id());
+            EXPECT_EQ(entry.definition.revision(), u64(1));
+            EXPECT_EQ(entry.request().lifetime, vrento::resource::TextureLifetimeClass::FrameLocal);
+            EXPECT_TRUE(entry.preserve_contents);
+        }
+    }
+}
+} // namespace vrento_test::frame_graph

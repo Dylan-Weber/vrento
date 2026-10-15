@@ -266,11 +266,20 @@ public:
     }
     auto TextureContext() -> vulkan::TextureContext& { return m_registries.Textures().Context(); }
     auto RenderedTarget(ref<str> name) -> Result<texture::TextureViewRef, resource::ResourceError> {
+        return RenderedTarget(
+            m_registries.TextureEntries().Find(resource::TextureRequestKind::RenderTarget, name));
+    }
+    auto RenderedTarget(const resource::TextureResourceRef& definition)
+        -> Result<texture::TextureViewRef, resource::ResourceError> {
+        return RenderedTarget(m_registries.TextureEntries().Find(definition));
+    }
+
+private:
+    auto RenderedTarget(Option<resource::TextureHandle> handle)
+        -> Result<texture::TextureViewRef, resource::ResourceError> {
         if (! Ready())
             return Err(resource::ResourceError { resource::ResourceErrorKind::BackendFailure,
                                                  rstd::format("resources are closed") });
-        auto handle =
-            m_registries.TextureEntries().Find(resource::TextureRequestKind::RenderTarget, name);
         auto physical = handle ? m_registries.TextureEntries().ResolveCurrent(*handle) : None();
         if (! physical || (**physical).allocation->Slots().is_empty())
             return Err(resource::ResourceError { resource::ResourceErrorKind::MissingContent,
@@ -290,6 +299,8 @@ public:
                                                  rstd::format("rendered target view failed") });
         return Ok(result.unwrap());
     }
+
+public:
     auto Native() -> mut_ref<dyn<vulkan::NativeSubmission>> {
         return dyn<vulkan::NativeSubmission>::from_ref(TextureContext()).as_mut_ref();
     }
@@ -922,8 +933,22 @@ public:
     }
     auto PrepareRegion(ref<str> key, texture::TextureUpload upload, usize slot = usize())
         -> Result<Option<PreparedTextureUpdate>, resource::ResourceError> {
-        auto handle =
-            m_registries.TextureEntries().Find(resource::TextureRequestKind::Imported, key);
+        return PrepareRegion(
+            m_registries.TextureEntries().Find(resource::TextureRequestKind::Imported, key),
+            rstd::move(upload),
+            slot);
+    }
+    auto PrepareRegion(const resource::TextureResourceRef& definition,
+                       texture::TextureUpload upload, usize slot = usize())
+        -> Result<Option<PreparedTextureUpdate>, resource::ResourceError> {
+        return PrepareRegion(
+            m_registries.TextureEntries().Find(definition), rstd::move(upload), slot);
+    }
+
+private:
+    auto PrepareRegion(Option<resource::TextureHandle> handle, texture::TextureUpload upload,
+                       usize slot)
+        -> Result<Option<PreparedTextureUpdate>, resource::ResourceError> {
         if (! handle) return Ok(None());
         auto physical = m_registries.TextureEntries().ResolveCurrent(*handle);
         if (! physical) return Ok(None());
@@ -940,6 +965,8 @@ public:
         uploads.push(rstd::move(upload));
         return Ok(Some(PreparedTextureUpdate { rstd::move(allocation), rstd::move(uploads) }));
     }
+
+public:
     FontAtlasUploadStatus QueueRegion(texture::Submission& work, ref<str> key,
                                       texture::TextureUpload upload, usize slot = usize()) {
         if (! work.valid()) return FontAtlasUploadStatus::Failed;

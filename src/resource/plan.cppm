@@ -25,16 +25,13 @@ struct TexturePlanEntry {
     String             allocation_key;
     ResourceAccess     access { ResourceAccess::Read };
     u32                version { 0 };
+    Option<TextureDefinitionId> source;
+    bool                        preserve_contents {};
 
-    void UpdateRequest(TextureRequest updated) {
-        // Frame-boundary retention belongs to the graph, not the refreshed image definition.
-        if (definition.valid() &&
-            (request().content & TextureContentFlag(TextureContent::PreserveAcrossFrames)) !=
-                u32()) {
-            updated.lifetime = TextureLifetimeClass::Retained;
-            updated.content |= TextureContentFlag(TextureContent::PreserveAcrossFrames);
-        }
-        definition = definition.with_definition(rstd::move(updated));
+    auto source_request() const -> TextureRequest {
+        auto result = request().clone();
+        if (source) result.source = source;
+        return result;
     }
 };
 
@@ -79,7 +76,9 @@ struct ResourcePlan {
                                    entry.definition.clone(),
                                    entry.allocation_key.clone(),
                                    entry.access,
-                                   entry.version });
+                                   entry.version,
+                                   entry.source,
+                                   entry.preserve_contents });
         for (const auto& entry : buffers)
             result.buffers.push(
                 { entry.handle, entry.definition.clone(), entry.access, entry.version });
@@ -111,16 +110,6 @@ struct ResourcePlan {
             .access     = access,
         });
         return handle;
-    }
-
-    bool UpdateTextureRequest(TextureUseHandle handle, TextureRequest request) {
-        if (handle.generation != generation) return false;
-        for (auto& entry : textures) {
-            if (entry.handle != handle) continue;
-            entry.UpdateRequest(rstd::move(request));
-            return true;
-        }
-        return false;
     }
 };
 

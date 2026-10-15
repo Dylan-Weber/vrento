@@ -1401,3 +1401,46 @@ TEST(GraphVulkan, TextureTransfers) {
     rstd_assert(session.validation_errors() == 0);
 }
 } // namespace vrento_test::graph_vulkan
+
+namespace vrento_test::graph_vulkan
+{
+TEST(GraphVulkan, SharedImportedTexturesRequireReadOnlyGraphUses) {
+    auto session = vrento::vulkan::DeviceSession::create({ .validation = true }).unwrap();
+    auto context = vrento::vulkan::TextureContext::create(session).unwrap();
+    vrento::texture::TextureDesc desc;
+    desc.extent = { 4, 4 };
+    desc.usage  = vrento::texture::Usage::Sampled | vrento::texture::Usage::TransferDestination;
+    auto view   = context.CreateView(context.CreateTexture(desc).unwrap(), {}).unwrap();
+    for (bool writes : array<bool, 2> { false, true }) {
+        vrento::fg::FrameGraphBuilder builder(711);
+        auto                          a  = builder.import_resource({ .id = { 1, 1 } }).unwrap();
+        auto                          b  = builder.import_resource({ .id = { 2, 1 } }).unwrap();
+        auto                          id = builder.add_pass({ 1 }).unwrap();
+        if (writes) a = builder.reserve_write(id, a).unwrap();
+        auto pass = vrento_test::texture_sampled_pass(id, b.resource, b.version);
+        pass.uses.push(
+            { a.resource,
+              a.version,
+              writes ? vrento::vulkan::GraphAccess::Write : vrento::vulkan::GraphAccess::Read,
+              writes ? vrento::vulkan::PassUsage::Transfer : vrento::vulkan::PassUsage::Sampled,
+              writes ? vrento::vulkan::PassStages::Transfer
+                     : vrento::vulkan::PassStages::Fragment });
+        vrento_test::declare_pass(builder, pass).unwrap();
+        Vec<vrento::vulkan::PassExecutionInfo> passes;
+        passes.push(rstd::move(pass));
+        auto graph = vrento::vulkan::VulkanPassSet::associate(rstd::move(builder).finish().unwrap(),
+                                                              rstd::move(passes))
+                         .unwrap();
+        vrento::vulkan::GraphBindings bindings(711);
+        for (auto version : array<vrento::fg::ResourceVersion, 2> { a, b })
+            bindings
+                .bind_version(version,
+                              rstd::sync::Arc<dyn<vrento::vulkan::GraphBinding>>::make(
+                                  vrento::vulkan::GraphTextureBinding(view)))
+                .unwrap();
+        EXPECT_EQ(bindings.validate(graph, session).is_ok(), ! writes);
+        EXPECT_TRUE(bindings.validate_resources(graph.resources(), session).is_err());
+    }
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
+} // namespace vrento_test::graph_vulkan

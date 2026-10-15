@@ -61,6 +61,7 @@ struct GraphBindingRequirement {
     GraphSerial       content_revision {};
     bool              check_revision {};
     bool              fixed_storage { true };
+    bool              read_only_import {};
 };
 struct PassResourceUse {
     ResourceId  resource;
@@ -325,6 +326,12 @@ public:
                                   .aspects       = resource.aspects,
                                   .imported      = resource.imported,
                                   .fixed_storage = resource.storage != 0 });
+        for (auto& resource : data.resources) {
+            resource.read_only_import = resource.imported;
+            for (const auto& version : graph.versions())
+                if (version.id.resource == resource.id && version.writer)
+                    resource.read_only_import = false;
+        }
         if (! requirements.is_empty()) {
             if (requirements.len() != data.resources.len())
                 return Err(GraphError { GraphErrorKind::Conflict });

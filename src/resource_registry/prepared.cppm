@@ -795,29 +795,23 @@ public:
             if (! entry.definition.valid())
                 return Err(resource::ResourceError {
                     .kind = resource::ResourceErrorKind::MissingDefinition });
-            resource::TextureHandle handle;
+            auto source_request = entry.source_request();
             if (entry.request().kind == resource::TextureRequestKind::Imported) {
-                if (content.is_none()) {
-                    return Err(resource::ResourceError {
-                        .kind    = resource::ResourceErrorKind::MissingContent,
-                        .message = rstd::format("texture content {} unavailable",
-                                                entry.request().name.as_str()),
-                    });
-                }
-                auto resolved = (*content)->ResolveTextureContent(entry.request());
-                if (resolved.is_err()) return Err(rstd::move(resolved).unwrap_err_unchecked());
-                imported_content = Some(rstd::move(resolved).unwrap_unchecked());
-                handle = m_textures.RegisterImported(entry.definition.clone(),
-                                                     imported_content->clone(),
-                                                     entry.allocation_key.is_empty()
-                                                         ? None<ref<str>>()
-                                                         : Some(entry.allocation_key.as_str()));
-            } else {
-                handle = m_textures.Register(entry.definition.clone(),
-                                             entry.allocation_key.is_empty()
-                                                 ? None<ref<str>>()
-                                                 : Some(entry.allocation_key.as_str()));
+                if (! content)
+                    return Err(
+                        resource::ResourceError { resource::ResourceErrorKind::MissingContent });
+                auto resolved = (*content)->ResolveTextureContent(source_request);
+                if (resolved.is_err()) return Err(resolved.unwrap_err());
+                imported_content = Some(resolved.unwrap());
             }
+            auto registered = m_textures.RegisterResource(
+                entry.definition.clone(),
+                imported_content ? Some(imported_content->clone()) : None(),
+                entry.allocation_key.is_empty() ? None<ref<str>>()
+                                                : Some(entry.allocation_key.as_str()),
+                entry.preserve_contents);
+            if (registered.is_err()) return Err(registered.unwrap_err());
+            auto handle = registered.unwrap();
             if (! handle.Valid()) {
                 return Err(resource::ResourceError {
                     .kind = resource::ResourceErrorKind::MissingDefinition,
@@ -828,6 +822,10 @@ public:
 
             auto physical = m_textures.ResolveCurrent(handle);
             if (physical.is_none()) physical = m_textures.ResolvePending(handle);
+            if (! physical && m_textures.ReusePhysical(handle)) {
+                physical = m_textures.ResolveCurrent(handle);
+                if (! physical) physical = m_textures.ResolvePending(handle);
+            }
             if (physical.is_some()) {
                 auto inserted = InsertPrepared(
                     entry.handle, handle, entry.definition.clone(), **physical, session.m_table);
@@ -876,7 +874,7 @@ public:
 
             auto  identity = rstd::move(imported_content).unwrap_unchecked();
             auto  found    = pending_index.get(identity);
-            auto  playback = (*content)->ResolveVideoPlayback(entry.request());
+            auto  playback = (*content)->ResolveVideoPlayback(source_request);
             usize index;
             if (found.is_some()) {
                 index = **found;

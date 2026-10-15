@@ -17,10 +17,17 @@ struct TextureSpec {
     bool                         imported {};
     resource::TextureResourceRef definition;
     auto request() const -> const resource::TextureRequest& { return definition.definition(); }
-    Option<String>                       allocation_family;
-    Option<vrento::texture::TextureDesc> metadata;
-    auto                                 clone() const -> TextureSpec {
-        return { key.clone(), imported, definition.clone(), allocation_family.clone(), metadata };
+    Option<String>                        allocation_family;
+    Option<vrento::texture::TextureDesc>  metadata;
+    Option<resource::TextureDefinitionId> source;
+    auto                                  source_request() const -> resource::TextureRequest {
+        auto result = request().clone();
+        if (source) result.source = source;
+        return result;
+    }
+    auto clone() const -> TextureSpec {
+        return { key.clone(), imported, definition.clone(), allocation_family.clone(),
+                 metadata,    source };
     }
 };
 struct TextureUse {
@@ -257,18 +264,15 @@ public:
         if (graph.data().scope != generation_.to_primitive())
             return Err(fg::Error { fg::ErrorKind::Conflict });
         if (! spec.definition.valid()) return Err(fg::Error { fg::ErrorKind::MissingResource });
-        if (spec.request().name != spec.key.as_str()) {
-            auto request    = spec.request().clone();
-            request.name    = spec.key.clone();
-            spec.definition = spec.definition.with_definition(rstd::move(request));
-        }
-        if (auto existing = find(spec.key.as_str()); existing) {
-            if (existing->spec.imported != spec.imported ||
-                existing->spec.metadata != spec.metadata ||
-                existing->spec.allocation_family != spec.allocation_family ||
-                ! resource::SameTextureRequest(existing->spec.request(), spec.request()))
-                return Err(fg::Error { fg::ErrorKind::Conflict, {}, existing->id });
-            return Ok(fg::ResourceVersion { existing->id, 0 });
+        for (const auto& existing : textures_) {
+            if (existing.spec.definition.id() != spec.definition.id()) continue;
+            if (existing.spec.definition.revision() != spec.definition.revision() ||
+                existing.spec.imported != spec.imported ||
+                existing.spec.metadata != spec.metadata || existing.spec.source != spec.source ||
+                existing.spec.allocation_family != spec.allocation_family ||
+                ! resource::SameTextureRequest(existing.spec.request(), spec.request()))
+                return Err(fg::Error { fg::ErrorKind::Conflict, {}, existing.id });
+            return Ok(fg::ResourceVersion { existing.id, 0 });
         }
         fg::Serial next { 1 };
         for (const auto& resource : graph.data().resources)
@@ -394,12 +398,13 @@ public:
                 request.content |=
                     resource::TextureContentFlag(resource::TextureContent::PreserveAcrossFrames);
             }
-            auto key = request.name.clone();
+            String key;
             if (texture->spec.allocation_family &&
                 request.lifetime == resource::TextureLifetimeClass::FrameLocal)
                 for (auto allocation : graph.inspect().allocations)
                     if (allocation.version == use.version)
-                        key = rstd::format("{}::slot_{}",
+                        key = rstd::format("{}::{}::slot_{}",
+                                           generation_,
                                            texture->spec.allocation_family->as_str(),
                                            allocation.slot);
             bool read {};
@@ -407,15 +412,15 @@ public:
                 for (const auto& access : pass.uses)
                     read |= access.version == use.version && access.access == fg::Access::Read;
             result.textures.push(
-                { .handle     = use.handle,
-                  .definition = resource::SameTextureRequest(request, texture->spec.request())
-                                    ? texture->spec.definition.clone()
-                                    : texture->spec.definition.with_definition(rstd::move(request)),
-                  .allocation_key = rstd::move(key),
-                  .access         = version->writer ? (read ? resource::ResourceAccess::ReadWrite
-                                                            : resource::ResourceAccess::Write)
-                                                    : resource::ResourceAccess::Read,
-                  .version        = u32(use.version.version) });
+                { .handle            = use.handle,
+                  .definition        = texture->spec.definition.clone(),
+                  .allocation_key    = rstd::move(key),
+                  .access            = version->writer ? (read ? resource::ResourceAccess::ReadWrite
+                                                               : resource::ResourceAccess::Write)
+                                                       : resource::ResourceAccess::Read,
+                  .version           = u32(use.version.version),
+                  .source            = texture->spec.source,
+                  .preserve_contents = resource->imported && ! texture->spec.imported });
         }
         return Ok(rstd::move(result));
     }

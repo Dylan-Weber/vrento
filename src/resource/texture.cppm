@@ -122,17 +122,20 @@ struct TextureDefinition {
 struct ImportedTextureContentIdentity {
     String key;
     u64    revision { 1 };
+    u64    scope {};
 
     auto clone() const -> ImportedTextureContentIdentity {
         return ImportedTextureContentIdentity {
             .key      = key.clone(),
             .revision = revision,
+            .scope    = scope,
         };
     }
 
     friend bool operator==(const ImportedTextureContentIdentity& lhs,
                            const ImportedTextureContentIdentity& rhs) {
-        return lhs.key == rhs.key.as_str() && lhs.revision == rhs.revision;
+        return lhs.key == rhs.key.as_str() && lhs.revision == rhs.revision &&
+               lhs.scope == rhs.scope;
     }
 };
 

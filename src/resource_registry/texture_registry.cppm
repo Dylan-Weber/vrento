@@ -11,6 +11,7 @@ using rstd::collections::HashSet;
 using rstd::sync::Arc;
 
 using namespace rstd::prelude;
+using namespace rstd::literals;
 
 export namespace vrento::resource
 {
@@ -18,6 +19,8 @@ export namespace vrento::resource
 struct Texture {
     resource::TextureHandle id;
     TextureResourceRef      definition;
+    String                  allocation_key;
+    bool                    preserve_contents {};
     auto request() const -> const TextureRequest& { return definition.definition(); }
     Option<ImportedTextureContentIdentity> imported_content;
     u64                                    definition_version { 1 };
@@ -25,8 +28,10 @@ struct Texture {
 
     auto clone() const -> Texture {
         return Texture {
-            .id               = id,
-            .definition       = definition.clone(),
+            .id                = id,
+            .definition        = definition.clone(),
+            .allocation_key    = allocation_key.clone(),
+            .preserve_contents = preserve_contents,
             .imported_content = imported_content.is_some() ? Some(imported_content->clone())
                                                            : None<ImportedTextureContentIdentity>(),
             .definition_version = definition_version,
@@ -61,17 +66,19 @@ struct PendingTextureUpload {
 };
 
 struct TextureRegistryIdentity {
-    TextureRequestKind kind { TextureRequestKind::Imported };
-    String             key;
+    TextureRequestKind                 kind { TextureRequestKind::Imported };
+    String                             key;
+    ResourceHandle<TextureResourceTag> logical;
 
     friend bool operator==(const TextureRegistryIdentity& lhs, const TextureRegistryIdentity& rhs) {
-        return lhs.kind == rhs.kind && lhs.key == rhs.key.as_str();
+        return lhs.kind == rhs.kind && lhs.key == rhs.key.as_str() && lhs.logical == rhs.logical;
     }
 
     auto clone() const -> TextureRegistryIdentity {
         return TextureRegistryIdentity {
-            .kind = kind,
-            .key  = key.clone(),
+            .kind    = kind,
+            .key     = key.clone(),
+            .logical = logical,
         };
     }
 };
@@ -89,6 +96,7 @@ struct Impl<hash::Hash, vrento::resource::TextureRegistryIdentity>
     void hash(H& state) const noexcept {
         hash::hash_into(u32(static_cast<uint32_t>(this->self().kind)), state);
         hash::hash_into(this->self().key, state);
+        hash::hash_into(this->self().logical, state);
     }
 };
 
@@ -100,6 +108,7 @@ struct Impl<hash::Hash, vrento::resource::ImportedTextureContentIdentity>
     void hash(H& state) const noexcept {
         hash::hash_into(this->self().key, state);
         hash::hash_into(this->self().revision, state);
+        hash::hash_into(this->self().scope, state);
     }
 };
 
@@ -115,44 +124,60 @@ public:
     TextureRegistry& operator=(const TextureRegistry&) = delete;
 
     auto Register(TextureRequest request) -> resource::TextureHandle {
-        return Register(TextureResourceRef(rstd::move(request)));
+        return Register(LegacyDefinition(rstd::move(request)));
     }
     auto Register(TextureResourceRef definition, Option<ref<str>> allocation_key = None())
         -> resource::TextureHandle {
         if (! definition.valid() || definition.definition().kind == TextureRequestKind::Imported)
             return {};
-        return RegisterImpl(
-            rstd::move(definition), None<ImportedTextureContentIdentity>(), allocation_key);
+        return RegisterResource(rstd::move(definition), None(), allocation_key).unwrap_or({});
     }
     auto RegisterImported(TextureRequest request, ImportedTextureContentIdentity content)
         -> resource::TextureHandle {
-        return RegisterImported(TextureResourceRef(rstd::move(request)), rstd::move(content));
+        return RegisterImported(LegacyDefinition(rstd::move(request)), rstd::move(content));
     }
     auto RegisterImported(TextureResourceRef definition, ImportedTextureContentIdentity content,
                           Option<ref<str>> allocation_key = None()) -> resource::TextureHandle {
         if (! definition.valid() || definition.definition().kind != TextureRequestKind::Imported ||
             content.key.is_empty())
             return {};
-        return RegisterImpl(rstd::move(definition), Some(rstd::move(content)), allocation_key);
+        return RegisterResource(rstd::move(definition), Some(rstd::move(content)), allocation_key)
+            .unwrap_or({});
     }
 
-private:
-    auto RegisterImpl(TextureResourceRef definition, Option<ImportedTextureContentIdentity> content,
-                      Option<ref<str>> allocation_key) -> resource::TextureHandle {
+    auto RegisterResource(TextureResourceRef                     definition,
+                          Option<ImportedTextureContentIdentity> content = None(),
+                          Option<ref<str>> allocation_key = None(), bool preserve_contents = false)
+        -> Result<TextureHandle, ResourceError> {
+        if (! definition.valid() || definition.definition().name.is_empty() ||
+            (definition.definition().kind == TextureRequestKind::Imported &&
+             (! content || content->key.is_empty())))
+            return Err(ResourceError { ResourceErrorKind::MissingDefinition });
         const auto& request = definition.definition();
-        if (request.name.is_empty()) return {};
-
+        for (const auto& [handle, texture] : m_textures.iter()) {
+            if (texture->definition.id() != definition.id()) continue;
+            if (texture->definition.revision() > definition.revision() ||
+                (texture->definition.revision() == definition.revision() &&
+                 ! SameTextureRequest(texture->request(), request)))
+                return Err(ResourceError { ResourceErrorKind::BackendFailure,
+                                           "conflicting texture definition revision"_Str });
+        }
         TextureRegistryIdentity identity {
-            .kind = request.kind,
-            .key  = allocation_key ? String::make(*allocation_key) : request.name.clone(),
+            .kind    = request.kind,
+            .key     = allocation_key ? String::make(*allocation_key) : String {},
+            .logical = definition.id(),
         };
         auto existing = m_handles.get(identity);
         if (existing.is_some()) {
             auto handle  = **existing;
             auto texture = m_textures.get_mut(handle);
-            if (texture.is_none()) return {};
+            if (texture.is_none())
+                return Err(ResourceError { ResourceErrorKind::MissingDefinition });
             if (! SameTextureRequest((**texture).request(), request)) {
-                if ((**texture).request().definition != request.definition) {
+                if ((**texture).request().definition != request.definition ||
+                    (**texture).request().kind != request.kind ||
+                    (**texture).request().lifetime != request.lifetime ||
+                    (**texture).request().content != request.content) {
                     ++(**texture).definition_version;
                 }
                 if (request.kind != TextureRequestKind::Imported &&
@@ -165,8 +190,9 @@ private:
                 ++(**texture).content_version;
                 (**texture).imported_content = rstd::move(content);
             }
-            (**texture).definition = definition.clone();
-            return handle;
+            (**texture).definition        = definition.clone();
+            (**texture).preserve_contents = preserve_contents;
+            return Ok(handle);
         }
 
         resource::TextureHandle handle {
@@ -175,12 +201,14 @@ private:
         };
         (void)m_textures.insert(handle,
                                 Texture {
-                                    .id               = handle,
-                                    .definition       = rstd::move(definition),
-                                    .imported_content = rstd::move(content),
+                                    .id                = handle,
+                                    .definition        = rstd::move(definition),
+                                    .allocation_key    = identity.key.clone(),
+                                    .preserve_contents = preserve_contents,
+                                    .imported_content  = rstd::move(content),
                                 });
         (void)m_handles.insert(rstd::move(identity), handle);
-        return handle;
+        return Ok(handle);
     }
 
 public:
@@ -338,14 +366,68 @@ public:
         return None();
     }
 
-    auto Find(TextureRequestKind kind, ref<str> key) const -> Option<resource::TextureHandle> {
-        auto handle = m_handles.get(TextureRegistryIdentity {
-            .kind = kind,
-            .key  = String::make(key),
-        });
-        if (handle.is_none()) return None();
-        auto value = **handle;
-        return Some(rstd::move(value));
+    auto Find(TextureRequestKind kind, ref<str> key) const -> Option<TextureHandle> {
+        Option<TextureHandle> selected;
+        for (const auto& [handle, texture] : m_textures.iter()) {
+            if (texture->request().kind != kind || texture->request().name != key) continue;
+            if (selected) return None();
+            selected = Some(TextureHandle(*handle));
+        }
+        return selected;
+    }
+
+    auto Find(const TextureResourceRef& definition) const -> Option<TextureHandle> {
+        if (! definition.valid()) return None();
+        Option<TextureHandle> selected;
+        for (const auto& [handle, texture] : m_textures.iter()) {
+            if (texture->definition.id() != definition.id() ||
+                texture->definition.revision() != definition.revision())
+                continue;
+            if (selected) return None();
+            selected = Some(TextureHandle(*handle));
+        }
+        return selected;
+    }
+
+    bool ReusePhysical(TextureHandle handle) {
+        auto target = ResolveTexture(handle);
+        if (! target) return false;
+        for (const auto& [other, texture] : m_textures.iter()) {
+            if (*other == handle || texture->request().kind != (*target)->request().kind ||
+                texture->request().definition != (*target)->request().definition ||
+                texture->request().content != (*target)->request().content ||
+                texture->request().lifetime != (*target)->request().lifetime)
+                continue;
+            if ((*target)->imported_content) {
+                if (texture->imported_content != (*target)->imported_content) continue;
+            } else if ((*target)->allocation_key.is_empty() ||
+                       texture->allocation_key != (*target)->allocation_key.as_str() ||
+                       texture->preserve_contents || (*target)->preserve_contents)
+                continue;
+            auto source = ResolveCurrent(*other);
+            if (source) {
+                auto physical               = (*source)->clone();
+                physical.definition_version = (*target)->definition_version;
+                physical.content_version    = (*target)->content_version;
+                (void)m_resources.insert(handle, rstd::move(physical));
+                return true;
+            }
+            for (auto [ticket, batch] : m_pending_uploads.iter_mut()) {
+                for (usize i {}; i < batch->len(); ++i) {
+                    const auto& pending = (*batch)[i];
+                    if (pending.handle != *other ||
+                        pending.physical.definition_version != texture->definition_version ||
+                        pending.physical.content_version != texture->content_version)
+                        continue;
+                    auto physical               = pending.physical.clone();
+                    physical.definition_version = (*target)->definition_version;
+                    physical.content_version    = (*target)->content_version;
+                    batch->push({ handle, rstd::move(physical) });
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     bool Unbind(resource::TextureHandle handle) { return m_resources.remove(handle).is_some(); }
@@ -361,10 +443,11 @@ public:
     void AbortPrepareTransaction() {
         auto snapshot = m_transaction.take();
         if (snapshot.is_none()) return;
-        m_textures   = rstd::move((*snapshot)->textures);
-        m_resources  = rstd::move((*snapshot)->resources);
-        m_handles    = rstd::move((*snapshot)->handles);
-        m_next_index = (*snapshot)->next_index;
+        m_textures  = rstd::move((*snapshot)->textures);
+        m_resources = rstd::move((*snapshot)->resources);
+        m_handles   = rstd::move((*snapshot)->handles);
+
+        m_legacy_definitions = rstd::move((*snapshot)->legacy_definitions);
         m_pending_uploads.clear();
     }
 
@@ -376,6 +459,18 @@ public:
         m_resources.retain([&](const resource::TextureHandle& handle, TexturePhysical&) {
             return active.contains(handle);
         });
+        m_textures.retain([&](const TextureHandle& handle, Texture&) {
+            return active.contains(handle);
+        });
+        m_handles.retain([&](const TextureRegistryIdentity&, TextureHandle& handle) {
+            return active.contains(handle);
+        });
+        m_legacy_definitions.retain(
+            [&](const TextureRegistryIdentity&, TextureResourceRef& definition) {
+                for (const auto& [handle, texture] : m_textures.iter())
+                    if (texture->definition.id() == definition.id()) return true;
+                return false;
+            });
     }
 
     void EvictUnused(bool transient_only = false) {
@@ -391,7 +486,9 @@ public:
     void ClearGraphResources() {
         m_resources.retain([&](const resource::TextureHandle& handle, TexturePhysical&) {
             auto texture = m_textures.get(handle);
-            return texture.is_some() && (**texture).request().kind == TextureRequestKind::Imported;
+            return texture.is_some() &&
+                   ((**texture).request().kind == TextureRequestKind::Imported ||
+                    (**texture).preserve_contents);
         });
     }
 
@@ -401,6 +498,7 @@ public:
         m_pending_uploads.clear();
         m_textures.clear();
         m_handles.clear();
+        m_legacy_definitions.clear();
         m_next_index = u64();
         ++m_generation;
         if (m_generation == u64()) ++m_generation;
@@ -410,6 +508,18 @@ public:
     auto Size() const noexcept -> usize { return m_textures.len(); }
 
 private:
+    auto LegacyDefinition(TextureRequest request) -> TextureResourceRef {
+        TextureRegistryIdentity identity { .kind = request.kind, .key = request.name.clone() };
+        auto                    previous = m_legacy_definitions.get_mut(identity);
+        if (previous) {
+            if (! SameTextureRequest((*previous)->definition(), request))
+                **previous = (*previous)->with_definition(rstd::move(request));
+            return (*previous)->clone();
+        }
+        TextureResourceRef definition(rstd::move(request));
+        (void)m_legacy_definitions.insert(rstd::move(identity), definition.clone());
+        return definition;
+    }
     template<typename Value>
     using HandleMap = HashMap<resource::TextureHandle, Value>;
 
@@ -417,7 +527,7 @@ private:
         HandleMap<Texture>                                        textures;
         HandleMap<TexturePhysical>                                resources;
         HashMap<TextureRegistryIdentity, resource::TextureHandle> handles;
-        u64                                                       next_index { 0 };
+        HashMap<TextureRegistryIdentity, TextureResourceRef>      legacy_definitions;
     };
 
     auto CloneSnapshot() const -> Snapshot {
@@ -440,7 +550,8 @@ private:
             (void)snapshot.handles.insert(item->template get<0>()->clone(),
                                           *item->template get<1>());
         }
-        snapshot.next_index = m_next_index;
+        for (const auto& [key, definition] : m_legacy_definitions.iter())
+            (void)snapshot.legacy_definitions.insert(key->clone(), definition->clone());
         return snapshot;
     }
 
@@ -451,6 +562,7 @@ private:
     HashMap<TextureRegistryIdentity, resource::TextureHandle> m_handles;
     HashMap<u64, Vec<PendingTextureUpload>>                   m_pending_uploads;
     Option<Box<Snapshot>>                                     m_transaction;
+    HashMap<TextureRegistryIdentity, TextureResourceRef>      m_legacy_definitions;
 };
 
 } // namespace vrento::resource
