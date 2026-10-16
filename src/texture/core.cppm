@@ -1,5 +1,6 @@
 export module vrento:texture.core;
 export import :types.texture;
+export import :texture.image;
 import rstd;
 import :vulkan.error;
 
@@ -436,12 +437,55 @@ struct BackendAccess {
         return value.backend();
     }
 };
+class TextureUploadPayload {
+    struct Storage {
+        Vec<u8>            owned;
+        Option<Arc<Image>> image;
+        usize              slot {}, mip {};
+        explicit Storage(Vec<u8> bytes): owned(rstd::move(bytes)) {}
+        Storage(Arc<Image> source, usize source_slot, usize source_mip)
+            : image(Some(rstd::move(source))), slot(source_slot), mip(source_mip) {}
+        auto bytes() const -> slice<u8> {
+            if (! image) return owned.as_slice();
+            const auto& data = (*image)->slots[slot].mipmaps[mip];
+            return slice<u8>::from_raw_parts(reinterpret_cast<const byte*>(data.data.get()),
+                                             usize(data.size.to_primitive()));
+        }
+    };
+    Option<Arc<Storage>> storage_;
+    explicit TextureUploadPayload(Arc<Storage> storage): storage_(Some(rstd::move(storage))) {}
+
+public:
+    TextureUploadPayload() = default;
+    TextureUploadPayload(Vec<u8> bytes): storage_(Some(Arc<Storage>::make(rstd::move(bytes)))) {}
+    TextureUploadPayload(const TextureUploadPayload&)                    = delete;
+    auto operator=(const TextureUploadPayload&) -> TextureUploadPayload& = delete;
+    TextureUploadPayload(TextureUploadPayload&&)                         = default;
+    auto operator=(TextureUploadPayload&&) -> TextureUploadPayload&      = default;
+    // Published image contents must remain immutable while uploads share them.
+    static auto FromImage(Arc<Image> image, usize slot, usize mip)
+        -> Result<TextureUploadPayload, Error> {
+        if (! image || image->header.kind != ImageKind::Pixels || slot >= image->slots.len() ||
+            mip >= image->slots[slot].mipmaps.len())
+            return Err(Error { ErrorKind::Invalid });
+        const auto& data = image->slots[slot].mipmaps[mip];
+        if (! data.data || data.size <= isize()) return Err(Error { ErrorKind::Invalid });
+        return Ok(TextureUploadPayload(Arc<Storage>::make(rstd::move(image), slot, mip)));
+    }
+    auto as_slice() const -> slice<u8> { return storage_ ? (*storage_)->bytes() : slice<u8> {}; }
+    auto len() const -> usize { return as_slice().len(); }
+    bool is_empty() const { return len() == usize(); }
+    auto operator[](usize index) const -> u8 { return as_slice()[index]; }
+    auto clone() const -> TextureUploadPayload {
+        return storage_ ? TextureUploadPayload(storage_->clone()) : TextureUploadPayload {};
+    }
+};
 struct TextureUpload {
-    TextureViewRef target;
-    Count          mip {}, layer {}, x {}, y {}, width {}, height {};
-    Serial         row_pitch {}, slice_pitch {};
-    Vec<u8>        bytes;
-    auto           clone() const -> TextureUpload {
+    TextureViewRef       target;
+    Count                mip {}, layer {}, x {}, y {}, width {}, height {};
+    Serial               row_pitch {}, slice_pitch {};
+    TextureUploadPayload bytes;
+    auto                 clone() const -> TextureUpload {
         return { target, mip, layer, x, y, width, height, row_pitch, slice_pitch, bytes.clone() };
     }
 };

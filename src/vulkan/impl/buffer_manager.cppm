@@ -127,9 +127,10 @@ public:
     }
 
     void Reset() {
-        m_cursor        = 0;
-        m_touched_begin = m_size;
-        m_touched_end   = 0;
+        m_cursor          = 0;
+        m_allocated_bytes = 0;
+        m_touched_begin   = m_size;
+        m_touched_end     = 0;
     }
 
     bool TryAllocate(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset) {
@@ -137,6 +138,7 @@ public:
         if (aligned > m_size || size > m_size - aligned) return false;
         offset   = aligned;
         m_cursor = aligned + size;
+        m_allocated_bytes += size;
         return true;
     }
 
@@ -160,6 +162,7 @@ public:
 
     VkBuffer     handle() const noexcept { return m_buffer.handle.handle(); }
     VkDeviceSize size() const noexcept { return m_size; }
+    VkDeviceSize allocated_bytes() const noexcept { return m_allocated_bytes; }
 
     UploadBlock(const Device& device, VkDeviceSize size): m_device(device), m_size(size) {}
 
@@ -189,6 +192,7 @@ private:
     AllocatedBufferParameters  m_buffer;
     Option<vvk::MemoryMapping> m_mapping;
     VkDeviceSize               m_cursor { 0 };
+    VkDeviceSize               m_allocated_bytes { 0 };
     VkDeviceSize               m_touched_begin { 0 };
     VkDeviceSize               m_touched_end { 0 };
 };
@@ -784,18 +788,35 @@ void ImageUploadManager::destroy() {
 
 Result<ImageUploadTicket, BackendError>
 ImageUploadManager::QueueRegion(VkImage image, VkBufferImageCopy region, slice<rstd::uint8_t> bytes,
-                                rstd::uint32_t block_bytes) {
+                                rstd::uint32_t block_bytes, Option<ImageUploadRows> source_rows) {
     if (! m_impl->initialized)
         return Err(BackendError { "queue image upload"_Str, BackendCause::Closed() });
     if (! block_bytes || ! image || bytes.is_empty())
         return Err(BackendError { "queue image upload"_Str,
                                   BackendCause::Invalid("empty image upload"_Str) });
+    auto         size      = VkDeviceSize(bytes.len().to_primitive());
+    VkDeviceSize row_bytes = size, rows = 1, source_pitch = size;
+    if (source_rows) {
+        row_bytes    = source_rows->row_bytes;
+        rows         = source_rows->rows;
+        source_pitch = source_rows->source_pitch ? source_rows->source_pitch : row_bytes;
+        if (! row_bytes || ! rows || source_pitch < row_bytes || region.bufferRowLength ||
+            region.bufferImageHeight || region.imageExtent.depth != 1 ||
+            region.imageSubresource.layerCount != 1 ||
+            (rows > 1 && source_pitch > (~VkDeviceSize {} - row_bytes) / (rows - 1)))
+            return Err(BackendError { "queue image upload"_Str,
+                                      BackendCause::Invalid("invalid source rows"_Str) });
+        const auto required = source_pitch * (rows - 1) + row_bytes;
+        if (required > size)
+            return Err(
+                BackendError { "queue image upload"_Str, BackendCause::Range(0, required, size) });
+        size = row_bytes * rows;
+    }
     if (! m_impl->pending) {
         ++m_impl->next_batch;
         m_impl->pending            = Some(Arc<RecordedImageUploads::State>::make());
         (*m_impl->pending)->serial = m_impl->next_batch;
     }
-    const auto   size = VkDeviceSize(bytes.len().to_primitive());
     VkDeviceSize offset {};
     VkDeviceSize gcd = 256, divisor = block_bytes;
     while (divisor) {
@@ -805,12 +826,32 @@ ImageUploadManager::QueueRegion(VkImage image, VkBufferImageCopy region, slice<r
     }
     auto block = m_impl->AllocateUpload(size, 256 / gcd * block_bytes, offset);
     if (block.is_err()) return Err(block.unwrap_err());
-    (*block)->Write(offset, bytes);
+    if (source_pitch == row_bytes) {
+        (*block)->Write(offset,
+                        slice<rstd::uint8_t>::from_raw_parts(bytes.as_raw_ptr(), usize(size)));
+    } else {
+        for (VkDeviceSize row {}; row < rows; ++row)
+            (*block)->Write(offset + row * row_bytes,
+                            slice<rstd::uint8_t>::from_raw_parts(
+                                bytes.as_raw_ptr() + row * source_pitch, usize(row_bytes)));
+    }
     region.bufferOffset = offset;
     (*m_impl->pending)->regions.push(ImageRegionOperation { image, region, block.unwrap() });
     ImageUploadTicket ticket { .value = ++m_impl->next_ticket };
     (*m_impl->pending)->tickets.push(decltype(ticket)(ticket));
     return Ok(ticket);
+}
+
+auto ImageUploadManager::statistics() const -> ImageUploadStatistics {
+    ImageUploadStatistics result;
+    for (const auto& block : m_impl->upload_blocks) {
+        result.capacity_bytes += block->size();
+        if (block.strong_count() == usize(1))
+            result.free_capacity_bytes += block->size();
+        else
+            result.live_bytes += block->allocated_bytes();
+    }
+    return result;
 }
 
 bool ImageUploadManager::HasPendingUploads() const noexcept {

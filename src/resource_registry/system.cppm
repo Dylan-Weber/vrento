@@ -60,7 +60,7 @@ public:
         updates_.push(rstd::move(update));
         return Ok(empty {});
     }
-    auto Record(texture::Submission& work) const -> Result<empty, resource::ResourceError> {
+    auto Record(texture::Submission& work) -> Result<empty, resource::ResourceError> {
         auto recording = vulkan::texture_recording(work, session_);
         if (recording.is_err())
             return Err(
@@ -80,6 +80,9 @@ public:
                                                             "record texture update"_Str));
         }
         frame_->uploads_recorded = true;
+        // Staging owns recorded bytes; keep only access descriptions with the frame.
+        for (auto& update : updates_)
+            for (auto& upload : update.uploads) upload.bytes = {};
         return Ok(empty {});
     }
 };

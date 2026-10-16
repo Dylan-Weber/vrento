@@ -239,8 +239,11 @@ auto Prepared::Record(vk::GraphRecordContext& context) const
         tex::TextureUpload upload;
         upload.target = context.texture(context.pass.uses[usize()].resource).unwrap();
         upload.width = upload.height = 4;
-        for (unsigned i {}; i < 64; ++i) upload.bytes.push(u8(i % 4 == 3 ? 255 : 41));
-        auto result = context.submission.commands()->Upload(rstd::move(upload));
+        Vec<u8> bytes;
+        bytes.resize(usize(64), u8(41));
+        for (usize alpha(3); alpha < bytes.len(); alpha += usize(4)) bytes[alpha] = u8(255);
+        upload.bytes = rstd::move(bytes);
+        auto result  = context.submission.commands()->Upload(rstd::move(upload));
         if (result.is_err())
             return Err(vk::GraphExecutionError {
                 vk::GraphExecutionStage::Record,
@@ -871,7 +874,10 @@ TEST(GraphVulkan, SurfaceOutput) {
     tex::TextureUpload upload;
     upload.target = source;
     upload.width = upload.height = 4;
-    for (unsigned i {}; i < 64; ++i) upload.bytes.push(u8(i % 4 == 3 ? 255 : 41));
+    Vec<u8> bytes;
+    bytes.resize(usize(64), u8(41));
+    for (usize alpha(3); alpha < bytes.len(); alpha += usize(4)) bytes[alpha] = u8(255);
+    upload.bytes = rstd::move(bytes);
     setup.commands()->Upload(rstd::move(upload)).unwrap();
     queue.wait(queue.Submit(rstd::move(setup)).unwrap()).unwrap();
     queue.Poll().unwrap();
@@ -1139,7 +1145,10 @@ TEST(GraphVulkan, DescriptorSnapshot) {
     tex::TextureUpload alternate;
     alternate.target = views[usize(3)];
     alternate.width = alternate.height = 4;
-    for (unsigned i {}; i < 64; ++i) alternate.bytes.push(u8(i % 4 == 3 ? 255 : 87));
+    Vec<u8> bytes;
+    bytes.resize(usize(64), u8(87));
+    for (usize alpha(3); alpha < bytes.len(); alpha += usize(4)) bytes[alpha] = u8(255);
+    alternate.bytes = rstd::move(bytes);
     setup.commands()->Upload(rstd::move(alternate)).unwrap();
     setup.commands()
         ->UseSampledView(views[usize(3)], assets->sampler, tex::Stages::Fragment)

@@ -938,10 +938,12 @@ TEST(VulkanRenderer, TextureRegionSurvivesPendingFailureAndCancellationWithoutCo
     renderer.compile(graph, rstd::move(descriptions)).unwrap();
     auto compiled = renderer.compiled().unwrap();
     auto region   = [&](unsigned size) {
+        Vec<u8> bytes;
+        bytes.resize(usize(size * size * 4), u8(127));
         tex::TextureUpload upload;
         upload.target = allocation->Slots()[usize()].view;
         upload.width = upload.height = size;
-        upload.bytes.resize(usize(size * size * 4), u8(127));
+        upload.bytes                 = rstd::move(bytes);
         Vec<tex::TextureUpload> uploads;
         uploads.push(rstd::move(upload));
         return registry::PreparedTextureUpdate { allocation.clone(), rstd::move(uploads) };

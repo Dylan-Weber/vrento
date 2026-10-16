@@ -295,12 +295,18 @@ export namespace vrento::resource_registry
 
 struct TexturePreparationStatistics {
     u64 image_preparations {}, image_reuses {}, target_allocations {};
+    u64 shared_upload_bytes {}, pending_bytes {}, peak_pending_bytes {};
+    u64 peak_pending_contents {}, peak_upload_batches {}, window_waits {}, window_wait_ns {};
 };
 class RegistryTextureContext {
     TexturePreparationStatistics statistics_;
 
 public:
-    auto Statistics() const -> TexturePreparationStatistics { return statistics_; }
+    auto Statistics() const -> TexturePreparationStatistics {
+        auto result          = statistics_;
+        result.pending_bytes = PendingBytes();
+        return result;
+    }
     static constexpr usize MaxPendingContents { 4 };
     static constexpr usize MaxUploadBatches { 3 };
     explicit RegistryTextureContext(vulkan::TextureContext context)
@@ -367,7 +373,7 @@ public:
         auto                         device = dyn<texture::TextureDevice>::from_ref(m_context);
         texture::ImagePrepareContext preparer(device.as_mut_ref());
         auto content = dyn<texture::TextureContentPreparer>::from_ref(preparer);
-        auto result  = content->PrepareImage(*image);
+        auto result  = content->PrepareImage(image.clone());
         if (result.is_err())
             return Failure("prepare texture pixels failed", Some(result.unwrap_err()));
         ++statistics_.image_preparations;
@@ -376,7 +382,9 @@ public:
         Vec<texture::TextureUpload> uploads;
         for (auto& item : prepared) {
             slots.push({ rstd::move(item.view), rstd::move(item.sampler) });
-            for (auto& upload : item.uploads) uploads.push(rstd::move(upload));
+            for (const auto& upload : item.uploads)
+                statistics_.shared_upload_bytes += u64(upload.bytes.len().to_primitive());
+            uploads.append(item.uploads);
         }
         auto queued = Queue(rstd::move(slots), rstd::move(uploads), false);
         if (queued.is_ok())
@@ -512,6 +520,8 @@ public:
         m_recorded_tickets.clear();
         m_recording = None();
         m_in_flight.push(texture::SubmissionToken(token));
+        statistics_.peak_upload_batches =
+            rstd::cmp::max(statistics_.peak_upload_batches, u64(m_in_flight.len().to_primitive()));
         return true;
     }
     void CancelRecording() {
@@ -571,7 +581,11 @@ public:
         auto polled = Poll();
         if (polled.is_err()) return polled;
         if (m_in_flight.len() < MaxUploadBatches) return Ok(empty {});
+        ++statistics_.window_waits;
+        auto start  = rstd::time::Instant::now();
         auto waited = m_context.wait(m_in_flight[usize()]);
+        statistics_.window_wait_ns +=
+            u64(rstd::uint64_t(start.elapsed().as_nanos().to_primitive()));
         if (waited.is_err()) return waited;
         return Poll();
     }
@@ -585,6 +599,13 @@ public:
     }
 
 private:
+    auto PendingBytes() const -> u64 {
+        u64 bytes {};
+        for (const auto& pending : m_pending)
+            for (const auto& upload : pending.uploads)
+                bytes += u64(upload.bytes.len().to_primitive());
+        return bytes;
+    }
     struct CachedImage {
         rstd::sync::Weak<Image>           source;
         Arc<TextureAllocation>            allocation;
@@ -666,6 +687,10 @@ private:
             ticket = Some(vulkan::ImageUploadTicket { .value = m_next_ticket });
             allocation->MarkPending();
             m_pending.push({ *ticket, allocation.clone(), rstd::move(uploads), transparent });
+            statistics_.peak_pending_contents = rstd::cmp::max(statistics_.peak_pending_contents,
+                                                               u64(m_pending.len().to_primitive()));
+            statistics_.peak_pending_bytes =
+                rstd::cmp::max(statistics_.peak_pending_bytes, PendingBytes());
         }
         return Ok(PreparedImageAllocation { rstd::move(allocation), ticket });
     }

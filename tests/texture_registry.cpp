@@ -20,8 +20,72 @@ namespace vrento_test::texture_registry
 struct SemaphoreOwner {
     vk::DeviceSession session;
     vvk::Semaphore    semaphore;
-    explicit SemaphoreOwner(vk::DeviceSession value): session(rstd::move(value)) {}
+    bool              signalled {};
+    explicit SemaphoreOwner(vk::DeviceSession value): session(rstd::move(value)) {
+        VkSemaphoreTypeCreateInfo type { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+        type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo info { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type };
+        rstd_assert(session.device().handle().CreateSemaphore(info, semaphore) == VK_SUCCESS);
+    }
+    void Signal() {
+        if (signalled) return;
+        auto& device = session.device();
+        auto  signal = reinterpret_cast<PFN_vkSignalSemaphoreKHR>(
+            device.handle().Dispatch().vkGetDeviceProcAddr(*device.handle(),
+                                                           "vkSignalSemaphoreKHR"));
+        rstd_assert(signal);
+        VkSemaphoreSignalInfo info { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
+        info.semaphore = *semaphore;
+        info.value     = 1;
+        rstd_assert(signal(*device.handle(), &info) == VK_SUCCESS);
+        signalled = true;
+    }
 };
+struct SignalOnDrop {
+    Arc<SemaphoreOwner> gate;
+    ~SignalOnDrop() { gate->Signal(); }
+};
+auto BlockQueue(vk::TextureContext& context, Arc<SemaphoreOwner> gate) -> tex::SubmissionToken {
+    auto work = context.Begin().unwrap();
+    dyn<vk::NativeSubmission>::from_ref(context)
+        ->AttachWait(work,
+                     { *gate->session.device().handle(),
+                       *gate->semaphore,
+                       vk::NativeSemaphoreKind::Timeline,
+                       1,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       Arc<dyn<rstd::any::Any>>::make(gate.clone()) })
+        .unwrap();
+    return context.Submit(rstd::move(work)).unwrap();
+}
+struct PixelLifetime {
+    usize live {}, peak {}, released {};
+};
+auto PixelImage(Arc<PixelLifetime> lifetime) -> Arc<vrento::Image> {
+    auto image           = Arc<vrento::Image>::make();
+    image->header.format = vrento::TextureFormat::RGBA8;
+    vrento::Image::Slot slot;
+    slot.width = slot.height = 2;
+    if (lifetime) {
+        ++lifetime->live;
+        lifetime->peak = rstd::cmp::max(lifetime->peak, lifetime->live);
+    }
+    slot.mipmaps.push(vrento::ImageData {
+        2,
+        2,
+        isize(16),
+        vrento::ImageDataPtr(new rstd::uint8_t[16] {},
+                             [lifetime = rstd::move(lifetime)](rstd::uint8_t* data) {
+                                 delete[] data;
+                                 if (lifetime) {
+                                     --lifetime->live;
+                                     ++lifetime->released;
+                                 }
+                             }) });
+    image->slots.push(rstd::move(slot));
+    return image;
+}
+auto PixelImage() -> Arc<vrento::Image> { return PixelImage(Arc<PixelLifetime>::make()); }
 } // namespace vrento_test::texture_registry
 
 namespace vrento_test::texture_registry
@@ -90,51 +154,39 @@ TEST(RenderResourceSystem, OwnsPreparationAndRejectsStaleCommitOrCancel) {
 }
 
 TEST(RegistryTextureContext, SlowGpuBoundsPendingUploads) {
-    auto                      session = vk::DeviceSession::create({ .validation = true }).unwrap();
-    auto                      context = vk::TextureContext::create(session).unwrap();
-    auto                      gate    = Arc<SemaphoreOwner>::make(session);
-    VkSemaphoreTypeCreateInfo type { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
-    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-    VkSemaphoreCreateInfo info { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type };
-    rstd_assert(session.device().handle().CreateSemaphore(info, gate->semaphore) == VK_SUCCESS);
-    auto work = context.Begin().unwrap();
-    dyn<vk::NativeSubmission>::from_ref(context)
-        ->AttachWait(work,
-                     { *session.device().handle(),
-                       *gate->semaphore,
-                       vk::NativeSemaphoreKind::Timeline,
-                       1,
-                       VK_PIPELINE_STAGE_TRANSFER_BIT,
-                       Arc<dyn<rstd::any::Any>>::make(gate.clone()) })
-        .unwrap();
-    auto                                blocked = context.Submit(rstd::move(work)).unwrap();
-    registry::RegistryTextureContext    textures(rstd::move(context));
-    vrento::resource::TextureDefinition definition;
-    definition.width = definition.height = i32(16);
-    definition.usage                     = vrento::resource::TextureUsage::Sampled |
-                                           vrento::resource::TextureUsage::TransferDestination;
+    auto created = vk::DeviceSession::create({ .validation = true });
+    if (created.is_err()) GTEST_SKIP() << "Vulkan unavailable";
+    auto                             session = created.unwrap();
+    auto                             context = vk::TextureContext::create(session).unwrap();
+    auto                             gate    = Arc<SemaphoreOwner>::make(session);
+    auto                             blocked = BlockQueue(context, gate.clone());
+    registry::RegistryTextureContext textures(rstd::move(context));
+    auto                             lifetime = Arc<PixelLifetime>::make();
+    usize                            produced {};
+    auto                             queue = [&] {
+        textures.CreateImportedTexture(PixelImage(lifetime.clone()), None()).unwrap();
+        ++produced;
+        EXPECT_LE(textures.PendingCount(), textures.MaxPendingContents);
+        EXPECT_LE(textures.InFlightCount(), textures.MaxUploadBatches);
+        EXPECT_EQ(textures.Statistics().pending_bytes,
+                  u64(textures.PendingCount().to_primitive()) * u64(16));
+        EXPECT_LE(lifetime->live, textures.MaxPendingContents + usize(1));
+    };
     for (usize batch {}; batch < textures.MaxUploadBatches; ++batch) {
-        for (usize item {}; item < textures.MaxPendingContents; ++item)
-            textures.AllocateTexture(definition, true).unwrap();
+        for (usize item {}; item < textures.MaxPendingContents; ++item) queue();
         rstd_assert(textures.PendingCount() == textures.MaxPendingContents);
+        EXPECT_EQ(lifetime->live, textures.MaxPendingContents);
         textures.Flush().unwrap();
+        EXPECT_EQ(lifetime->live, usize());
+        EXPECT_EQ(textures.Statistics().pending_bytes, u64());
     }
     rstd_assert(textures.InFlightCount() == textures.MaxUploadBatches);
     rstd_assert(! blocked.poll().unwrap());
-    auto release =
-        rstd::thread::spawn([gate = gate.clone()] {
-            rstd::thread::sleep(rstd::time::Duration::from_millis(u64(30)));
-            auto& device = gate->session.device();
-            auto  signal = reinterpret_cast<PFN_vkSignalSemaphoreKHR>(
-                device.handle().Dispatch().vkGetDeviceProcAddr(*device.handle(),
-                                                               "vkSignalSemaphoreKHR"));
-            rstd_assert(signal);
-            VkSemaphoreSignalInfo signal_info { VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
-            signal_info.semaphore = *gate->semaphore;
-            signal_info.value     = 1;
-            rstd_assert(signal(*device.handle(), &signal_info) == VK_SUCCESS);
-        }).unwrap();
-    textures.AllocateTexture(definition, true).unwrap();
+    auto release = rstd::thread::spawn([gate = gate.clone()] {
+                       rstd::thread::sleep(rstd::time::Duration::from_millis(u64(30)));
+                       gate->Signal();
+                   }).unwrap();
+    queue();
     rstd::move(release).join().unwrap();
     rstd_assert(blocked.poll().unwrap());
     rstd_assert(textures.InFlightCount() < textures.MaxUploadBatches);
@@ -144,24 +196,36 @@ TEST(RegistryTextureContext, SlowGpuBoundsPendingUploads) {
         rstd_assert(textures.RecordPendingUploads(cancelled));
     }
     rstd_assert(textures.PendingCount() == usize(1));
+    EXPECT_EQ(lifetime->live, usize(1));
     textures.CancelRecording();
     textures.Flush().unwrap();
+    EXPECT_EQ(lifetime->live, usize());
+    usize first_peak {};
+    for (auto count : array<unsigned, 2> { 24u, 192u }) {
+        for (unsigned index {}; index < count; ++index) queue();
+        textures.Flush().unwrap();
+        EXPECT_EQ(lifetime->live, usize());
+        if (first_peak == usize())
+            first_peak = lifetime->peak;
+        else
+            EXPECT_EQ(lifetime->peak, first_peak);
+    }
     textures.WaitForUploads(5'000'000'000).unwrap();
     rstd_assert(textures.InFlightCount() == usize());
+    EXPECT_EQ(textures.PendingCount(), usize());
+    EXPECT_EQ(lifetime->released, produced);
+    EXPECT_EQ(lifetime->peak, textures.MaxPendingContents + usize(1));
+    auto statistics = textures.Statistics();
+    EXPECT_EQ(statistics.image_preparations, u64(produced.to_primitive()));
+    EXPECT_EQ(statistics.shared_upload_bytes, u64(produced.to_primitive()) * u64(16));
+    EXPECT_EQ(statistics.pending_bytes, u64());
+    EXPECT_EQ(statistics.peak_pending_bytes,
+              u64(textures.MaxPendingContents.to_primitive()) * u64(16));
+    EXPECT_EQ(statistics.peak_pending_contents, u64(textures.MaxPendingContents.to_primitive()));
+    EXPECT_EQ(statistics.peak_upload_batches, u64(textures.MaxUploadBatches.to_primitive()));
+    EXPECT_GE(statistics.window_waits, u64(1));
+    EXPECT_GT(statistics.window_wait_ns, u64());
     rstd_assert(session.validation_errors() == 0);
-}
-
-auto PixelImage() -> Arc<vrento::Image> {
-    auto image           = Arc<vrento::Image>::make();
-    image->header.format = vrento::TextureFormat::RGBA8;
-    vrento::Image::Slot slot;
-    slot.width = slot.height = 2;
-    slot.mipmaps.push(vrento::ImageData {
-        2, 2, isize(16), vrento::ImageDataPtr(new rstd::uint8_t[16] {}, [](rstd::uint8_t* data) {
-            delete[] data;
-        }) });
-    image->slots.push(rstd::move(slot));
-    return image;
 }
 
 TEST(RegistryTextureContext, ImageIdentityReusesPreparedAllocationAndCancelledUpload) {
@@ -169,26 +233,45 @@ TEST(RegistryTextureContext, ImageIdentityReusesPreparedAllocationAndCancelledUp
     if (created.is_err()) GTEST_SKIP() << "Vulkan unavailable";
     auto                             session = created.unwrap();
     registry::RegistryTextureContext textures(vk::TextureContext::create(session).unwrap());
-    auto                             preload = PixelImage();
+    registry::RenderResourceSystem   resources;
+    ASSERT_TRUE(resources.Initialize(session));
+    auto preload = PixelImage();
     ASSERT_TRUE(textures.TryPrepareImage(preload.clone()).unwrap());
     auto adopted = textures.CreateImportedTexture(preload.clone(), None()).unwrap();
     EXPECT_FALSE(adopted.upload);
     EXPECT_EQ(textures.PendingCount(), usize());
-    auto image  = PixelImage();
-    auto first  = textures.CreateImportedTexture(image.clone(), None()).unwrap();
-    auto reused = textures.CreateImportedTexture(image.clone(), None()).unwrap();
+    auto lifetime = Arc<PixelLifetime>::make();
+    auto image    = PixelImage(lifetime.clone());
+    auto source   = image.downgrade();
+    auto pixels   = image->slots[usize()].mipmaps[usize()].data.get();
+    auto first    = textures.CreateImportedTexture(image.clone(), None()).unwrap();
+    auto reused   = textures.CreateImportedTexture(rstd::move(image), None()).unwrap();
     EXPECT_TRUE(Arc<registry::TextureAllocation>::ptr_eq(first.allocation, reused.allocation));
     EXPECT_EQ(textures.PendingCount(), usize(1));
+    EXPECT_FALSE(source.expired());
+    EXPECT_EQ(lifetime->released, usize());
     EXPECT_EQ(first.allocation->InitialReadiness().unwrap(), registry::ImageReadiness::Pending);
     {
-        auto cancelled = textures.Context().Begin().unwrap();
+        auto cancelled = resources.BeginFrame().unwrap();
         auto updates   = textures.PreparePendingUploads(cancelled).unwrap();
         ASSERT_EQ(updates.len(), usize(1));
+        ASSERT_EQ(updates[usize()].uploads.len(), usize(1));
+        auto clone = updates[usize()].clone();
+        EXPECT_EQ(updates[usize()].uploads[usize()].bytes.as_slice().as_raw_ptr(),
+                  reinterpret_cast<const byte*>(pixels));
+        EXPECT_EQ(clone.uploads[usize()].bytes.as_slice().as_raw_ptr(),
+                  reinterpret_cast<const byte*>(pixels));
         EXPECT_EQ(updates[usize()].Readiness().unwrap(), registry::ImageReadiness::Pending);
-        updates[usize()].Record(cancelled, session).unwrap();
-        EXPECT_EQ(updates[usize()].Readiness(Some(cancelled.receipt())).unwrap(),
+        auto batch = resources.PreparePendingUploads(cancelled).unwrap();
+        batch.Add(rstd::move(updates[usize()])).unwrap();
+        updates.clear();
+        batch.Record(cancelled).unwrap();
+        EXPECT_EQ(clone.Readiness(Some(cancelled.receipt())).unwrap(),
                   registry::ImageReadiness::Recorded);
-        EXPECT_TRUE(updates[usize()].clone().Record(cancelled, session).is_err());
+        EXPECT_TRUE(clone.Record(cancelled, session).is_err());
+        EXPECT_EQ(batch.Writes().len(), usize(1));
+        EXPECT_FALSE(source.expired());
+        EXPECT_EQ(lifetime->released, usize());
         auto foreign         = textures.Context().Begin().unwrap();
         auto foreign_receipt = foreign.receipt();
         auto token           = textures.Context().Submit(rstd::move(foreign)).unwrap();
@@ -198,11 +281,56 @@ TEST(RegistryTextureContext, ImageIdentityReusesPreparedAllocationAndCancelledUp
                   registry::ImageReadiness::Recorded);
     }
     EXPECT_EQ(first.allocation->InitialReadiness().unwrap(), registry::ImageReadiness::Pending);
+    EXPECT_FALSE(source.expired());
+    EXPECT_EQ(lifetime->released, usize());
     textures.CancelRecording();
-    textures.Flush().unwrap();
-    auto again = textures.CreateImportedTexture(image.clone(), None()).unwrap();
+    auto again = textures.CreateImportedTexture(source.upgrade(), None()).unwrap();
     EXPECT_TRUE(Arc<registry::TextureAllocation>::ptr_eq(first.allocation, again.allocation));
-    EXPECT_FALSE(again.upload);
+    EXPECT_TRUE(again.upload);
+    auto work    = resources.BeginFrame().unwrap();
+    auto updates = textures.PreparePendingUploads(work).unwrap();
+    ASSERT_EQ(updates.len(), usize(1));
+    ASSERT_EQ(updates[usize()].uploads.len(), usize(1));
+    EXPECT_EQ(updates[usize()].uploads[usize()].bytes.as_slice().as_raw_ptr(),
+              reinterpret_cast<const byte*>(pixels));
+    auto batch = Arc<registry::PreparedResourceUploads>::make(
+        resources.PreparePendingUploads(work).unwrap());
+    batch->Add(rstd::move(updates[usize()])).unwrap();
+    updates.clear();
+    auto writes = batch->Writes();
+    ASSERT_EQ(writes.len(), usize(1));
+    batch->Record(work).unwrap();
+    ASSERT_EQ(batch->Writes().len(), writes.len());
+    EXPECT_EQ(batch->Writes()[usize()].view.texture().identity(),
+              writes[usize()].view.texture().identity());
+    EXPECT_EQ(batch->Writes()[usize()].access, tex::Access::TransferDestination);
+    EXPECT_EQ(batch->Writes()[usize()].range, writes[usize()].range);
+    EXPECT_FALSE(source.expired());
+    EXPECT_EQ(textures.Statistics().pending_bytes, u64(16));
+    auto retained_batch = batch.downgrade();
+    work.retain(rstd::move(batch));
+    auto         gate = Arc<SemaphoreOwner>::make(session);
+    SignalOnDrop release { gate.clone() };
+    auto         blocked = BlockQueue(textures.Context(), gate.clone());
+    auto         receipt = work.receipt();
+    auto         token   = resources.SubmitFrame(rstd::move(work)).unwrap();
+    ASSERT_TRUE(textures.ConfirmSubmitted(receipt, token));
+    EXPECT_FALSE(token.poll().unwrap());
+    EXPECT_FALSE(blocked.poll().unwrap());
+    EXPECT_FALSE(retained_batch.expired());
+    {
+        auto retained = retained_batch.upgrade();
+        ASSERT_TRUE(retained);
+        EXPECT_EQ(retained->Writes().len(), usize(1));
+    }
+    EXPECT_TRUE(source.expired());
+    EXPECT_EQ(lifetime->live, usize());
+    EXPECT_EQ(lifetime->released, usize(1));
+    EXPECT_EQ(textures.PendingCount(), usize());
+    EXPECT_EQ(textures.Statistics().pending_bytes, u64());
+    EXPECT_EQ(first.allocation->InitialReadiness().unwrap(), registry::ImageReadiness::Submitted);
+    gate->Signal();
+    resources.TryWaitSubmission(token).unwrap();
     auto revision = textures.CreateImportedTexture(PixelImage(), None()).unwrap();
     EXPECT_FALSE(Arc<registry::TextureAllocation>::ptr_eq(first.allocation, revision.allocation));
     textures.Flush().unwrap();
@@ -669,11 +797,21 @@ namespace vrento_test::texture_registry
 {
 TEST(TextureRegistry, SharesCompatibleContentButSeparatesSourceScopes) {
     namespace resource = vrento::resource;
-    auto session       = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto created       = vk::DeviceSession::create({ .validation = true });
+    if (created.is_err()) GTEST_SKIP() << "Vulkan unavailable";
+    auto                             session = created.unwrap();
     registry::RegistryTextureContext context(vk::TextureContext::create(session).unwrap());
-    auto                             image = PixelImage();
+    auto                             lifetime = Arc<PixelLifetime>::make();
+    auto                             image    = PixelImage(lifetime.clone());
+    auto                             source   = image.downgrade();
     context.TryPrepareImage(image.clone()).unwrap();
     auto allocation = context.CreateImportedTexture(rstd::move(image), None()).unwrap().allocation;
+    EXPECT_TRUE(source.expired());
+    EXPECT_EQ(lifetime->released, usize(1));
+    auto statistics = context.Statistics();
+    EXPECT_EQ(statistics.image_preparations, u64(1));
+    EXPECT_EQ(statistics.shared_upload_bytes, u64(16));
+    EXPECT_EQ(statistics.pending_bytes, u64());
     resource::TextureRegistry textures;
     resource::TextureRequest  request { .kind = resource::TextureRequestKind::Imported,
                                         .name = "shared"_Str };
@@ -685,6 +823,7 @@ TEST(TextureRegistry, SharesCompatibleContentButSeparatesSourceScopes) {
             .RegisterResource(resource::TextureResourceRef(request.clone()), Some(content.clone()))
             .unwrap();
     textures.Publish(a, allocation.clone()).unwrap();
+    request.name = "alias"_Str;
     auto b =
         textures
             .RegisterResource(resource::TextureResourceRef(request.clone()), Some(content.clone()))
@@ -692,6 +831,20 @@ TEST(TextureRegistry, SharesCompatibleContentButSeparatesSourceScopes) {
     EXPECT_TRUE(textures.ReusePhysical(b));
     EXPECT_TRUE(Arc<registry::TextureAllocation>::ptr_eq((*textures.ResolveCurrent(b))->allocation,
                                                          allocation));
+    auto different = content.clone();
+    different.key  = "other-pixels"_Str;
+    auto other_key = textures
+                         .RegisterResource(resource::TextureResourceRef(request.clone()),
+                                           Some(rstd::move(different)))
+                         .unwrap();
+    EXPECT_FALSE(textures.ReusePhysical(other_key));
+    different           = content.clone();
+    different.revision  = u64(2);
+    auto other_revision = textures
+                              .RegisterResource(resource::TextureResourceRef(request.clone()),
+                                                Some(rstd::move(different)))
+                              .unwrap();
+    EXPECT_FALSE(textures.ReusePhysical(other_revision));
     content.scope = u64(2);
     auto c =
         textures
@@ -701,6 +854,19 @@ TEST(TextureRegistry, SharesCompatibleContentButSeparatesSourceScopes) {
     textures.RetainActive(array<resource::TextureHandle, 1> { b }.as_slice());
     EXPECT_EQ(textures.Size(), usize(1));
     EXPECT_TRUE(textures.ResolveCurrent(b));
+    content.scope = u64(1);
+    auto rebuilt =
+        textures
+            .RegisterResource(resource::TextureResourceRef(request.clone()), Some(content.clone()))
+            .unwrap();
+    EXPECT_TRUE(textures.ReusePhysical(rebuilt));
+    EXPECT_TRUE(Arc<registry::TextureAllocation>::ptr_eq(
+        (*textures.ResolveCurrent(rebuilt))->allocation, allocation));
+    EXPECT_TRUE(allocation->Slots()[usize()].view.texture().check().is_ok());
+    EXPECT_EQ(context.Statistics().image_preparations, statistics.image_preparations);
+    EXPECT_EQ(context.Statistics().shared_upload_bytes, statistics.shared_upload_bytes);
+    EXPECT_EQ(context.PendingCount(), usize());
+    context.WaitForUploads(5'000'000'000).unwrap();
     EXPECT_EQ(session.validation_errors(), 0u);
 }
 TEST(RenderResourceSystem, StableReferencesKeepStoragePolicyAndOldPreparedAllocations) {

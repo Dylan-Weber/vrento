@@ -643,6 +643,15 @@ private:
     Option<Arc<RecordedImageUploads::State>> m_state;
 };
 
+struct ImageUploadRows {
+    // Counts format-block rows, not texel rows for compressed formats.
+    VkDeviceSize row_bytes {}, rows {}, source_pitch {};
+};
+
+struct ImageUploadStatistics {
+    VkDeviceSize live_bytes {}, capacity_bytes {}, free_capacity_bytes {};
+};
+
 class ImageUploadManager {
 public:
     ImageUploadManager(const ImageUploadManager&)            = delete;
@@ -655,9 +664,13 @@ public:
     bool init();
     void destroy();
 
-    // Copies the source bytes into owned staging before returning.
+    // Copies into owned staging before returning. Source rows require a tightly packed,
+    // single-layer 2D region; a zero source pitch means row_bytes.
     auto QueueRegion(VkImage image, VkBufferImageCopy region, slice<rstd::uint8_t> bytes,
-                     rstd::uint32_t block_bytes = 4) -> Result<ImageUploadTicket, BackendError>;
+                     rstd::uint32_t block_bytes = 4, Option<ImageUploadRows> source_rows = None())
+        -> Result<ImageUploadTicket, BackendError>;
+    // Live bytes exclude alignment gaps; free capacity belongs to unleased cached blocks.
+    auto statistics() const -> ImageUploadStatistics;
     bool HasPendingUploads() const noexcept;
     auto RecordQueuedRegions(vvk::CommandBuffer& command, RecordedImageUploads& recorded)
         -> Result<rstd::empty, BackendError>;

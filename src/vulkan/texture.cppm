@@ -874,20 +874,8 @@ public:
                                    false,
                                    Some(desc.range) });
         if (access.is_err()) return access;
-        auto    data = layout.unwrap();
-        Vec<u8> packed;
-        auto    bytes = slice<u8>::from_raw_parts(upload.bytes.as_slice().as_raw_ptr(),
-                                                  usize(data.row_bytes * data.rows));
-        if (data.source_pitch != data.row_bytes) {
-            packed.reserve(usize(data.row_bytes * data.rows));
-            for (tex::Serial row = 0; row < data.rows; ++row) {
-                auto start = usize(row * data.source_pitch);
-                packed.extend_from_slice(slice<u8>::from_raw_parts(
-                    upload.bytes.as_slice().as_raw_ptr() + start.to_primitive(),
-                    usize(data.row_bytes)));
-            }
-            bytes = packed.as_slice();
-        }
+        auto              data  = layout.unwrap();
+        auto              bytes = upload.bytes.as_slice();
         VkBufferImageCopy region {};
         region.imageSubresource = { desc.range.aspect == tex::Aspect::Depth
                                         ? VK_IMAGE_ASPECT_DEPTH_BIT
@@ -904,7 +892,8 @@ public:
             image,
             region,
             content,
-            tex::format_layout(upload.target.texture().description().format).block_bytes);
+            tex::format_layout(upload.target.texture().description().format).block_bytes,
+            Some(ImageUploadRows { data.row_bytes, data.rows, data.source_pitch }));
         if (queued.is_err()) return Err(tex::Error::from_backend(queued.unwrap_err()));
         return Ok(empty {});
     }

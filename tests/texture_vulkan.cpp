@@ -194,7 +194,9 @@ void fill(tex::Submission& work, tex::TextureViewRef target, unsigned width, uns
     upload.layer  = layer;
     upload.x      = x;
     upload.y      = y;
-    for (unsigned i = 0; i < width * height * 4; ++i) upload.bytes.push(u8(value));
+    Vec<u8> bytes;
+    bytes.resize(usize(width * height * 4), u8(value));
+    upload.bytes = rstd::move(bytes);
     work.commands()->Upload(rstd::move(upload)).unwrap();
 }
 TEST(TextureVulkan, UploadLayoutsPreserveMipAndLayerPayloads) {
@@ -232,25 +234,203 @@ TEST(TextureVulkan, UploadLayoutsPreserveMipAndLayerPayloads) {
                     upload.width     = extent.width;
                     upload.height    = extent.height;
                     upload.row_pitch = layout == 0 ? 0 : pitch;
-                    upload.bytes.resize(usize(size + (layout == 3 ? 31 : 0)), u8(0xee));
+                    Vec<u8> bytes;
+                    bytes.resize(usize(size + (layout == 3 ? 31 : 0)), u8(0xee));
                     for (unsigned row {}; row < rows; ++row)
                         for (unsigned byte {}; byte < row_bytes; ++byte)
-                            upload.bytes[usize(row * pitch + byte)] =
+                            bytes[usize(row * pitch + byte)] =
                                 u8((row * row_bytes + byte + mip * 13 + layer * 7) % 251);
-                    auto work = device.Begin().unwrap();
+                    upload.bytes = rstd::move(bytes);
+                    auto work    = device.Begin().unwrap();
                     work.commands()->Upload(rstd::move(upload)).unwrap();
                     auto submitted = device.Submit(rstd::move(work)).unwrap();
                     device.wait(submitted).unwrap();
-                    auto bytes = read(device, view, mip, layer);
-                    ASSERT_EQ(bytes.len(), usize(row_bytes * rows));
-                    for (usize index {}; index < bytes.len(); ++index)
-                        ASSERT_EQ(bytes[index],
+                    auto readback = read(device, view, mip, layer);
+                    ASSERT_EQ(readback.len(), usize(row_bytes * rows));
+                    for (usize index {}; index < readback.len(); ++index)
+                        ASSERT_EQ(readback[index],
                                   u8((index.to_primitive() + mip * 13 + layer * 7) % 251));
                 }
             }
         }
     }
     EXPECT_GT(tested_formats, usize());
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
+TEST(TextureVulkan, PitchedRegionUploadsPreserveOtherBlocks) {
+    auto  session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto  device  = vk::TextureContext::create(session).unwrap();
+    usize tested_formats {};
+    for (auto format : array<vrento::TextureFormat, 3> { vrento::TextureFormat::RGBA8,
+                                                         vrento::TextureFormat::BC1,
+                                                         vrento::TextureFormat::BC3 }) {
+        tex::TextureDesc desc;
+        desc.extent = { 18, 14 };
+        desc.format = format;
+        desc.usage =
+            tex::Usage::Sampled | tex::Usage::TransferDestination | tex::Usage::TransferSource;
+        if (device.QuerySupport(desc).is_err()) continue;
+        ++tested_formats;
+        auto texture = device.CreateTexture(desc).unwrap();
+        auto view    = device.CreateView(texture, {}).unwrap();
+        auto blocks  = tex::format_layout(format);
+        auto columns = (desc.extent.width + blocks.block_width - 1) / blocks.block_width;
+        auto rows    = (desc.extent.height + blocks.block_height - 1) / blocks.block_height;
+        auto work    = device.Begin().unwrap();
+        tex::TextureUpload initial;
+        initial.target = view;
+        initial.width  = desc.extent.width;
+        initial.height = desc.extent.height;
+        Vec<u8> initial_bytes;
+        initial_bytes.resize(usize(columns * rows * blocks.block_bytes), u8(0x27));
+        initial.bytes = rstd::move(initial_bytes);
+        work.commands()->Upload(rstd::move(initial)).unwrap();
+        tex::TextureUpload patch;
+        patch.target = view;
+        patch.x = patch.y  = 4;
+        patch.width        = desc.extent.width - patch.x;
+        patch.height       = desc.extent.height - patch.y;
+        auto patch_columns = (patch.width + blocks.block_width - 1) / blocks.block_width;
+        auto patch_rows    = (patch.height + blocks.block_height - 1) / blocks.block_height;
+        auto row_bytes     = patch_columns * blocks.block_bytes;
+        auto pitch         = row_bytes + 7;
+        patch.row_pitch    = pitch;
+        Vec<u8> patch_bytes;
+        patch_bytes.resize(usize(pitch * (patch_rows - 1) + row_bytes), u8(0xee));
+        for (unsigned row {}; row < patch_rows; ++row)
+            for (unsigned byte {}; byte < row_bytes; ++byte)
+                patch_bytes[usize(row * pitch + byte)] = u8((row * row_bytes + byte) % 251);
+        patch.bytes = rstd::move(patch_bytes);
+        work.commands()->Upload(rstd::move(patch)).unwrap();
+        device.wait(device.Submit(rstd::move(work)).unwrap()).unwrap();
+        auto bytes = read(device, view);
+        ASSERT_EQ(bytes.len(), usize(columns * rows * blocks.block_bytes));
+        auto first_column = 4 / blocks.block_width;
+        auto first_row    = 4 / blocks.block_height;
+        for (unsigned row {}; row < rows; ++row)
+            for (unsigned column {}; column < columns; ++column)
+                for (unsigned byte {}; byte < blocks.block_bytes; ++byte) {
+                    auto expected = row >= first_row && column >= first_column
+                                        ? u8(((row - first_row) * row_bytes +
+                                              (column - first_column) * blocks.block_bytes + byte) %
+                                             251)
+                                        : u8(0x27);
+                    EXPECT_EQ(bytes[usize((row * columns + column) * blocks.block_bytes + byte)],
+                              expected);
+                }
+    }
+    EXPECT_GT(tested_formats, usize());
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
+TEST(TextureVulkan, ImageStagingRowsAndLeaseLifetime) {
+    auto                   session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto                   device  = vk::TextureContext::create(session).unwrap();
+    vk::ImageUploadManager uploads(session.device());
+    ASSERT_TRUE(uploads.init());
+    EXPECT_EQ(uploads.statistics().capacity_bytes, 0u);
+    tex::TextureDesc desc;
+    desc.extent = { 4, 4 };
+    desc.usage = tex::Usage::Sampled | tex::Usage::TransferDestination | tex::Usage::TransferSource;
+    auto              texture = device.CreateTexture(desc).unwrap();
+    auto              view    = device.CreateView(texture, {}).unwrap();
+    auto              image   = vk::native_texture(texture).unwrap();
+    VkBufferImageCopy region {};
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageExtent      = { 4, 4, 1 };
+    array<rstd::uint8_t, 76> bytes {};
+    for (unsigned row {}; row < 4; ++row)
+        for (unsigned byte {}; byte < 16; ++byte)
+            bytes[usize(row * 20 + byte)] = rstd::uint8_t(row * 16 + byte);
+    for (auto invalid :
+         array<vk::ImageUploadRows, 5> { vk::ImageUploadRows { 0, 4, 20 },
+                                         vk::ImageUploadRows { 16, 0, 20 },
+                                         vk::ImageUploadRows { 16, 4, 15 },
+                                         vk::ImageUploadRows { 16, 4, 21 },
+                                         vk::ImageUploadRows { 16, 4, ~VkDeviceSize {} } })
+        EXPECT_TRUE(
+            uploads.QueueRegion(image, region, bytes.as_slice(), 4, Some(invalid)).is_err());
+    auto non_tight            = region;
+    non_tight.bufferRowLength = 4;
+    EXPECT_TRUE(
+        uploads
+            .QueueRegion(
+                image, non_tight, bytes.as_slice(), 4, Some(vk::ImageUploadRows { 16, 4, 20 }))
+            .is_err());
+    EXPECT_FALSE(uploads.HasPendingUploads());
+    EXPECT_EQ(uploads.statistics().capacity_bytes, 0u);
+    auto ticket =
+        uploads
+            .QueueRegion(
+                image, region, bytes.as_slice(), 4, Some(vk::ImageUploadRows { 16, 4, 20 }))
+            .unwrap();
+    EXPECT_TRUE(ticket.Valid());
+    auto capacity = uploads.statistics().capacity_bytes;
+    EXPECT_GE(capacity, 64u);
+    EXPECT_EQ(uploads.statistics().live_bytes, 64u);
+    EXPECT_EQ(uploads.statistics().free_capacity_bytes, 0u);
+    for (auto& byte : bytes) byte = 0xff;
+    {
+        auto cancelled = device.Begin().unwrap();
+        cancelled.commands()
+            ->UseTexture({ view, tex::Access::TransferDestination, tex::Stages::Transfer })
+            .unwrap();
+        auto command = vk::native_command_recording(cancelled, session).unwrap();
+        vk::RecordedImageUploads recorded;
+        uploads.RecordQueuedRegions(command, recorded).unwrap();
+    }
+    EXPECT_TRUE(uploads.HasPendingUploads());
+    EXPECT_EQ(uploads.statistics().live_bytes, 64u);
+    auto work = device.Begin().unwrap();
+    work.commands()
+        ->UseTexture({ view, tex::Access::TransferDestination, tex::Stages::Transfer })
+        .unwrap();
+    auto                     command = vk::native_command_recording(work, session).unwrap();
+    vk::RecordedImageUploads recorded;
+    uploads.RecordQueuedRegions(command, recorded).unwrap();
+    auto lease = uploads.CommitRecordedUploads(rstd::move(recorded)).unwrap();
+    EXPECT_EQ(lease.Tickets().len(), usize(1));
+    EXPECT_EQ(lease.Tickets()[usize()], ticket);
+    work.retain(rstd::move(lease));
+    auto gate = semaphore(session, true);
+    auto api  = dyn<vk::NativeSubmission>::from_ref(device);
+    api->AttachWait(work,
+                    { *session.device().handle(),
+                      *gate->semaphore,
+                      vk::NativeSemaphoreKind::Timeline,
+                      1,
+                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                      pin(gate) })
+        .unwrap();
+    auto done = device.Submit(rstd::move(work)).unwrap();
+    EXPECT_FALSE(done.poll().unwrap());
+    device.Poll().unwrap();
+    EXPECT_EQ(uploads.statistics().live_bytes, 64u);
+    uploads.QueueRegion(image, region, bytes.as_slice(), 4, Some(vk::ImageUploadRows { 16, 4 }))
+        .unwrap();
+    EXPECT_EQ(uploads.statistics().capacity_bytes, capacity * 2);
+    EXPECT_EQ(uploads.statistics().live_bytes, 128u);
+    EXPECT_EQ(uploads.statistics().free_capacity_bytes, 0u);
+    uploads.DiscardPendingUploads();
+    EXPECT_EQ(uploads.statistics().live_bytes, 64u);
+    EXPECT_EQ(uploads.statistics().free_capacity_bytes, capacity);
+    host_signal(session, *gate->semaphore, 1);
+    device.wait(done).unwrap();
+    EXPECT_EQ(uploads.statistics().live_bytes, 0u);
+    EXPECT_EQ(uploads.statistics().free_capacity_bytes, capacity * 2);
+    auto pixels = read(device, view);
+    ASSERT_EQ(pixels.len(), usize(64));
+    for (usize index {}; index < pixels.len(); ++index)
+        EXPECT_EQ(pixels[index], u8(index.to_primitive()));
+    uploads.Trim();
+    EXPECT_EQ(uploads.statistics().capacity_bytes, capacity);
+    EXPECT_EQ(uploads.statistics().free_capacity_bytes, capacity);
+    uploads.QueueRegion(image, region, bytes.as_slice()).unwrap();
+    EXPECT_EQ(uploads.statistics().capacity_bytes, capacity);
+    EXPECT_EQ(uploads.statistics().live_bytes, 76u);
+    uploads.DiscardPendingUploads();
+    EXPECT_EQ(uploads.statistics().live_bytes, 0u);
+    uploads.destroy();
+    EXPECT_EQ(uploads.statistics().capacity_bytes, 0u);
     EXPECT_EQ(session.validation_errors(), 0u);
 }
 TEST(TextureVulkan, Resources) {
@@ -294,7 +474,9 @@ TEST(TextureVulkan, Resources) {
     upload.mip    = 1;
     upload.width = upload.height = 4;
     upload.row_pitch             = 20;
-    for (unsigned i = 0; i < 76; ++i) upload.bytes.push(u8(i));
+    Vec<u8> upload_bytes;
+    for (unsigned i = 0; i < 76; ++i) upload_bytes.push(u8(i));
+    upload.bytes = rstd::move(upload_bytes);
     work.commands()->Upload(rstd::move(upload)).unwrap();
     work.commands()->UseSampledView(mip, smooth, tex::Stages::Fragment).unwrap();
     auto submitted = queue->Submit(rstd::move(work)).unwrap();
@@ -371,24 +553,27 @@ TEST(TextureVulkan, Resources) {
     ReadbackDevice           readback_device { device };
     auto                     readback_factory = dyn<tex::TextureDevice>::from_ref(readback_device);
     tex::ImagePrepareContext atlas_context(readback_factory.as_mut_ref());
-    auto          atlas_preparer = dyn<tex::TextureContentPreparer>::from_ref(atlas_context);
-    vrento::Image atlas;
-    atlas.header.format = vrento::TextureFormat::R8;
-    rstd::uint8_t atlas_bytes[16] {};
+    auto atlas_preparer  = dyn<tex::TextureContentPreparer>::from_ref(atlas_context);
+    auto atlas           = rstd::sync::Arc<vrento::Image>::make();
+    atlas->header.format = vrento::TextureFormat::R8;
+    auto* atlas_bytes    = new rstd::uint8_t[16] {};
     for (unsigned i = 0; i < 16; ++i) atlas_bytes[i] = rstd::uint8_t(i);
     vrento::Image::Slot atlas_slot;
     atlas_slot.width = atlas_slot.height = 4;
-    atlas_slot.mipmaps.push(
-        vrento::ImageData { 4, 4, isize(16), vrento::ImageDataPtr(atlas_bytes, [](rstd::uint8_t*) {
-                            }) });
-    atlas.slots.push(rstd::move(atlas_slot));
-    auto prepared_atlas = atlas_preparer->PrepareImage(atlas).unwrap();
+    atlas_slot.mipmaps.push(vrento::ImageData {
+        4, 4, isize(16), vrento::ImageDataPtr(atlas_bytes, [](rstd::uint8_t* data) {
+            delete[] data;
+        }) });
+    atlas->slots.push(rstd::move(atlas_slot));
+    auto atlas_weak     = atlas.downgrade();
+    auto prepared_atlas = atlas_preparer->PrepareImage(rstd::move(atlas)).unwrap();
     rstd_assert(prepared_atlas.len() == usize(1));
     auto& atlas_image = prepared_atlas[usize()];
     rstd_assert(atlas_image.view.texture().description().format == vrento::TextureFormat::R8);
-    atlas_bytes[5] = 99;
-    work           = queue->Begin().unwrap();
+    EXPECT_FALSE(atlas_weak.expired());
+    work = queue->Begin().unwrap();
     for (auto& item : atlas_image.uploads) work.commands()->Upload(rstd::move(item)).unwrap();
+    EXPECT_TRUE(atlas_weak.expired());
     work.commands()
         ->UseSampledView(atlas_image.view, atlas_image.sampler, tex::Stages::Fragment)
         .unwrap();
@@ -400,8 +585,10 @@ TEST(TextureVulkan, Resources) {
     atlas_update.target = atlas_image.view;
     atlas_update.x = atlas_update.y = 1;
     atlas_update.width = atlas_update.height = 1;
-    atlas_update.bytes.push(u8(atlas_bytes[5]));
-    work = queue->Begin().unwrap();
+    Vec<u8> atlas_update_bytes;
+    atlas_update_bytes.push(u8(99));
+    atlas_update.bytes = rstd::move(atlas_update_bytes);
+    work               = queue->Begin().unwrap();
     work.commands()->Upload(rstd::move(atlas_update)).unwrap();
     work.commands()
         ->UseSampledView(atlas_image.view, atlas_image.sampler, tex::Stages::Fragment)

@@ -52,7 +52,10 @@ class ImagePrepareContext {
 
 public:
     explicit ImagePrepareContext(mut_ref<dyn<TextureDevice>> device): device_(device) {}
-    auto PrepareImage(const vrento::Image& image) -> Result<Vec<PreparedImage>, Error> {
+    auto PrepareImage(rstd::sync::Arc<vrento::Image> source_image)
+        -> Result<Vec<PreparedImage>, Error> {
+        if (! source_image) return Err(Error { ErrorKind::Invalid });
+        const auto& image = *source_image;
         if (image.header.kind != ImageKind::Pixels || image.slots.is_empty())
             return Err(Error { ErrorKind::Unsupported });
         auto descriptions = describe_image(image);
@@ -92,9 +95,9 @@ public:
                 upload.mip    = mip;
                 upload.width  = Count(source.width);
                 upload.height = Count(source.height);
-                upload.bytes  = Vec<u8>::from(
-                    slice<u8>::from_raw_parts(reinterpret_cast<const byte*>(source.data.get()),
-                                              usize(source.size.to_primitive())));
+                upload.bytes =
+                    TextureUploadPayload::FromImage(source_image.clone(), index, usize(mip))
+                        .unwrap();
                 prepared.uploads.push(rstd::move(upload));
             }
             result.push(rstd::move(prepared));
@@ -108,8 +111,9 @@ struct TextureContentPreparer {
     template<typename Self, typename = void>
     struct Api {
         using Trait = TextureContentPreparer;
-        auto PrepareImage(const vrento::Image& image) -> Result<Vec<PreparedImage>, Error> {
-            return rstd::trait_call<0>(this, image);
+        auto PrepareImage(rstd::sync::Arc<vrento::Image> image)
+            -> Result<Vec<PreparedImage>, Error> {
+            return rstd::trait_call<0>(this, rstd::move(image));
         }
     };
     template<typename T>
@@ -121,9 +125,9 @@ export namespace rstd
 template<>
 struct Impl<vrento::texture::TextureContentPreparer, vrento::texture::ImagePrepareContext>
     : ImplBase<vrento::texture::ImagePrepareContext> {
-    auto PrepareImage(const vrento::Image& image)
+    auto PrepareImage(sync::Arc<vrento::Image> image)
         -> Result<prelude::Vec<vrento::texture::PreparedImage>, vrento::texture::Error> {
-        return self().PrepareImage(image);
+        return self().PrepareImage(rstd::move(image));
     }
 };
 } // namespace rstd
