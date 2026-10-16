@@ -557,10 +557,12 @@ struct ImageSlotsRef {
 
 // ---------- Swapchain.hpp ----------
 
+enum class PresentationMode { Fifo, Immediate, Mailbox, FifoRelaxed };
 struct SwapchainOptions {
     bool              require_srgb { false };
     VkImageUsageFlags usage { VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT };
+    PresentationMode presentation { PresentationMode::Fifo };
 };
 
 class Swapchain {

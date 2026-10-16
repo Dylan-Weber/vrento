@@ -110,6 +110,8 @@ auto Swapchain::CreateResult(Device& device, VkSurfaceKHR surface, VkExtent2D ex
     SwapChainSupportDetails swap_details;
     auto support = querySwapChainSupport(device.gpu(), surface, swap_details);
     if (support != VK_SUCCESS) return support;
+    if (unsigned(options.presentation) > unsigned(PresentationMode::FifoRelaxed))
+        return VK_ERROR_INITIALIZATION_FAILED;
 
     auto format = chooseSwapSurfaceFormat(swap_details.formats.as_slice(), options.require_srgb);
     if (format.is_none()) return VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -125,6 +127,11 @@ auto Swapchain::CreateResult(Device& device, VkSurfaceKHR surface, VkExtent2D ex
         (surfaceCapabilities.supportedUsageFlags & options.usage) != options.usage) return VK_ERROR_INITIALIZATION_FAILED;
 
     swap.m_present_mode                          = VK_PRESENT_MODE_FIFO_KHR;
+    const VkPresentModeKHR modes[] { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR,
+                                     VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_RELAXED_KHR };
+    auto preferred = modes[unsigned(options.presentation)];
+    for (auto available : swap_details.presentModes)
+        if (available == preferred) swap.m_present_mode = preferred;
     VkSurfaceTransformFlagBitsKHR preTransform   = surfaceCapabilities.currentTransform;
     VkCompositeAlphaFlagBitsKHR compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     while (!(surfaceCapabilities.supportedCompositeAlpha & compositeAlpha)) {
