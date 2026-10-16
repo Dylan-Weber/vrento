@@ -17,38 +17,12 @@ namespace registry = vrento::resource_registry;
 
 namespace vrento_test::texture_registry
 {
-struct Playback {
-    struct State {
-        vrento::VideoPlaybackSnapshot snapshot;
-        f64                           current;
-        Option<f64>                   duration;
-    };
-    mutable rstd::sync::Mutex<State> state;
-    auto                             Snapshot() const -> vrento::VideoPlaybackSnapshot {
-        return state.lock().unwrap()->snapshot;
-    }
-    void PublishTime(f64 time, Option<f64> length) const {
-        auto locked      = state.lock().unwrap();
-        locked->current  = time;
-        locked->duration = length;
-    }
-};
 struct SemaphoreOwner {
     vk::DeviceSession session;
     vvk::Semaphore    semaphore;
     explicit SemaphoreOwner(vk::DeviceSession value): session(rstd::move(value)) {}
 };
 } // namespace vrento_test::texture_registry
-
-namespace rstd
-{
-template<>
-struct Impl<vrento::VideoPlayback, Arc<vrento_test::texture_registry::Playback>>
-    : ImplBase<Arc<vrento_test::texture_registry::Playback>> {
-    auto Snapshot() const -> vrento::VideoPlaybackSnapshot { return self()->Snapshot(); }
-    void PublishTime(f64 time, Option<f64> duration) const { self()->PublishTime(time, duration); }
-};
-} // namespace rstd
 
 namespace vrento_test::texture_registry
 {
@@ -474,110 +448,6 @@ TEST(RenderResourceSystem, LocalOutputExportsAndReusesSlots) {
     rstd_assert(session.validation_errors() == 0);
 }
 
-TEST(MediaRegistry, ContinuousPlaybackKeepsStableTexture) {
-    auto path = rstd::env::var("VR_TEST_VIDEO"_str);
-    if (path.is_err()) GTEST_SKIP();
-    auto                     width  = rstd::env::var("VR_TEST_VIDEO_WIDTH"_str).unwrap();
-    auto                     height = rstd::env::var("VR_TEST_VIDEO_HEIGHT"_str).unwrap();
-    auto                     hwdec  = rstd::env::var("VR_TEST_VIDEO_HWDEC"_str).unwrap();
-    array<vk::Extension, 13> extensions {
-        vk::Extension { true, "VK_KHR_external_memory_fd"_str },
-        vk::Extension { true, "VK_KHR_external_semaphore_fd"_str },
-        vk::Extension { false, "VK_KHR_synchronization2"_str },
-        vk::Extension { false, "VK_EXT_external_memory_dma_buf"_str },
-        vk::Extension { false, "VK_KHR_image_format_list"_str },
-        vk::Extension { false, "VK_EXT_image_drm_format_modifier"_str },
-        vk::Extension { false, "VK_EXT_queue_family_foreign"_str },
-        vk::Extension { false, "VK_KHR_video_queue"_str },
-        vk::Extension { false, "VK_KHR_video_decode_queue"_str },
-        vk::Extension { false, "VK_KHR_video_decode_h264"_str },
-        vk::Extension { false, "VK_KHR_video_decode_h265"_str },
-        vk::Extension { false, "VK_EXT_descriptor_buffer"_str },
-        vk::Extension { false, "VK_EXT_shader_object"_str },
-    };
-    auto session = vk::DeviceSession::create({ .device_extensions = extensions.as_slice(),
-                                               .api_version       = VK_API_VERSION_1_3,
-                                               .validation        = true })
-                       .unwrap();
-    auto context = vk::TextureContext::create(session).unwrap();
-    vk::MediaRegistry media(session, { hwdec.clone(), {} });
-    auto              physical_path = rstd::path::PathBuf::from(path->as_str());
-    auto              file          = rstd::fs::File::open(physical_path.as_path()).unwrap();
-    auto              size          = file.metadata().unwrap().len();
-    auto              source        = rstd::io::SharedReadAt::make(rstd::move(file));
-    vrento::Image     image;
-    image.header.kind = vrento::ImageKind::Video;
-    image.key         = "playback"_Str;
-    vrento::Image::Slot slot;
-    slot.width  = rstd::from_str<i32>(width.as_str()).unwrap().to_primitive();
-    slot.height = rstd::from_str<i32>(height.as_str()).unwrap().to_primitive();
-    vrento::ImageData data;
-    data.width        = slot.width;
-    data.height       = slot.height;
-    data.video_source = Some(rstd::io::ReadRange::make(rstd::move(source), u64(), size).unwrap());
-    slot.mipmaps.push(rstd::move(data));
-    image.slots.push(rstd::move(slot));
-    auto control     = Arc<Playback>::make();
-    auto playback    = Arc<dyn<vrento::VideoPlayback>>::make(control.clone());
-    auto preparation = media.Prepare(context, image, Some(playback.clone()));
-    if (preparation.is_err())
-        rstd::io::eprintln("media preparation failed: {}", preparation.as_ref().unwrap_err());
-    auto prepared = rstd::move(preparation).unwrap();
-    auto identity = prepared.view.texture().identity();
-    auto initial  = context.Begin().unwrap();
-    for (auto& upload : prepared.uploads) initial.commands()->Upload(rstd::move(upload)).unwrap();
-    initial.commands()
-        ->UseSampledView(prepared.view, prepared.sampler, tex::Stages::Fragment)
-        .unwrap();
-    context.wait(context.Submit(rstd::move(initial)).unwrap()).unwrap();
-    auto expected = hwdec.as_str() == "none"_str     ? vk::MediaSourceKind::Software
-                    : hwdec.as_str() == "vulkan"_str ? vk::MediaSourceKind::VulkanShared
-                                                     : vk::MediaSourceKind::VaapiDrm;
-    rstd_assert(prepared.producer->SourceKind() == expected);
-    auto tick = [&] {
-        prepared.producer->Pump(context, 1.0 / 30.0).unwrap();
-        vrento::vulkan::VulkanPassData data { .scope = 1 };
-        data.resources.push({ .id = { 1, 1 }, .imported = true });
-        data.passes.push(vrento_test::texture_sampled_pass({ 1 }, { 1, 1 }, 0));
-        vk::GraphBindings bindings(1);
-        bindings
-            .bind({ 1, 1 },
-                  Arc<dyn<vk::GraphBinding>>::make(vk::GraphTextureBinding(prepared.view)))
-            .unwrap();
-        vk::VulkanPassBackends backends;
-        vk::register_texture_passes(backends).unwrap();
-        auto graph =
-            vk::PreparedGraphProgram::prepare(
-                session, vrento_test::make_pass_set(rstd::move(data)).unwrap(), bindings, backends)
-                .unwrap();
-        auto sampled = context.Begin().unwrap();
-        graph.record(sampled).unwrap();
-        context.wait(context.Submit(rstd::move(sampled)).unwrap()).unwrap();
-        context.Poll().unwrap();
-        rstd_assert(prepared.view.texture().identity() == identity);
-    };
-    for (unsigned frame {}; frame < 12; ++frame) tick();
-    rstd_assert(prepared.producer->ContentRevision() != u64());
-    control->state.lock().unwrap()->snapshot.playing = false;
-    auto paused                                      = prepared.producer->ContentRevision();
-    for (unsigned frame {}; frame < 4; ++frame) tick();
-    rstd_assert(prepared.producer->ContentRevision() == paused);
-    {
-        auto state              = control->state.lock().unwrap();
-        state->snapshot.playing = true;
-        ++state->snapshot.seek_sequence;
-        state->snapshot.seek_seconds = *state->duration - f64(0.2);
-    }
-    bool looped {};
-    for (unsigned frame {}; frame < 30; ++frame) {
-        tick();
-        if (control->state.lock().unwrap()->current < f64(1.0)) looped = true;
-    }
-    rstd_assert(looped);
-    media.Drain(u64(5'000'000'000)).unwrap();
-    media.Clear();
-    rstd_assert(session.validation_errors() == 0);
-}
 } // namespace vrento_test::texture_registry
 
 namespace vrento_test::texture_registry
@@ -875,49 +745,6 @@ TEST(RenderResourceSystem, StableReferencesKeepStoragePolicyAndOldPreparedAlloca
 }
 } // namespace vrento_test::texture_registry
 
-TEST(MediaRegistry, OpenFailureOwnsDecoderDiagnostic) {
-    array<vk::Extension, 2> extensions { vk::Extension { true, "VK_KHR_external_memory_fd"_str },
-                                         vk::Extension { true,
-                                                         "VK_KHR_external_semaphore_fd"_str } };
-    auto session = vk::DeviceSession::create({ .device_extensions = extensions.as_slice(),
-                                               .api_version       = VK_API_VERSION_1_3,
-                                               .validation        = true })
-                       .unwrap();
-    auto context = vk::TextureContext::create(session).unwrap();
-    vk::MediaRegistry media(session, { "none"_Str, {} });
-    auto              dir = rstd::fs::TempDir::make("vrento-invalid-video"_str).unwrap();
-    auto              path =
-        rstd::path::PathBuf::from(dir.path().as_os_str().to_os_string()).join("invalid.bin"_str);
-    rstd::fs::write(path.as_path(), "not a video"_str.as_bytes()).unwrap();
-    auto          file = rstd::fs::File::open(path.as_path()).unwrap();
-    auto          size = file.metadata().unwrap().len();
-    vrento::Image input;
-    input.header.kind = vrento::ImageKind::Video;
-    input.key         = "invalid-video"_Str;
-    vrento::Image::Slot slot;
-    slot.width  = 16;
-    slot.height = 16;
-    vrento::ImageData data;
-    data.width  = 16;
-    data.height = 16;
-    data.video_source =
-        Some(rstd::io::ReadRange::make(rstd::io::SharedReadAt::make(rstd::move(file)), u64(), size)
-                 .unwrap());
-    slot.mipmaps.push(rstd::move(data));
-    input.slots.push(rstd::move(slot));
-    auto failed = media.Prepare(context, input);
-    ASSERT_TRUE(failed.is_err());
-    auto error = failed.unwrap_err();
-    EXPECT_EQ(error.operation, tex::MediaOperation::Open);
-    ASSERT_TRUE(error.cause.is_Decoder());
-    EXPECT_FALSE(error.cause.as_Decoder().message.is_empty());
-    auto snapshot = vrento::resource::ResourceErrorSnapshot(
-        vrento::resource::ResourceError::media(rstd::move(error)));
-    media.Clear();
-    EXPECT_FALSE(snapshot.error().source->as_Media().source.cause.as_Decoder().message.is_empty());
-    EXPECT_EQ(session.validation_errors(), 0u);
-}
-
 TEST(RenderResourceSystem, BufferRangeSnapshotSurvivesCancelCommitAndRestore) {
     auto              session = vk::DeviceSession::create({ .validation = true }).unwrap();
     vk::BufferManager buffers(session.device());
@@ -1024,3 +851,139 @@ TEST(RenderResourceSystem, BufferRangeQueryScale) {
         }
     }
 }
+
+namespace vrento_test::producers
+{
+struct Calls {
+    int  creates {}, pumps {}, clears {}, drains {}, released {};
+    bool fail_drain {};
+    u64  timeout;
+};
+struct Producer {
+    Arc<Calls> calls;
+    ~Producer() {
+        if (calls) ++calls->released;
+    }
+    explicit Producer(Arc<Calls> value): calls(rstd::move(value)) {}
+    Producer(Producer&&) = default;
+};
+struct Factory {
+    Arc<Calls> calls;
+};
+} // namespace vrento_test::producers
+namespace rstd
+{
+template<>
+struct Impl<registry::TextureProducer, vrento_test::producers::Producer>
+    : ImplBase<vrento_test::producers::Producer> {
+    auto Pump(vk::TextureContext&, double) -> Result<empty, vrento::resource::ResourceError> {
+        ++self().calls->pumps;
+        return Ok(empty {});
+    }
+};
+template<>
+struct Impl<registry::TextureProducerFactory, vrento_test::producers::Factory>
+    : ImplBase<vrento_test::producers::Factory> {
+    auto Create(vk::TextureContext& context, Arc<vrento::Image>,
+                Option<Arc<dyn<vrento::VideoPlayback>>>)
+        -> Result<registry::ProducedTexture, vrento::resource::ResourceError> {
+        ++self().calls->creates;
+        tex::TextureDesc desc;
+        desc.extent                       = { 2, 2 };
+        desc.usage                        = tex::Usage::Sampled;
+        auto                      texture = context.CreateTexture(desc).unwrap();
+        auto                      view    = context.CreateView(texture, {}).unwrap();
+        auto                      sampler = context.CreateSampler({}).unwrap();
+        registry::ProducedTexture result;
+        result.slots.push({ rstd::move(view), rstd::move(sampler) });
+        result.producer = Some(Arc<dyn<registry::TextureProducer>>::make(
+            vrento_test::producers::Producer(self().calls.clone())));
+        return Ok(rstd::move(result));
+    }
+    void Clear() { ++self().calls->clears; }
+    auto Drain(u64 timeout) -> Result<empty, vrento::resource::ResourceError> {
+        ++self().calls->drains;
+        self().calls->timeout = timeout;
+        if (self().calls->fail_drain)
+            return Err(vrento::resource::ResourceError::external(
+                rstd::format("producer drain"),
+                Arc<dyn<error::Error>>::make(tex::Error { tex::ErrorKind::Timeout })));
+        return Ok(empty {});
+    }
+};
+} // namespace rstd
+namespace vrento_test::producers
+{
+auto MakeFactory(const Arc<Calls>& calls) -> Arc<dyn<registry::TextureProducerFactory>> {
+    return Arc<dyn<registry::TextureProducerFactory>>::make(Factory { calls.clone() });
+}
+TEST(TextureProducerFactory, RegistrationFollowsResourceSession) {
+    auto session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto calls   = Arc<Calls>::make();
+    registry::RenderResourceSystem resources;
+    auto                           closed = resources.SetTextureProducerFactory(MakeFactory(calls));
+    ASSERT_TRUE(closed.is_err());
+    EXPECT_EQ(closed.unwrap_err().kind, vrento::resource::ResourceErrorKind::Closed);
+    resources.TryInitialize(session).unwrap();
+    resources.SetTextureProducerFactory(MakeFactory(calls)).unwrap();
+    auto duplicate = resources.SetTextureProducerFactory(MakeFactory(calls));
+    ASSERT_TRUE(duplicate.is_err());
+    EXPECT_EQ(duplicate.unwrap_err().kind, vrento::resource::ResourceErrorKind::Busy);
+    resources.ClearTextures();
+    EXPECT_EQ(calls->clears, 1);
+    resources.Reset();
+    EXPECT_EQ(calls->clears, 2);
+    EXPECT_EQ(calls->drains, 1);
+    resources.TryInitialize(session).unwrap();
+    resources.SetTextureProducerFactory(MakeFactory(calls)).unwrap();
+    resources.Reset();
+    EXPECT_EQ(calls->drains, 2);
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
+TEST(TextureProducerFactory, AllocationRetainsProducerAcrossClearAndReset) {
+    auto session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto calls   = Arc<Calls>::make();
+    registry::ResourceRegistries registries;
+    registries.TryInitialize(session).unwrap();
+    auto& textures     = registries.Textures();
+    auto  image        = Arc<vrento::Image>::make();
+    image->header.kind = vrento::ImageKind::Video;
+    auto missing       = textures.CreateImportedTexture(image.clone(), None());
+    ASSERT_TRUE(missing.is_err());
+    EXPECT_EQ(missing.unwrap_err().kind, vrento::resource::ResourceErrorKind::Unsupported);
+    textures.SetProducerFactory(MakeFactory(calls)).unwrap();
+    auto prepared = textures.CreateImportedTexture(image.clone(), None()).unwrap();
+    EXPECT_EQ(calls->creates, 1);
+    textures.ClearProducers();
+    EXPECT_EQ(calls->clears, 1);
+    EXPECT_EQ(calls->released, 0);
+    prepared.allocation->Pump(textures.Context(), 0.1).unwrap();
+    EXPECT_EQ(calls->pumps, 1);
+    textures.DrainProducers(u64(123)).unwrap();
+    EXPECT_EQ(calls->timeout, u64(123));
+    registries.Reset();
+    EXPECT_EQ(calls->drains, 2);
+    EXPECT_EQ(calls->released, 0);
+    prepared.allocation.reset();
+    EXPECT_EQ(calls->released, 1);
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
+TEST(TextureProducerFactory, DrainPreservesOwnedDiagnostic) {
+    auto                             session = vk::DeviceSession::create().unwrap();
+    auto                             calls   = Arc<Calls>::make();
+    registry::RegistryTextureContext textures(vk::TextureContext::create(session).unwrap());
+    textures.SetProducerFactory(MakeFactory(calls)).unwrap();
+    calls->fail_drain = true;
+    auto failed       = textures.DrainProducers(u64());
+    ASSERT_TRUE(failed.is_err());
+    auto saved = failed.unwrap_err().clone();
+    textures.ClearProducers();
+    auto cause    = as<rstd::error::Error>(saved).source().unwrap()->source().unwrap();
+    auto concrete = rstd::error::downcast_ref<tex::Error>(cause);
+    ASSERT_TRUE(concrete.is_some());
+    EXPECT_EQ((*concrete)->kind, tex::ErrorKind::Timeout);
+    EXPECT_FALSE(rstd::format("{}", *saved.source).is_empty());
+    calls->fail_drain = false;
+    textures.DrainProducers(u64()).unwrap();
+}
+} // namespace vrento_test::producers

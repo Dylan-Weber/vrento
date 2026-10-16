@@ -3,7 +3,6 @@ export import :texture.prepare;
 import :texture.video_playback;
 import :resource;
 import :vulkan.texture;
-import :vulkan.media;
 import rstd;
 
 using namespace rstd::prelude;
@@ -239,13 +238,19 @@ struct TextureProducerFactory {
     template<typename Self, typename = void>
     struct Api {
         using Trait = TextureProducerFactory;
-        auto Create(Arc<Image> image, Option<Arc<dyn<VideoPlayback>>> playback)
+        auto Create(vulkan::TextureContext& context, Arc<Image> image,
+                    Option<Arc<dyn<VideoPlayback>>> playback)
             -> Result<ProducedTexture, resource::ResourceError> {
-            return rstd::trait_call<0>(this, rstd::move(image), rstd::move(playback));
+            return rstd::trait_call<0>(this, context, rstd::move(image), rstd::move(playback));
+        }
+        // Clear preserves producers retained by allocations and in-flight submissions.
+        void Clear() { rstd::trait_call<1>(this); }
+        auto Drain(u64 timeout_ns) -> Result<empty, resource::ResourceError> {
+            return rstd::trait_call<2>(this, timeout_ns);
         }
     };
     template<typename T>
-    using Funcs = TraitFuncs<&T::Create>;
+    using Funcs = TraitFuncs<&T::Create, &T::Clear, &T::Drain>;
 };
 
 struct TexturePrepareBackend {
@@ -285,22 +290,6 @@ struct TextureUploadPublisher {
 
 } // namespace vrento::resource_registry
 
-export namespace rstd
-{
-template<>
-struct Impl<vrento::resource_registry::TextureProducer,
-            sync::Arc<dyn<vrento::vulkan::MediaTextureProducer>>>
-    : ImplBase<sync::Arc<dyn<vrento::vulkan::MediaTextureProducer>>> {
-    auto Pump(vrento::vulkan::TextureContext& context, double seconds)
-        -> Result<empty, vrento::resource::ResourceError> {
-        auto result = self()->Pump(context, seconds);
-        if (result.is_err())
-            return Err(vrento::resource::ResourceError::media(result.unwrap_err()));
-        return Ok(empty {});
-    }
-};
-} // namespace rstd
-
 export namespace vrento::resource_registry
 {
 
@@ -315,48 +304,49 @@ public:
     static constexpr usize MaxPendingContents { 4 };
     static constexpr usize MaxUploadBatches { 3 };
     explicit RegistryTextureContext(vulkan::TextureContext context)
-        : m_context(rstd::move(context)), m_media(m_context.session()) {}
+        : m_context(rstd::move(context)) {}
 
     auto Context() -> vulkan::TextureContext& { return m_context; }
     auto Context() const -> const vulkan::TextureContext& { return m_context; }
-    void SetProducerFactory(Arc<dyn<TextureProducerFactory>> factory) {
+    auto SetProducerFactory(Arc<dyn<TextureProducerFactory>> factory)
+        -> Result<empty, resource::ResourceError> {
+        if (m_producers)
+            return Err(resource::ResourceError {
+                resource::ResourceErrorKind::Busy,
+                rstd::format("texture producer factory already registered") });
         m_producers = Some(rstd::move(factory));
+        return Ok(empty {});
     }
     void SetUploadPublisher(mut_ref<dyn<TextureUploadPublisher>> publisher) {
         m_publisher = Some(publisher);
     }
-    void SetVideoDecodeOptions(vulkan::MediaDecodeOptions options) {
-        m_media.SetOptions(rstd::move(options));
+    void ClearProducers() {
+        if (m_producers) (*m_producers)->Clear();
     }
-    void ClearProducers() { m_media.Clear(); }
-    auto DrainProducers(u64 timeout) -> Result<empty, texture::MediaError> {
-        return m_media.Drain(timeout);
+    auto DrainProducers(u64 timeout) -> Result<empty, resource::ResourceError> {
+        if (m_producers) return (*m_producers)->Drain(timeout);
+        return Ok(empty {});
     }
 
     // Pixel contents are immutable; publish a new Image for a new revision.
     auto CreateImportedTexture(Arc<Image> image, Option<Arc<dyn<VideoPlayback>>> playback)
         -> Result<PreparedImageAllocation, resource::ResourceError> {
         if (image->header.kind == ImageKind::Video) {
+            if (! m_producers)
+                return Err(resource::ResourceError {
+                    resource::ResourceErrorKind::Unsupported,
+                    rstd::format("video texture requires a texture producer factory") });
             auto window = MakeRoom();
             if (window.is_err())
                 return Failure("texture upload window failed", Some(window.unwrap_err()));
-            if (m_producers.is_some()) {
-                auto result = (*m_producers)->Create(rstd::move(image), rstd::move(playback));
-                if (result.is_err()) return Err(rstd::move(result).unwrap_err_unchecked());
-                auto prepared = rstd::move(result).unwrap_unchecked();
-                return Queue(rstd::move(prepared.slots),
-                             rstd::move(prepared.uploads),
-                             false,
-                             rstd::move(prepared.producer));
-            }
-            auto result = m_media.Prepare(m_context, *image, rstd::move(playback));
-            if (result.is_err()) return Err(resource::ResourceError::media(result.unwrap_err()));
-            auto             media = rstd::move(result).unwrap_unchecked();
-            Vec<TextureSlot> slots;
-            slots.push({ rstd::move(media.view), rstd::move(media.sampler) });
-            auto producer = Arc<dyn<TextureProducer>>::make(rstd::move(media.producer));
-            return Queue(
-                rstd::move(slots), rstd::move(media.uploads), false, Some(rstd::move(producer)));
+            auto result =
+                (*m_producers)->Create(m_context, rstd::move(image), rstd::move(playback));
+            if (result.is_err()) return Err(rstd::move(result).unwrap_err_unchecked());
+            auto prepared = rstd::move(result).unwrap_unchecked();
+            return Queue(rstd::move(prepared.slots),
+                         rstd::move(prepared.uploads),
+                         false,
+                         rstd::move(prepared.producer));
         }
         m_images.retain([](const CachedImage& cached) {
             return cached.source.strong_count() != usize();
@@ -681,7 +671,6 @@ private:
     }
 
     vulkan::TextureContext                       m_context;
-    vulkan::MediaRegistry                        m_media;
     Option<Arc<dyn<TextureProducerFactory>>>     m_producers;
     Option<mut_ref<dyn<TextureUploadPublisher>>> m_publisher;
     Vec<Pending>                                 m_pending;

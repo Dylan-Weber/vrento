@@ -261,8 +261,6 @@ public:
     auto TryInitialize(vulkan::DeviceSession session) -> Result<empty, resource::ResourceError> {
         auto initialized = m_registries.TryInitialize(rstd::move(session));
         if (initialized.is_err()) return initialized;
-        auto options = m_video_options.take();
-        if (options.is_some()) m_registries.Textures().SetVideoDecodeOptions(rstd::move(*options));
         return Ok(empty {});
     }
 
@@ -319,8 +317,13 @@ public:
     bool AttachFence(texture::Submission& work, vulkan::NativeFence fence) {
         return Native()->AttachFence(work, rstd::move(fence)).is_ok();
     }
-    void SetTextureProducerFactory(rstd::sync::Arc<dyn<TextureProducerFactory>> factory) {
-        m_registries.Textures().SetProducerFactory(rstd::move(factory));
+    auto SetTextureProducerFactory(rstd::sync::Arc<dyn<TextureProducerFactory>> factory)
+        -> Result<empty, resource::ResourceError> {
+        if (! Ready())
+            return Err(
+                resource::ResourceError { resource::ResourceErrorKind::Closed,
+                                          rstd::format("resource system is not initialized") });
+        return m_registries.Textures().SetProducerFactory(rstd::move(factory));
     }
 
     void Reset() {
@@ -951,16 +954,10 @@ public:
         (void)m_registries.Textures().Poll();
     }
 
-    auto TryPumpVideoTextures(double seconds) -> Result<empty, resource::ResourceError> {
+    auto TryPumpTextureProducers(double seconds) -> Result<empty, resource::ResourceError> {
         return m_registries.TextureEntries().Pump(TextureContext(), seconds);
     }
-    bool PumpVideoTextures(double seconds) { return TryPumpVideoTextures(seconds).is_ok(); }
-    void SetVideoDecodeOptions(vulkan::MediaDecodeOptions options) {
-        if (Ready())
-            m_registries.Textures().SetVideoDecodeOptions(rstd::move(options));
-        else
-            m_video_options = Some(rstd::move(options));
-    }
+    bool PumpTextureProducers(double seconds) { return TryPumpTextureProducers(seconds).is_ok(); }
     auto PrepareRegion(ref<str> key, texture::TextureUpload upload, usize slot = usize())
         -> Result<Option<PreparedTextureUpdate>, resource::ResourceError> {
         return PrepareRegion(
@@ -1112,7 +1109,6 @@ private:
     PreparedResourceTable                         m_prepared;
     Option<PrepareRollback>                       m_prepare_rollback;
     Option<rstd::sync::Arc<FrameSubmissionLease>> m_frame;
-    Option<vulkan::MediaDecodeOptions>            m_video_options;
 };
 
 } // namespace vrento::resource_registry

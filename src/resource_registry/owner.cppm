@@ -59,6 +59,7 @@ public:
 
     void Reset() {
         if (m_textures.is_some()) {
+            Textures().ClearProducers();
             (void)Textures().DrainProducers(u64(5'000'000'000));
             (void)Textures().Context().session().wait_idle();
             (void)Textures().Poll();

@@ -7,7 +7,6 @@ export import :preparation;
 import :texture.core;
 import :resource.handle;
 import :vulkan.error;
-export import :texture.media_error;
 
 using namespace rstd::prelude;
 
@@ -37,7 +36,8 @@ enum class ResourceErrorKind
 class ResourceErrorSource {
     RSTD_ENUM(ResourceErrorSource, (Texture, (texture::Error source;)),
               (Native, (rstd::int32_t code;)), (Backend, (vulkan::BackendError source;)),
-              (Media, (texture::MediaError source;)), (Io, (rstd::io::error::Error source;)))
+              (External, (rstd::sync::Arc<dyn<rstd::error::Error>> source;)),
+              (Io, (rstd::io::error::Error source;)))
 };
 
 struct TextureErrorContext {
@@ -78,9 +78,10 @@ struct ResourceError {
     Option<ResourceErrorSource> source;
     Vec<TextureErrorContext>    textures;
     Vec<ResourceErrorContext>   contexts;
-    static auto                 media(texture::MediaError error) -> ResourceError {
-        return { .message = rstd::format("media operation={}", int(error.operation)),
-                 .source  = Some(ResourceErrorSource::Media(rstd::move(error))) };
+    static auto external(String operation, rstd::sync::Arc<dyn<rstd::error::Error>> error)
+        -> ResourceError {
+        return { .message = rstd::move(operation),
+                 .source  = Some(ResourceErrorSource::External(rstd::move(error))) };
     }
     static auto backend(vulkan::BackendError error) -> ResourceError {
         return { .message = error.operation.clone(),
@@ -97,8 +98,8 @@ struct ResourceError {
                 copied = Some(ResourceErrorSource::Texture(source->as_Texture().source));
             else if (source->is_Native())
                 copied = Some(ResourceErrorSource::Native(source->as_Native().code));
-            else if (source->is_Media())
-                copied = Some(ResourceErrorSource::Media(source->as_Media().source.clone()));
+            else if (source->is_External())
+                copied = Some(ResourceErrorSource::External(source->as_External().source.clone()));
             else if (source->is_Backend())
                 copied = Some(ResourceErrorSource::Backend(source->as_Backend().source.clone()));
             else
@@ -144,7 +145,9 @@ struct Impl<fmt::Display, vrento::resource::ResourceErrorSource>
         const auto& value = this->self();
         if (value.is_Texture()) return as<fmt::Display>(value.as_Texture().source).fmt(formatter);
         if (value.is_Io()) return as<fmt::Display>(value.as_Io().source).fmt(formatter);
-        if (value.is_Media()) return as<fmt::Display>(value.as_Media().source).fmt(formatter);
+        if (value.is_External())
+            return formatter.write_fmt(
+                fmt::Arguments::make("{}", value.as_External().source.deref()));
         if (value.is_Backend()) return as<fmt::Display>(value.as_Backend().source).fmt(formatter);
         return formatter.write_str(
             rstd::format("backend error code={}", value.as_Native().code).as_str());
@@ -164,7 +167,7 @@ struct Impl<error::Error, vrento::resource::ResourceErrorSource>
         const auto& e = this->self();
         if (e.is_Texture()) return Some(dyn<error::Error>::from_ref(e.as_Texture().source));
         if (e.is_Io()) return Some(dyn<error::Error>::from_ref(e.as_Io().source));
-        if (e.is_Media()) return Some(dyn<error::Error>::from_ref(e.as_Media().source));
+        if (e.is_External()) return Some(e.as_External().source.deref());
         if (e.is_Backend()) return Some(dyn<error::Error>::from_ref(e.as_Backend().source));
         return None();
     }

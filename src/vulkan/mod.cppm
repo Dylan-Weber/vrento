@@ -16,7 +16,6 @@ export import :vulkan.graphics_scope;
 export import :vulkan.graph_surface;
 export import :vulkan.pipeline_prepare;
 export import :vulkan.passes.texture_transfer;
-export import :vulkan.media;
 export import :vulkan.pipeline_layout;
 
 export import :vulkan.passes.surface;
