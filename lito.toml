@@ -34,13 +34,6 @@ sources = [
   "tests/scene_identity.cpp",
 ]
 
-[usage]
-options = [
-  "-Wextra",
-  "-Wno-missing-field-initializers",
-  "-Wno-gnu-zero-variadic-macro-arguments",
-]
-
 [dependencies]
 rstd-std = { version = "0.1.0", pub = true }
 rstd-cppstd = { version = "0.1.0", pub = true }
