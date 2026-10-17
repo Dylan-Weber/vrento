@@ -1,6 +1,5 @@
 #include <rstd/macro.hpp>
 #include <rstd/test/gtest.hpp>
-#include <cstdio>
 import rstd;
 import rstd.test;
 import vrento;
@@ -358,12 +357,11 @@ void queue_output(vk::DeviceSession session, vk::QueueParameters transfer, bool 
     auto submitted = program.execute();
     if (submitted.error() && ! fail && ! uncertain) {
         const auto& error = *submitted.error();
-        fprintf(stderr,
-                "queue graph stage=%u resource=%llu native=%d\n",
-                unsigned(error.stage),
-                static_cast<unsigned long long>(error.resource.value),
-                error.texture_error() ? int(error.texture_error()->kind)
-                                      : int(error.native_result()));
+        rstd::io::eprintln("queue graph stage={} resource={} native={}",
+                           unsigned(error.stage),
+                           error.resource.value,
+                           error.texture_error() ? int(error.texture_error()->kind)
+                                                 : int(error.native_result()));
     }
     if (uncertain) {
         rstd_assert(submitted.status() == vk::GraphSubmissionStatus::Uncertain);
@@ -505,12 +503,11 @@ TEST(GraphQueue, CrossFamily) {
         if (queue.family_index != session.device().graphics_queue().family_index &&
             (queue.flags &
              (VK_QUEUE_TRANSFER_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT))) {
-            fprintf(stderr,
-                    "graphics family=%u transfer family=%u index=%u flags=%u\n",
-                    session.device().graphics_queue().family_index,
-                    queue.family_index,
-                    queue.queue_index,
-                    queue.flags);
+            rstd::io::eprintln("graphics family={} transfer family={} index={} flags={}",
+                               session.device().graphics_queue().family_index,
+                               queue.family_index,
+                               queue.queue_index,
+                               queue.flags);
             queue_output(session, queue);
             queue_output(session, queue, true);
             return;
@@ -618,11 +615,10 @@ TEST(GraphVulkan, BindPrepareRecordAndRetire) {
         auto prepared = vk::PreparedGraphProgram::prepare(session, description, bindings, backends);
         if (prepared.is_err()) {
             auto error = prepared.unwrap_err();
-            fprintf(stderr,
-                    "graph prepare stage=%u pass=%llu resource=%llu\n",
-                    unsigned(error.stage),
-                    static_cast<unsigned long long>(error.pass.value),
-                    static_cast<unsigned long long>(error.resource.value));
+            rstd::io::eprintln("graph prepare stage={} pass={} resource={}",
+                               unsigned(error.stage),
+                               error.pass.value,
+                               error.resource.value);
         }
         auto program = Some(rstd::move(prepared).unwrap());
         if (! frame) {
@@ -1292,12 +1288,11 @@ TEST(GraphVulkan, AttachmentVariantsAndRetention) {
         auto described = vrento_test::make_pass_set(rstd::move(data));
         if (described.is_err()) {
             auto error = described.unwrap_err();
-            std::fprintf(stderr,
-                         "variant=%u graph error=%u pass=%llu resource=%llu\n",
-                         index,
-                         unsigned(error.kind),
-                         static_cast<unsigned long long>(error.pass.value),
-                         static_cast<unsigned long long>(error.resource.value));
+            rstd::io::eprintln("variant={} graph error={} pass={} resource={}",
+                               index,
+                               unsigned(error.kind),
+                               error.pass.value,
+                               error.resource.value);
         }
         auto description = rstd::move(described).unwrap();
         auto program     = Some(
@@ -1551,7 +1546,15 @@ TEST(GraphBindings, SparseVersionsGenerationCloneAndMove) {
     EXPECT_EQ((*moved.resolve({ 9001, 4 }, 1))->Info().identity.resource, 2u);
 }
 TEST(GraphBindings, PreparationScale) {
-    auto session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto created = vk::DeviceSession::create({ .validation = true });
+    if (created.is_err()) {
+        const auto& error = created.as_ref().unwrap_err();
+        rstd::io::eprintln(
+            "device session stage={} result={}", unsigned(error.stage), int(error.result));
+        if (error.cause)
+            rstd::io::eprintln("{}: {}", error.cause.error(), error.cause.error().cause);
+    }
+    auto session = created.unwrap();
     for (unsigned count : array<unsigned, 4> { 16u, 128u, 512u, 1024u }) {
         vrento::fg::FrameGraphBuilder builder(700);
         auto                          id = builder.add_pass({ 1 }).unwrap();
@@ -1588,11 +1591,11 @@ TEST(GraphBindings, PreparationScale) {
             EXPECT_EQ(counts->info, count);
             EXPECT_EQ(counts->frozen, count);
             EXPECT_EQ(counts->read_only, count);
-            std::printf("binding preparation B=U=%u trial=%u ns=%llu info=%u\n",
-                        count,
-                        trial,
-                        static_cast<unsigned long long>(elapsed.to_primitive()),
-                        counts->info);
+            rstd::io::println("binding preparation B=U={} trial={} ns={} info={}",
+                              count,
+                              trial,
+                              elapsed,
+                              counts->info);
         }
     }
 }

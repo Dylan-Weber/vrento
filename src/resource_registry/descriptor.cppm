@@ -1,7 +1,3 @@
-module;
-
-#include <algorithm>
-
 export module vrento:resource_registry.descriptor;
 import rstd;
 import :resource;

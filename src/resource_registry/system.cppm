@@ -1,7 +1,3 @@
-module;
-
-#include <span>
-
 export module vrento:resource_registry.system;
 import rstd;
 import :resource;

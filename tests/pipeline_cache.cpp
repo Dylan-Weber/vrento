@@ -1,6 +1,5 @@
 #include <rstd/macro.hpp>
 #include <rstd/test/gtest.hpp>
-#include <cstdio>
 import rstd;
 import rstd.test;
 import vrento;
@@ -335,13 +334,14 @@ TEST(PipelineCache, CreationTimings) {
         object_ms += started.elapsed().as_secs_f64() * 1000;
         rstd_assert(graphics.pipelines.stats().creations == created);
     }
-    std::printf("pipeline: %u samples; cold driver %.3f ms; loaded driver %.3f ms; %u object hits "
-                "%.3f ms; hot creations 0\n",
-                samples,
-                cold_ms / samples,
-                warm_ms / samples,
-                hits,
-                object_ms / samples);
+    rstd::io::println(
+        "pipeline: {} samples; cold driver {:.3} ms; loaded driver {:.3} ms; {} object hits "
+        "{:.3} ms; hot creations 0",
+        samples,
+        cold_ms / samples,
+        warm_ms / samples,
+        hits,
+        object_ms / samples);
     rstd_assert(session.validation_errors() == 0);
 }
 } // namespace vrento_test::pipeline_cache

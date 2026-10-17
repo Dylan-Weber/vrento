@@ -1,7 +1,3 @@
-module;
-
-#include <cstdint>
-
 export module vrento:resource_registry.buffer_registry;
 import rstd;
 import :resource;

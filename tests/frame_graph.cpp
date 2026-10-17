@@ -1,7 +1,6 @@
 module;
 #include <rstd/macro.hpp>
 #include <rstd/test/gtest.hpp>
-#include <cstdio>
 module vrento;
 import :frame_graph;
 import :pass.resources;
@@ -236,10 +235,10 @@ TEST(FrameGraph, CachedScheduleAndDiagnostics) {
                         dot->contains("first="_str));
         }
     }
-    std::printf("frame graph: %u samples, %u passes, build + two cached schedules: %.3f ms\n",
-                samples,
-                nodes,
-                started.elapsed().as_secs_f64() * 1000);
+    rstd::io::println("frame graph: {} samples, {} passes, build + two cached schedules: {:.3} ms",
+                      samples,
+                      nodes,
+                      started.elapsed().as_secs_f64() * 1000);
 }
 TEST(FrameGraph, UnicodeDiagnostics) {
     FrameGraphBuilder graph(1);

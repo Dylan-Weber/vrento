@@ -2,7 +2,6 @@
 #include <rstd/test/gtest.hpp>
 import rstd;
 import rstd.test;
-import rstd.cppstd;
 import vrento;
 
 using namespace rstd::prelude;

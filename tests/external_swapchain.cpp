@@ -9,14 +9,17 @@ import vrento;
 
 using namespace rstd::prelude;
 using namespace vrento;
+using namespace rstd::literals;
+using rstd::sync::Arc;
 using rstd::sync::atomic::Atomic;
 
 namespace vrento_test::external_swapchain
 {
 struct Counts {
-    int destroyed {};
-    int submitted {};
-    int aborted {};
+    int  destroyed {};
+    int  submitted {};
+    int  aborted {};
+    bool fail {};
 };
 
 class TestSwapchain final : public ExSwapchain {
@@ -37,10 +40,20 @@ private:
     FrameSurfaceCompletionResult CompleteRendered(FrameSurfaceIdentity identity, int fd) override {
         if (fd >= 0) ::close(fd);
         ++counts_.submitted;
+        if (counts_.fail)
+            return { .status   = FrameSurfaceCompletionStatus::SessionLost,
+                     .identity = identity,
+                     .error    = Some(FrameSurfaceError {
+                         FrameSurfaceErrorKind::SessionLost,
+                         Some(Arc<dyn<rstd::error::Error>>::make(vulkan::BackendError {
+                             "submit surface"_Str,
+                             vulkan::BackendCause::Native(VK_ERROR_DEVICE_LOST) })) }) };
         return { .status = FrameSurfaceCompletionStatus::Submitted, .identity = identity };
     }
     FrameSurfaceCompletionResult AbortRenderTarget(FrameSurfaceIdentity identity) override {
         ++counts_.aborted;
+        if (counts_.fail)
+            return { .status = FrameSurfaceCompletionStatus::StaleIdentity, .identity = identity };
         return { .status = FrameSurfaceCompletionStatus::Aborted, .identity = identity };
     }
     Counts&        counts_;
@@ -104,5 +117,48 @@ TEST(ExternalSwapchain, Lifetime) {
     rstd_assert(triple.getInprogress() == slots[usize(1)]);
     rstd_assert(triple.eatFrame() == slots[usize(2)]);
     rstd_assert(triple.eatFrame() == nullptr);
+}
+TEST(ExternalSwapchain, SurfaceErrors) {
+    FrameSurfaceAcquireResult waiting;
+    rstd_assert(! waiting.acquired() && ! waiting.error);
+    FrameSurfaceAcquireResult busy { .status = FrameSurfaceAcquireStatus::Busy };
+    rstd_assert(! busy.acquired() && ! busy.error);
+    FrameSurfaceAcquireResult lost { .status = FrameSurfaceAcquireStatus::SessionLost };
+    rstd_assert(! lost.acquired() && lost.error->kind == FrameSurfaceErrorKind::SessionLost);
+    FrameSurfaceAcquireResult protocol { .status = FrameSurfaceAcquireStatus::ProtocolError };
+    rstd_assert(! protocol.acquired() &&
+                protocol.error->kind == FrameSurfaceErrorKind::ProtocolFailure);
+    auto local = ExSwapchain::Make<vulkan::LocalExSwapchain>(
+        rstd::array<vulkan::LocalExHandle, 3> {}, VkExtent2D { 1, 1 }, 0u);
+    auto invalid = local->AsSwapchain().acquireRenderTarget();
+    rstd_assert(! invalid.acquired() && ! invalid.completion.valid());
+    rstd_assert(invalid.error && invalid.error->kind == FrameSurfaceErrorKind::InvalidLease);
+    rstd_assert(rstd::as<rstd::error::Error>(*invalid.error).source().is_none());
+
+    FrameSurfaceCompletionCapability empty;
+    auto                             absent = empty.Abort();
+    rstd_assert(! absent.completed() && absent.error->kind == FrameSurfaceErrorKind::NotPending);
+    FrameSurfaceCompletionResult success { .status = FrameSurfaceCompletionStatus::Submitted };
+    rstd_assert(success.completed() && ! success.error);
+
+    Counts counts { .fail = true };
+    auto   owner   = ExSwapchain::Make<TestSwapchain>(counts);
+    auto   frame   = owner->AsSwapchain().acquireRenderTarget();
+    auto   aborted = frame.completion.Abort();
+    rstd_assert(aborted.error->kind == FrameSurfaceErrorKind::StaleIdentity);
+    frame = owner->AsSwapchain().acquireRenderTarget();
+    owner.reset();
+    int fd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    rstd_assert(fd >= 0);
+    auto failed = frame.completion.Submit(fd);
+    rstd_assert(::fcntl(fd, F_GETFD) == -1);
+    rstd_assert(! frame.completion.valid() && counts.destroyed == 1);
+    rstd_assert(! failed.completed() && failed.error->kind == FrameSurfaceErrorKind::SessionLost);
+    auto saved   = failed.error->clone();
+    failed.error = None();
+    auto cause   = rstd::as<rstd::error::Error>(saved).source();
+    rstd_assert(cause.is_some());
+    rstd_assert(rstd::format("{}", saved).as_str().contains("submit surface"_str));
+    rstd_assert(rstd::format("{}", *cause).as_str().contains("submit surface"_str));
 }
 } // namespace vrento_test::external_swapchain

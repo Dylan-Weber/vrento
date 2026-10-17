@@ -3,7 +3,6 @@
 
 import rstd;
 import rstd.test;
-import rstd.cppstd;
 import vrento;
 
 using namespace rstd::prelude;
@@ -137,7 +136,7 @@ struct FakeShaderBackend {
     explicit FakeShaderBackend(Counts& value): counts(&value) {}
     FakeShaderBackend(const FakeShaderBackend&) = delete;
     FakeShaderBackend(FakeShaderBackend&& other) noexcept
-        : counts(std::exchange(other.counts, nullptr)) {}
+        : counts(rstd::exchange(other.counts, nullptr)) {}
     ~FakeShaderBackend() {
         if (counts != nullptr) ++counts->destroyed;
     }

@@ -1,7 +1,6 @@
 module;
 
 #include <unistd.h>
-#include <cerrno>
 
 // Macros only — VVK_CHECK family.
 #include "vvk/macros.hpp"
@@ -17,6 +16,7 @@ import :texture.video_playback;
 // Export Vulkan FFI symbols for backend consumers.
 export import vvk;
 export import :vulkan.error;
+export import :vulkan.surface_error;
 
 export import :vulkan.shader_compile;
 
@@ -162,11 +162,27 @@ enum class FrameSurfaceCompletionStatus
 struct FrameSurfaceCompletionResult {
     FrameSurfaceCompletionStatus status { FrameSurfaceCompletionStatus::NotPending };
     FrameSurfaceIdentity         identity;
-    i32                          error_code { 0 };
+    Option<FrameSurfaceError>    error { DefaultError(status) };
+
+    static auto DefaultError(FrameSurfaceCompletionStatus status) -> Option<FrameSurfaceError> {
+        switch (status) {
+        case FrameSurfaceCompletionStatus::Submitted:
+        case FrameSurfaceCompletionStatus::Aborted: return None();
+        case FrameSurfaceCompletionStatus::NotPending:
+            return Some(FrameSurfaceError { FrameSurfaceErrorKind::NotPending });
+        case FrameSurfaceCompletionStatus::StaleIdentity:
+            return Some(FrameSurfaceError { FrameSurfaceErrorKind::StaleIdentity });
+        case FrameSurfaceCompletionStatus::SessionLost:
+            return Some(FrameSurfaceError { FrameSurfaceErrorKind::SessionLost });
+        case FrameSurfaceCompletionStatus::ProtocolError:
+            return Some(FrameSurfaceError { FrameSurfaceErrorKind::ProtocolFailure });
+        }
+        return Some(FrameSurfaceError { FrameSurfaceErrorKind::ProtocolFailure });
+    }
 
     bool completed() const noexcept {
-        return status == FrameSurfaceCompletionStatus::Submitted ||
-               status == FrameSurfaceCompletionStatus::Aborted;
+        return ! error && (status == FrameSurfaceCompletionStatus::Submitted ||
+                           status == FrameSurfaceCompletionStatus::Aborted);
     }
 };
 
@@ -225,12 +241,20 @@ struct FrameSurfaceAcquireResult {
     FrameSurfaceAcquireStatus        status { FrameSurfaceAcquireStatus::NotReady };
     FrameSurfaceLease                lease;
     FrameSurfaceCompletionCapability completion;
-    i32                              error_code { 0 };
+    Option<FrameSurfaceError>        error { DefaultError(status) };
+
+    static auto DefaultError(FrameSurfaceAcquireStatus status) -> Option<FrameSurfaceError> {
+        if (status == FrameSurfaceAcquireStatus::SessionLost)
+            return Some(FrameSurfaceError { FrameSurfaceErrorKind::SessionLost });
+        if (status == FrameSurfaceAcquireStatus::ProtocolError)
+            return Some(FrameSurfaceError { FrameSurfaceErrorKind::ProtocolFailure });
+        return None();
+    }
 
     bool acquired() const noexcept {
         return (status == FrameSurfaceAcquireStatus::Acquired ||
                 status == FrameSurfaceAcquireStatus::Suboptimal) &&
-               lease.valid() && completion.valid();
+               lease.valid() && completion.valid() && ! error;
     }
 };
 
@@ -1217,11 +1241,12 @@ public:
             return { .status = ::vrento::FrameSurfaceAcquireStatus::Busy };
         }
         const u32 slot_index     = rstd::as_cast<u32>(this->getInprogress()->id());
-        const u64 acquire_serial = m_next_acquire_serial++;
+        const u64 acquire_serial = m_next_acquire_serial;
         if (acquire_serial == u64()) {
-            return { .status     = ::vrento::FrameSurfaceAcquireStatus::ProtocolError,
-                     .error_code = i32(-EOVERFLOW) };
+            return { .status = ::vrento::FrameSurfaceAcquireStatus::ProtocolError,
+                     .error  = Some(FrameSurfaceError { FrameSurfaceErrorKind::SerialExhausted }) };
         }
+        ++m_next_acquire_serial;
         ::vrento::FrameSurfaceLease lease {
             .identity = { .owner_generation = u64(1),
                           .image_index      = slot_index,
@@ -1237,8 +1262,8 @@ public:
             .discard_content      = true,
         };
         if (! lease.valid()) {
-            return { .status     = ::vrento::FrameSurfaceAcquireStatus::ProtocolError,
-                     .error_code = i32(-EINVAL) };
+            return { .status = ::vrento::FrameSurfaceAcquireStatus::ProtocolError,
+                     .error  = Some(FrameSurfaceError { FrameSurfaceErrorKind::InvalidLease }) };
         }
         m_surface_pending  = true;
         m_pending_identity = lease.identity;

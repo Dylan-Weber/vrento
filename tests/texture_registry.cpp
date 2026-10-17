@@ -1,5 +1,4 @@
 #include <rstd/macro.hpp>
-#include <cstdio>
 #include <rstd/test/gtest.hpp>
 import rstd;
 import rstd.test;
@@ -1007,13 +1006,12 @@ TEST(RenderResourceSystem, BufferRangeQueryScale) {
                     for (const auto& range : snapshot.ranges(allocation.identity()))
                         total += range.size;
             EXPECT_EQ(total, rstd::uint64_t(count) * 32 * 24);
-            std::printf(
-                "buffer ranges N=%u C=%u trial=%u prepare_ns=%llu query32_ns=%llu\n",
-                count,
-                count * 3,
-                trial,
-                static_cast<unsigned long long>(prepare_ns.to_primitive()),
-                static_cast<unsigned long long>(queried.elapsed().as_nanos().to_primitive()));
+            rstd::io::println("buffer ranges N={} C={} trial={} prepare_ns={} query32_ns={}",
+                              count,
+                              count * 3,
+                              trial,
+                              prepare_ns,
+                              queried.elapsed().as_nanos());
         }
     }
 }

@@ -1,6 +1,5 @@
 #include <rstd/macro.hpp>
 #include <rstd/test/gtest.hpp>
-#include <cstdio>
 import rstd;
 import rstd.test;
 import vrento;
@@ -259,24 +258,22 @@ void compute_output(DeviceSession session, QueueParameters compute, QueueParamet
         slice<GraphQueueAssignment>::from_raw_parts(assignments, usize(3)));
     if (prepared.is_err()) {
         auto error = prepared.unwrap_err();
-        fprintf(stderr,
-                "buffer prepare failed stage=%u pass=%llu resource=%llu native=%d\n",
-                unsigned(error.stage),
-                static_cast<unsigned long long>(error.pass.value),
-                static_cast<unsigned long long>(error.resource.value),
-                error.texture_error() ? int(error.texture_error()->kind)
-                                      : int(error.native_result()));
+        rstd::io::eprintln("buffer prepare failed stage={} pass={} resource={} native={}",
+                           unsigned(error.stage),
+                           error.pass.value,
+                           error.resource.value,
+                           error.texture_error() ? int(error.texture_error()->kind)
+                                                 : int(error.native_result()));
     }
     auto program   = prepared.unwrap();
     auto submitted = program.execute();
     if (submitted.error())
-        fprintf(stderr,
-                "buffer graph failed stage=%u resource=%llu error=%u\n",
-                unsigned(submitted.error()->stage),
-                static_cast<unsigned long long>(submitted.error()->resource.value),
-                submitted.error()->texture_error()
-                    ? unsigned(submitted.error()->texture_error()->kind)
-                    : 0);
+        rstd::io::eprintln("buffer graph failed stage={} resource={} error={}",
+                           unsigned(submitted.error()->stage),
+                           submitted.error()->resource.value,
+                           submitted.error()->texture_error()
+                               ? unsigned(submitted.error()->texture_error()->kind)
+                               : 0);
     rstd_assert(submitted.status() == GraphSubmissionStatus::Submitted);
     submitted.wait().unwrap();
     auto pixels = vrento_test::texture_vulkan::read(queue, output, 0, 0);
@@ -299,11 +296,10 @@ TEST(GraphQueue, ComputeBufferSharedFamily) {
             if ((compute.flags & VK_QUEUE_COMPUTE_BIT) &&
                 compute.family_index == transfer.family_index &&
                 compute.queue_index != transfer.queue_index) {
-                fprintf(stderr,
-                        "shared family=%u queues=%u,%u\n",
-                        compute.family_index,
-                        compute.queue_index,
-                        transfer.queue_index);
+                rstd::io::eprintln("shared family={} queues={},{}",
+                                   compute.family_index,
+                                   compute.queue_index,
+                                   transfer.queue_index);
                 compute_output(session, compute, transfer);
                 return;
             }
@@ -318,11 +314,10 @@ TEST(GraphQueue, ComputeBufferCrossFamily) {
                 (transfer.flags &
                  (VK_QUEUE_TRANSFER_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) &&
                 compute.family_index != session.device().graphics_queue().family_index) {
-                fprintf(stderr,
-                        "compute family=%u transfer family=%u graphics family=%u\n",
-                        compute.family_index,
-                        transfer.family_index,
-                        session.device().graphics_queue().family_index);
+                rstd::io::eprintln("compute family={} transfer family={} graphics family={}",
+                                   compute.family_index,
+                                   transfer.family_index,
+                                   session.device().graphics_queue().family_index);
                 compute_output(session, compute, transfer, true);
                 return;
             }
