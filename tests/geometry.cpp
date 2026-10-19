@@ -13,25 +13,24 @@ using namespace vrento;
 namespace vrento_test::geometry
 {
 TEST(BufferContent, PreservesAllocationAndAllocatorUntilLastOwner) {
-    rstd::alloc::AllocationTracker  tracker;
+    auto                            tracker = rstd::alloc::SharedTrackingAllocator<>::make();
     Option<resource::BufferContent> retained;
     const void*                     pointer {};
     {
-        auto bytes = Vec<u8, rstd::alloc::TrackingAllocator<>>::new_in(
-            rstd::alloc::TrackingAllocator<>(rstd::alloc::Global {}, tracker));
+        auto bytes = Vec<u8, rstd::alloc::SharedTrackingAllocator<>>::new_in(tracker.clone());
         bytes.resize(usize(4096), u8(7));
         pointer      = bytes.as_slice().as_raw_ptr();
         auto content = resource::BufferContent::from(rstd::move(bytes));
         EXPECT_EQ(content.as_slice().as_raw_ptr(), pointer);
         retained = Some(content.clone());
         EXPECT_EQ(retained->as_slice().as_raw_ptr(), pointer);
-        EXPECT_EQ(tracker.snapshot().allocations, u64(1));
+        EXPECT_EQ(tracker.snapshot().allocations, u64(2));
     }
     EXPECT_EQ(retained->as_slice()[usize()], u8(7));
     EXPECT_EQ(tracker.snapshot().deallocations, u64());
     retained = None();
     EXPECT_EQ(tracker.snapshot().live_bytes, u64());
-    EXPECT_EQ(tracker.snapshot().deallocations, u64(1));
+    EXPECT_EQ(tracker.snapshot().deallocations, u64(2));
 }
 
 TEST(BufferContent, DistinguishesBorrowedBytesEmptyAndZeroed) {
@@ -175,5 +174,97 @@ TEST(Geometry, Mutations) {
     rstd_assert(indices.BufferView().count == usize());
     rstd_assert(moved_indices.Data()[1] == 1);
     rstd_assert(moved_indices.RenderDataCount() == usize(2));
+}
+
+TEST(Geometry, PublishedVerticesShareThenDetachWithoutChangingStreamIdentity) {
+    VertexArray           vertices({ { "position"_Str, VertexType::FLOAT3, false } }, usize(4));
+    const array<float, 6> input { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f };
+    ASSERT_TRUE(vertices.SetVertexs(usize(), input.as_slice()));
+    auto* pointer = vertices.Data();
+    auto  layout  = vertices.BufferView().layout();
+    auto  first   = vertices.PublishContent();
+    auto  second  = vertices.PublishContent();
+    EXPECT_EQ(first.as_slice().as_raw_ptr(), reinterpret_cast<const byte*>(pointer));
+    EXPECT_EQ(first.as_slice().as_raw_ptr(), second.as_slice().as_raw_ptr());
+    EXPECT_EQ(first.len(), usize(sizeof(input)));
+    EXPECT_EQ(vertices.CapacitySize(), usize(12));
+    const array<float, 3> changed { 7.0f, 8.0f, 9.0f };
+    ASSERT_TRUE(vertices.SetVertexs(usize(1), changed.as_slice()));
+    EXPECT_NE(vertices.Data(), pointer);
+    EXPECT_EQ(vertices.Data()[0], 1.0f);
+    EXPECT_EQ(vertices.Data()[3], 7.0f);
+    EXPECT_EQ(vertices.CapacitySize(), usize(12));
+    EXPECT_EQ(vertices.BufferView().storage_generation, layout.storage_generation);
+    EXPECT_EQ(vertices.DataGeneration(), layout.data_generation + u64(1));
+    EXPECT_EQ(__builtin_memcmp(first.as_slice().as_raw_ptr(), input.begin(), sizeof(input)), 0);
+    auto current = vertices.PublishContent();
+    EXPECT_EQ(current.as_slice().as_raw_ptr(), reinterpret_cast<const byte*>(vertices.Data()));
+    auto generation = vertices.DataGeneration();
+    EXPECT_FALSE(vertices.SetVertexs(usize::MAX, input.as_slice()));
+    EXPECT_EQ(vertices.DataGeneration(), generation);
+    EXPECT_EQ(current.as_slice().as_raw_ptr(), reinterpret_cast<const byte*>(vertices.Data()));
+}
+
+TEST(Geometry, PublishedStorageRecoversUniqueAllocationAndKeepsInactiveValues) {
+    VertexArray           vertices({ { "position"_Str, VertexType::FLOAT3, false } }, usize(4));
+    const array<float, 6> input { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f };
+    ASSERT_TRUE(vertices.SetVertexs(usize(), input.as_slice()));
+    auto* pointer = vertices.Data();
+    (void)vertices.PublishContent();
+    vertices.ResetSize();
+    const array<float, 3> replacement { 7.0f, 8.0f, 9.0f };
+    ASSERT_TRUE(vertices.SetVertexs(usize(), replacement.as_slice()));
+    EXPECT_EQ(vertices.Data(), pointer);
+    EXPECT_EQ(vertices.Data()[3], 4.0f);
+    auto snapshot = vertices.PublishContent();
+    EXPECT_EQ(snapshot.len(), usize(3 * sizeof(float)));
+    EXPECT_EQ(vertices.CapacitySize(), usize(12));
+    VertexArray moved(rstd::move(vertices));
+    EXPECT_EQ(moved.Data(), pointer);
+    EXPECT_EQ(vertices.CapacitySize(), usize());
+    EXPECT_TRUE(vertices.BufferView().bytes.is_empty());
+}
+
+TEST(Geometry, PublishedRewriteDiscardsOldContentsAndCompletesAfterException) {
+    VertexArray           vertices({ { "position"_Str, VertexType::FLOAT3, false } }, usize(4));
+    const array<float, 6> input { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f };
+    ASSERT_TRUE(vertices.SetVertexs(usize(), input.as_slice()));
+    auto snapshot = vertices.PublishContent();
+    auto identity = vertices.BufferView().storage_generation;
+    bool caught {};
+    try {
+        (void)vertices.RewriteVertices([](VertexWriter& writer) {
+            auto vertex     = writer.AppendZeroedVertex().unwrap();
+            vertex[usize()] = 9.0f;
+            throw 7;
+        });
+    } catch (int) {
+        caught = true;
+    }
+    EXPECT_TRUE(caught);
+    EXPECT_EQ(vertices.VertexCount(), usize(1));
+    EXPECT_EQ(vertices.Data()[0], 9.0f);
+    EXPECT_EQ(vertices.Data()[3], 0.0f);
+    EXPECT_EQ(vertices.BufferView().storage_generation, identity);
+    EXPECT_EQ(vertices.PublishContent().len(), usize(3 * sizeof(float)));
+    EXPECT_EQ(__builtin_memcmp(snapshot.as_slice().as_raw_ptr(), input.begin(), sizeof(input)), 0);
+}
+
+TEST(Geometry, PublishedIndicesKeepCountMetadataAndOldContents) {
+    const array<uint32_t, 3> input { 0u, 1u, 2u };
+    IndexArray               indices(input.as_slice());
+    auto                     first    = indices.PublishContent();
+    auto                     pointer  = first.as_slice().as_raw_ptr();
+    auto                     identity = indices.BufferView().storage_generation;
+    indices.SetRenderDataCount(usize(2));
+    auto second = indices.PublishContent();
+    EXPECT_EQ(second.as_slice().as_raw_ptr(), pointer);
+    EXPECT_EQ(indices.RenderDataCount(), usize(2));
+    const array<uint32_t, 1> replacement { 7u };
+    indices.Assign(usize(1), replacement.as_slice());
+    EXPECT_EQ(indices.Data()[1], 7u);
+    EXPECT_EQ(indices.BufferView().storage_generation, identity);
+    EXPECT_NE(indices.PublishContent().as_slice().as_raw_ptr(), pointer);
+    EXPECT_EQ(__builtin_memcmp(first.as_slice().as_raw_ptr(), input.begin(), sizeof(input)), 0);
 }
 } // namespace vrento_test::geometry

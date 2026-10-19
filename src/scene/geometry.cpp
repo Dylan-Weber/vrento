@@ -72,7 +72,8 @@ auto VertexWriter::AppendZeroedVertex() noexcept -> Option<mut_ref<float[]>> {
 }
 
 auto VertexArray::FinishVertexRewrite(const VertexWriter& writer) noexcept -> VertexWriteResult {
-    m_size = writer.Written() * m_oneSize;
+    m_rewriting = false;
+    m_size      = writer.Written() * m_oneSize;
     BumpDataGeneration();
     return {
         .vertex_count = writer.Written(),
@@ -87,8 +88,7 @@ VertexArray::VertexArray(Vec<VertexAttribute> attrs, const usize count)
         m_oneSize += VertexArray::RealAttributeSize(el);
     }
     auto capacity = m_oneSize * count;
-    m_data        = Vec<float>::with_capacity(capacity);
-    for (usize i {}; i < capacity; ++i) m_data.push(0.0f);
+    m_data        = detail::GeometryArrayStorage<float>(capacity);
 }
 
 VertexArray::VertexArray(VertexArray&& other) noexcept
@@ -120,13 +120,15 @@ VertexArray& VertexArray::operator=(VertexArray&& other) noexcept {
 }
 
 bool VertexArray::AddVertex(const float* data) {
+    if (m_rewriting) rstd::panic { "geometry mutation during rewrite" };
     if (data == nullptr || m_oneSize == usize() || m_oneSize > m_data.len() - m_size) return false;
+    auto  target = m_data.write();
     usize pos {};
     usize mpos = m_size;
     for (const auto& el : m_attributes) {
         auto typeSize = VertexArray::TypeCount(el.type);
         for (usize component {}; component < typeSize; ++component)
-            m_data[mpos + component] = data[(pos + component).to_primitive()];
+            target[mpos + component] = data[(pos + component).to_primitive()];
         pos += typeSize;
         mpos += VertexArray::RealAttributeSize(el);
     }
@@ -136,6 +138,7 @@ bool VertexArray::AddVertex(const float* data) {
 }
 
 bool VertexArray::SetVertex(ref<str> name, slice<float> data) noexcept {
+    if (m_rewriting) rstd::panic { "geometry mutation during rewrite" };
     usize offset {};
     for (const auto& el : m_attributes) {
         if (el.name.as_str() == name) {
@@ -143,11 +146,12 @@ bool VertexArray::SetVertex(ref<str> name, slice<float> data) noexcept {
             if (data.len() % typeSize != usize()) return false;
             const auto count = data.len() / typeSize;
             if (! TrySetSize(count * m_oneSize)) return false;
+            auto target = m_data.write();
 
             for (usize i {}; i < data.len(); i += typeSize) {
                 auto num = i / typeSize;
                 for (usize component {}; component < typeSize; ++component) {
-                    m_data[offset + num * m_oneSize + component] = data[i + component];
+                    target[offset + num * m_oneSize + component] = data[i + component];
                 }
             }
             BumpDataGeneration();
@@ -159,12 +163,14 @@ bool VertexArray::SetVertex(ref<str> name, slice<float> data) noexcept {
 }
 
 bool VertexArray::SetVertexs(usize index, slice<float> data) noexcept {
+    if (m_rewriting) rstd::panic { "geometry mutation during rewrite" };
     if (m_oneSize == usize() || index > m_data.len() / m_oneSize) return false;
     usize start = index * m_oneSize;
     if (data.len() > m_data.len() - start) return false;
     if (TrySetSize(start + data.len())) {
+        auto target = m_data.write();
         for (usize source_index {}; source_index < data.len(); ++source_index) {
-            m_data[start + source_index] = data[source_index];
+            target[start + source_index] = data[source_index];
         }
         BumpDataGeneration();
         return true;
@@ -173,6 +179,7 @@ bool VertexArray::SetVertexs(usize index, slice<float> data) noexcept {
 }
 
 void VertexArray::ResetSize() noexcept {
+    if (m_rewriting) rstd::panic { "geometry mutation during rewrite" };
     if (m_size == usize()) return;
     m_size = usize();
     BumpDataGeneration();
@@ -198,16 +205,9 @@ auto VertexArray::AttributeOffset(ref<str> name) const -> Option<usize> {
 }
 
 IndexArray::IndexArray(usize index_count)
-    : m_data(Vec<uint32_t>::with_capacity(index_count)),
-      m_storage_generation(next_storage_generation()) {
-    for (usize i {}; i < index_count; ++i) m_data.push(0);
-}
+    : m_data(index_count), m_storage_generation(next_storage_generation()) {}
 IndexArray::IndexArray(slice<uint32_t> data)
-    : m_data(Vec<uint32_t>::with_capacity(data.len())),
-      m_size(data.len()),
-      m_storage_generation(next_storage_generation()) {
-    for (uint32_t value : data) m_data.push(rstd::move(value));
-}
+    : m_data(data), m_size(data.len()), m_storage_generation(next_storage_generation()) {}
 
 IndexArray::IndexArray(IndexArray&& other) noexcept
     : m_data(rstd::move(other.m_data)),

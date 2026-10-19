@@ -3,6 +3,71 @@ export import :types.vertex;
 export import :resource.buffer;
 import rstd;
 using namespace rstd::prelude;
+
+namespace vrento::detail
+{
+template<typename T>
+class GeometryArrayStorage {
+    static_assert(rstd::mtp::same_as<T, float> || rstd::mtp::same_as<T, rstd::uint32_t>);
+    rstd::bytes::BytesMut      writable_;
+    Option<rstd::bytes::Bytes> published_;
+    usize                      count_ {};
+
+    template<typename A>
+    static auto allocate(usize count, A allocator) -> rstd::bytes::BytesMut {
+        auto values = Vec<T, A>::with_capacity_in(count, rstd::move(allocator));
+        values.resize(count, T {});
+        return rstd::bytes::BytesMut::from_vec(rstd::move(values));
+    }
+
+public:
+    GeometryArrayStorage() = default;
+    explicit GeometryArrayStorage(usize count)
+        : writable_(allocate(count, rstd::alloc::Global {})), count_(count) {}
+    explicit GeometryArrayStorage(slice<T> values)
+        : writable_(rstd::bytes::BytesMut::from_vec(Vec<T>::from(values))), count_(values.len()) {}
+    GeometryArrayStorage(GeometryArrayStorage&& other) noexcept
+        : writable_(rstd::move(other.writable_)),
+          published_(other.published_.take()),
+          count_(rstd::exchange(other.count_, usize())) {}
+    auto operator=(GeometryArrayStorage&& other) noexcept -> GeometryArrayStorage& {
+        if (this != &other) {
+            writable_  = rstd::move(other.writable_);
+            published_ = other.published_.take();
+            count_     = rstd::exchange(other.count_, usize());
+        }
+        return *this;
+    }
+    auto len() const -> usize { return count_; }
+    auto data() const -> const T* {
+        auto bytes = published_ ? published_->as_slice() : writable_.as_slice();
+        return bytes.is_empty() ? nullptr : reinterpret_cast<const T*>(bytes.as_raw_ptr());
+    }
+    auto write(bool preserve = true) -> mut_ref<T[]> {
+        if (published_) {
+            auto recovered = rstd::move(published_.take().unwrap_unchecked()).try_into_mut();
+            if (recovered.is_ok()) {
+                writable_ = rstd::move(recovered).unwrap_unchecked();
+            } else {
+                auto source = rstd::move(recovered).unwrap_err_unchecked();
+                writable_   = allocate(count_, source.allocator());
+                if (preserve && ! source.is_empty())
+                    rstd::mem::memcpy(writable_.data(), source.data(), source.len());
+            }
+        }
+        // Every allocation contains initialized T objects before byte ownership is transferred.
+        return mut_ref<T[]>::from_raw_parts(reinterpret_cast<T*>(writable_.data()), count_);
+    }
+    auto publish(usize count) -> resource::BufferContent {
+        if (count > count_) rstd::panic { "geometry publication exceeds initialized storage" };
+        if (! published_) published_ = Some(writable_.freeze());
+        auto bytes = published_->clone();
+        bytes.truncate(count * usize(sizeof(T)));
+        return resource::BufferContent::from(rstd::move(bytes));
+    }
+};
+} // namespace vrento::detail
+
 export namespace vrento
 {
 struct GeometryBufferLayout {
@@ -165,13 +230,14 @@ public:
     void Assign(usize index, slice<uint32_t> data) {
         if (index > m_data.len() || data.len() > m_data.len() - index) return;
         if (! IncreaseCheckSet((index + data.len()) * Unit_Byte_Size)) return;
+        auto target = m_data.write();
         for (usize source_index {}; source_index < data.len(); ++source_index) {
-            m_data[index + source_index] = data[source_index];
+            target[index + source_index] = data[source_index];
         }
         BumpDataGeneration();
     }
 
-    const uint32_t* Data() const { return m_data.is_empty() ? nullptr : m_data.begin(); }
+    const uint32_t* Data() const { return m_data.data(); }
     usize           DataCount() const { return m_size; }
     usize           DataSizeOf() const { return m_size * Unit_Byte_Size; }
 
@@ -184,6 +250,7 @@ public:
     usize CapacitySizeof() const { return m_data.len() * Unit_Byte_Size; }
     u64   DataGeneration() const { return m_generation; }
     auto  BufferView() const -> GeometryBufferView;
+    auto  PublishContent() -> resource::BufferContent { return m_data.publish(m_size); }
 
     u32  ID() const { return m_id; }
     void SetID(u32 id) { m_id = id; }
@@ -192,8 +259,8 @@ private:
     bool IncreaseCheckSet(usize size);
     void BumpDataGeneration() noexcept { ++m_generation; }
 
-    Vec<uint32_t> m_data;
-    usize         m_size { 0 };
+    detail::GeometryArrayStorage<uint32_t> m_data;
+    usize                                  m_size { 0 };
 
     usize m_render_size { usize::MAX };
 
@@ -263,7 +330,9 @@ public:
 
     template<typename Fill>
     [[nodiscard]] auto RewriteVertices(Fill&& fill) -> VertexWriteResult {
-        VertexWriter writer(m_data.as_mut_slice().as_mut_ref(), m_oneSize);
+        if (m_rewriting) rstd::panic { "nested geometry rewrite" };
+        VertexWriter writer(m_data.write(false), m_oneSize);
+        m_rewriting = true;
         try {
             fill(writer);
         } catch (...) {
@@ -277,7 +346,7 @@ public:
     // SetVertexs calls regrow it.
     void ResetSize() noexcept;
 
-    const float* Data() const { return m_data.is_empty() ? nullptr : m_data.begin(); }
+    const float* Data() const { return m_data.data(); }
     usize        DataSize() const { return m_size; }
     usize        DataSizeOf() const { return m_size * usize(sizeof(float)); }
     usize        VertexCount() const { return m_oneSize == usize() ? usize() : m_size / m_oneSize; }
@@ -287,6 +356,10 @@ public:
     usize        OneSizeOf() const { return m_oneSize * usize(sizeof(float)); }
     u64          DataGeneration() const { return m_generation; }
     auto         BufferView() const -> GeometryBufferView;
+    auto         PublishContent() -> resource::BufferContent {
+        if (m_rewriting) rstd::panic { "geometry publication during rewrite" };
+        return m_data.publish(m_size);
+    }
 
     auto Attributes() const -> slice<VertexAttribute> { return m_attributes.as_slice(); }
     auto AttributeOffset(ref<str> name) const -> Option<usize>;
@@ -304,9 +377,10 @@ private:
 
     Vec<VertexAttribute> m_attributes;
 
-    Vec<float> m_data;
-    usize      m_oneSize { 0 };
-    usize      m_size { 0 };
+    detail::GeometryArrayStorage<float> m_data;
+    usize                               m_oneSize { 0 };
+    usize                               m_size { 0 };
+    bool                                m_rewriting {};
 
     u32 m_id { u32::MAX };
     u64 m_generation { 1 };
