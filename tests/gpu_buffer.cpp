@@ -164,7 +164,8 @@ auto BufferBackend::Prepare(const rg::PassExecutionInfo& pass, const GraphPrepar
         auto add                           = [&](const auto& words, vrento::ShaderType type) {
             auto shader   = Box<ShaderSpv>::make();
             shader->stage = type;
-            for (auto word : words) shader->spirv.push(unsigned(word));
+            shader->spirv = vrento::ShaderCode::from(slice<rstd::uint32_t>::from_raw_parts(
+                words, usize(sizeof(words) / sizeof(words[0]))));
             request.shader_stages.push(rstd::move(shader));
         };
         add(shaders::vertex.words, vrento::ShaderType::VERTEX);

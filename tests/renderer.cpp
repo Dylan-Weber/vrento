@@ -841,7 +841,8 @@ TEST(VulkanRenderer, GraphicsDrawRebindsAndRecompilesRecipeWithDeviceCache) {
     auto stage                                = [&](const auto& words, vrento::ShaderType type) {
         auto value   = Box<vk::ShaderSpv>::make();
         value->stage = type;
-        for (auto word : words) value->spirv.push(unsigned(word));
+        value->spirv = vrento::ShaderCode::from(
+            slice<rstd::uint32_t>::from_raw_parts(words, usize(sizeof(words) / sizeof(words[0]))));
         recipe.request.shader_stages.push(rstd::move(value));
     };
     stage(vrento_test::shaders::vertex.words, vrento::ShaderType::VERTEX);

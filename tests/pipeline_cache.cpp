@@ -17,7 +17,7 @@ template<rstd::size_t N>
 auto stage(const unsigned (&words)[N], vrento::ShaderType type) -> Uni_ShaderSpv {
     auto value   = Box<ShaderSpv>::make();
     value->stage = type;
-    for (auto word : words) value->spirv.push(unsigned(word));
+    value->spirv = vrento::ShaderCode::from(slice<rstd::uint32_t>::from_raw_parts(words, usize(N)));
     return value;
 }
 auto request(vrento::resource::PipelineLayoutHandle layout) -> PipelineResourceRequest {
@@ -53,6 +53,31 @@ TEST(PipelineCache, CompatibilityKey) {
     original.multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     original.raster.cullMode                  = VK_CULL_MODE_FRONT_BIT;
     rstd_assert(! SamePipelineCacheKey(key, MakePipelineCacheKey(original)));
+}
+TEST(PipelineCache, ClonesShareCodeAndKeysCompareFullContent) {
+    auto        original  = request({ u64(1), u64(1) });
+    auto        key       = MakePipelineCacheKey(original);
+    auto        cloned    = original.clone();
+    auto        desc      = MakePipelineResourceDesc(cloned);
+    auto        desc_copy = desc.clone();
+    const auto* words     = original.shader_stages[usize()]->spirv.data();
+    EXPECT_EQ(cloned.shader_stages[usize()]->spirv.data(), words);
+    EXPECT_EQ(desc.shader_stages[usize()].spirv.data(), words);
+    EXPECT_EQ(desc_copy.shader_stages[usize()].spirv.data(), words);
+    EXPECT_TRUE(SamePipelineCacheKey(key, MakePipelineCacheKey(cloned)));
+    auto independent = request({ u64(1), u64(1) });
+    EXPECT_NE(independent.shader_stages[usize()]->spirv.data(), words);
+    EXPECT_TRUE(SamePipelineCacheKey(key, MakePipelineCacheKey(independent)));
+    independent.shader_stages[usize()]->entry_point = "other"_Str;
+    auto changed                                    = MakePipelineCacheKey(independent);
+    changed.value                                   = key.value;
+    EXPECT_FALSE(SamePipelineCacheKey(key, changed));
+    original.shader_stages.clear();
+    cloned.shader_stages.clear();
+    desc.shader_stages.clear();
+    EXPECT_EQ(desc_copy.shader_stages[usize()].spirv.data(), words);
+    EXPECT_EQ(desc_copy.shader_stages[usize()].spirv[usize()], 0x07230203u);
+    EXPECT_TRUE(SamePipelineCacheKey(key, MakePipelineCacheKey(desc_copy)));
 }
 TEST(PipelineCache, RetentionAndRenderPass) {
     auto                     session = DeviceSession::create({ .validation = true }).unwrap();

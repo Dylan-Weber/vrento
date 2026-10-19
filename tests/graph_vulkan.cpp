@@ -145,7 +145,7 @@ template<rstd::size_t N>
 auto shader(const unsigned (&words)[N], vrento::ShaderType stage) -> vk::Uni_ShaderSpv {
     auto value   = Box<vk::ShaderSpv>::make();
     value->stage = stage;
-    for (auto word : words) value->spirv.push(unsigned(word));
+    value->spirv = vrento::ShaderCode::from(slice<rstd::uint32_t>::from_raw_parts(words, usize(N)));
     return value;
 }
 auto Backend::Prepare(const rg::PassExecutionInfo& pass, const vk::GraphPrepareContext& context)

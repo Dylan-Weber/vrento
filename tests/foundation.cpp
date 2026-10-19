@@ -10,6 +10,41 @@ using namespace rstd::literals;
 using namespace vrento;
 using namespace vrento::vulkan;
 
+TEST(ShaderCode, FreezesWithoutCopyAndKeepsStorageAlive) {
+    ShaderCode            survivor;
+    const rstd::uint32_t* pointer {};
+    {
+        auto words =
+            Vec<rstd::uint32_t>::from(array<rstd::uint32_t, 3> { 0x07230203u, 2u, 3u }.as_slice());
+        pointer   = words.data();
+        auto code = ShaderCode::from(rstd::move(words));
+        survivor  = code.clone();
+        EXPECT_EQ(code.data(), pointer);
+        EXPECT_EQ(survivor.data(), pointer);
+    }
+    EXPECT_EQ(survivor.data(), pointer);
+    EXPECT_EQ(survivor.len(), usize(3));
+    EXPECT_EQ(survivor[usize(2)], 3u);
+}
+
+TEST(ShaderCode, ComparesContentAndReplacesOnlyOneOwner) {
+    const auto words = array<rstd::uint32_t, 2> { 1u, 2u };
+    auto       first = ShaderCode::from(words.as_slice());
+    auto       equal = ShaderCode::from(words.as_slice());
+    EXPECT_NE(first.data(), equal.data());
+    EXPECT_EQ(first, equal);
+    auto retained = first.clone();
+    first         = ShaderCode::from(array<rstd::uint32_t, 2> { 1u, 3u }.as_slice());
+    EXPECT_NE(first, equal);
+    EXPECT_EQ(retained, equal);
+    EXPECT_EQ(retained[usize(1)], 2u);
+    ShaderCode empty;
+    EXPECT_TRUE(empty.is_empty());
+    EXPECT_EQ(empty, empty.clone());
+    EXPECT_EQ(empty, ShaderCode::from(Vec<rstd::uint32_t> {}));
+    EXPECT_EQ(empty.data(), nullptr);
+}
+
 namespace vrento_test::foundation
 {
 struct Counts {
@@ -160,7 +195,7 @@ struct FakeShaderBackend {
         auto stage         = Box<ShaderSpv>::make();
         stage->stage       = units[usize()].stage;
         stage->entry_point = units[usize()].entry_point.clone();
-        stage->spirv.push(0x07230203u);
+        stage->spirv       = ShaderCode::from(array<rstd::uint32_t, 1> { 0x07230203u }.as_slice());
         output.push(rstd::move(stage));
         return Ok(empty {});
     }
