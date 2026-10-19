@@ -16,13 +16,21 @@ u64 next_allocation_generation() {
     return next.fetch_add(u64(1), Ordering::Relaxed);
 }
 
-bool ValidBuffer(const GeometryBufferView& view) {
-    return view.bytes.len() <= view.capacity && view.count <= usize(u32::MAX.to_primitive()) &&
-           (view.stride != usize() ? view.count <= view.bytes.len() / view.stride
-                                   : view.count == usize() && view.bytes.is_empty());
+auto BufferLayout(const GeometryBufferView& view) -> GeometryBufferLayout { return view.layout(); }
+auto BufferLayout(const GeometryBufferLayout& layout) -> const GeometryBufferLayout& {
+    return layout;
 }
 
-auto DrawCount(const GeometryView& geometry) -> Option<u32> {
+template<typename Buffer>
+bool ValidBuffer(const Buffer& buffer) {
+    const auto view = BufferLayout(buffer);
+    return view.byte_length <= view.capacity && view.count <= usize(u32::MAX.to_primitive()) &&
+           (view.stride != usize() ? view.count <= view.byte_length / view.stride
+                                   : view.count == usize() && view.byte_length == usize());
+}
+
+template<typename Geometry>
+auto DrawCount(const Geometry& geometry) -> Option<u32> {
     usize count = geometry.vertices.is_empty() ? usize() : usize::MAX;
     for (const auto& vertex : geometry.vertices) {
         if (! ValidBuffer(vertex)) return None();
@@ -51,8 +59,18 @@ String BuildDrawBufferResourceName(DrawId draw, DrawBufferRole role, u32 stream)
 
 auto BuildDrawBufferKeys(const DrawBufferRequest& request, u64 allocation_generation)
     -> Vec<DrawBufferKey> {
+    auto layout = request.geometry.layout();
+    return BuildDrawBufferKeys(DrawBufferPrepareRequest { request.render_item,
+                                                          layout,
+                                                          request.submesh_index,
+                                                          request.dynamic_allocation_generation,
+                                                          request.buffer_uses },
+                               allocation_generation);
+}
+auto BuildDrawBufferKeys(const DrawBufferPrepareRequest& request, u64 allocation_generation)
+    -> Vec<DrawBufferKey> {
     Vec<DrawBufferKey> keys;
-    auto append = [&](const GeometryBufferView& view, DrawBufferRole role, u32 stream) {
+    auto append = [&](const GeometryBufferLayout& view, DrawBufferRole role, u32 stream) {
         keys.push(DrawBufferKey {
             .render_item           = request.render_item,
             .role                  = role,
@@ -73,6 +91,16 @@ auto BuildDrawBufferKeys(const DrawBufferRequest& request, u64 allocation_genera
 }
 
 auto RenderBufferResolver::tryPrepareDrawBuffers(const DrawBufferRequest& request)
+    -> Result<DrawBufferRefs, resource::ResourceError> {
+    auto layout = request.geometry.layout();
+    return tryPrepareDrawBuffers(DrawBufferPrepareRequest { request.render_item,
+                                                            layout,
+                                                            request.submesh_index,
+                                                            request.dynamic_allocation_generation,
+                                                            request.buffer_uses });
+}
+
+auto RenderBufferResolver::tryPrepareDrawBuffers(const DrawBufferPrepareRequest& request)
     -> Result<DrawBufferRefs, resource::ResourceError> {
     auto count = DrawCount(request.geometry);
     if (count.is_none())

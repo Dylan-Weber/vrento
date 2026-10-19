@@ -3,9 +3,58 @@ import rstd;
 import :resource.handle;
 
 using namespace rstd::prelude;
+using rstd::sync::Arc;
 
 export namespace vrento::resource
 {
+
+class BufferContent {
+    Option<Arc<dyn<rstd::any::Any>>> owner_;
+    slice<u8>                        bytes_;
+    usize                            size_ {};
+    bool                             zeroed_ {};
+
+public:
+    BufferContent() = default;
+    BufferContent(BufferContent&& other) noexcept { *this = rstd::move(other); }
+    auto operator=(BufferContent&& other) noexcept -> BufferContent& {
+        if (this != &other) {
+            owner_  = other.owner_.take();
+            bytes_  = rstd::exchange(other.bytes_, {});
+            size_   = rstd::exchange(other.size_, usize());
+            zeroed_ = rstd::exchange(other.zeroed_, false);
+        }
+        return *this;
+    }
+    template<typename A>
+    static auto from(Vec<u8, A> bytes) -> BufferContent {
+        BufferContent result;
+        if (! bytes.is_empty()) {
+            result.bytes_ = bytes.as_slice();
+            result.size_  = bytes.len();
+            result.owner_ = Some(Arc<dyn<rstd::any::Any>>::make(rstd::move(bytes)));
+        }
+        return result;
+    }
+    static auto from(slice<u8> bytes) -> BufferContent { return from(Vec<u8>::from(bytes)); }
+    static auto zeroed(usize size) -> BufferContent {
+        BufferContent result;
+        result.size_   = size;
+        result.zeroed_ = true;
+        return result;
+    }
+    auto as_slice() const -> slice<u8> { return bytes_; }
+    auto len() const -> usize { return size_; }
+    auto is_zeroed() const -> bool { return zeroed_; }
+    auto clone() const -> BufferContent {
+        BufferContent result;
+        result.owner_  = owner_.clone();
+        result.bytes_  = bytes_;
+        result.size_   = size_;
+        result.zeroed_ = zeroed_;
+        return result;
+    }
+};
 
 struct BufferDefinitionId {
     u32 index { u32::MAX };

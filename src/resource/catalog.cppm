@@ -128,7 +128,7 @@ struct BufferContentProvider {
     struct Api {
         using Trait = BufferContentProvider;
 
-        auto LoadBuffer(const BufferRequest& request) -> Result<slice<u8>, ResourceError> {
+        auto LoadBuffer(const BufferResourceRef& request) -> Result<BufferContent, ResourceError> {
             return rstd::trait_call<0>(this, request);
         }
     };

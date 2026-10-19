@@ -74,9 +74,9 @@ namespace vrento_test::pipeline_layout
 {
 struct SharedBytes {
     array<u8, 16> bytes {};
-    auto          LoadBuffer(const vrento::resource::BufferRequest&)
-        -> Result<slice<u8>, vrento::resource::ResourceError> {
-        return Ok(bytes.as_slice());
+    auto          LoadBuffer(const vrento::resource::BufferResourceRef&)
+        -> Result<vrento::resource::BufferContent, vrento::resource::ResourceError> {
+        return Ok(vrento::resource::BufferContent::from(bytes.as_slice()));
     }
 };
 TEST(PreparedGraphicsResources, SharedBindingsAndDescriptorLifetime) {

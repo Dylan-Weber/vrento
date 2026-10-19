@@ -61,10 +61,20 @@ public:
     auto Ensure(resource::BufferRequest request, slice<u8> content,
                 mut_ref<dyn<vulkan::BufferBackend>> backend)
         -> Result<PreparedBuffer, resource::ResourceError> {
-        return Ensure(resource::BufferResourceRef(rstd::move(request)), content, backend);
+        struct Provider {
+            slice<u8> bytes;
+            auto      LoadBuffer(const resource::BufferResourceRef&)
+                -> Result<resource::BufferContent, resource::ResourceError> {
+                return Ok(resource::BufferContent::from(bytes));
+            }
+        } provider { content };
+        auto source = dyn<resource::BufferContentProvider>::from_ref(provider);
+        return Ensure(
+            resource::BufferResourceRef(rstd::move(request)), Some(source.as_mut_ref()), backend);
     }
-    auto Ensure(resource::BufferResourceRef definition, slice<u8> content,
-                mut_ref<dyn<vulkan::BufferBackend>> backend)
+    auto Ensure(resource::BufferResourceRef                           definition,
+                Option<mut_ref<dyn<resource::BufferContentProvider>>> content,
+                mut_ref<dyn<vulkan::BufferBackend>>                   backend)
         -> Result<PreparedBuffer, resource::ResourceError> {
         if (! definition.valid())
             return Err(
@@ -86,22 +96,42 @@ public:
             });
         }
 
-        auto existing = m_resources.get(handle);
-        if (existing.is_some() &&
-            (**existing)->definition_generation == (**entry).definition_version) {
-            if ((**entry).request().lifetime != resource::BufferLifetimeClass::Dynamic) {
-                auto queued = QueueWrite((**existing).clone(),
-                                         content,
-                                         request.content_version,
-                                         backend,
-                                         request.content_identity);
-                if (queued.is_err()) return Err(rstd::move(queued).unwrap_err_unchecked());
-            }
+        auto       existing = m_resources.get(handle);
+        const bool reuse    = existing.is_some() &&
+                              (**existing)->definition_generation == (**entry).definition_version;
+        if (reuse && (request.lifetime == resource::BufferLifetimeClass::Dynamic ||
+                      ((**existing)->source_generation == request.content_version &&
+                       (**existing)->source_identity == request.content_identity))) {
             return Ok(PreparedBuffer {
                 .resource   = handle,
                 .physical   = (**existing).clone(),
                 .definition = definition.clone(),
             });
+        }
+
+        if (! content)
+            return Err(resource::ResourceError {
+                .kind    = resource::ResourceErrorKind::MissingContent,
+                .message = rstd::format("buffer content {} unavailable", request.name),
+            });
+        auto loaded = (*content)->LoadBuffer(definition);
+        if (loaded.is_err()) return Err(loaded.unwrap_err());
+        auto bytes = loaded.unwrap();
+        if (bytes.len() > request.definition.size ||
+            (bytes.is_zeroed() && bytes.len() != request.definition.size))
+            return Err(resource::ResourceError {
+                .kind    = resource::ResourceErrorKind::MissingContent,
+                .message = rstd::format("invalid buffer content range for {}", request.name),
+            });
+        if (reuse) {
+            auto queued = QueueWrite((**existing).clone(),
+                                     bytes.as_slice(),
+                                     request.content_version,
+                                     backend,
+                                     request.content_identity,
+                                     bytes.is_zeroed());
+            if (queued.is_err()) return Err(queued.unwrap_err());
+            return Ok(PreparedBuffer { handle, (**existing).clone(), definition.clone() });
         }
 
         auto allocated = backend->AllocateBuffer(vulkan::BufferAllocationRequest {
@@ -121,8 +151,12 @@ public:
         u64  physical_generation = existing.is_some() ? (**existing)->generation + u64(1) : u64(1);
         auto physical            = Arc<BufferPhysical>::make(
             rstd::move(*allocated), physical_generation, (**entry).definition_version);
-        auto queued = QueueWrite(
-            physical.clone(), content, request.content_version, backend, request.content_identity);
+        auto queued = QueueWrite(physical.clone(),
+                                 bytes.as_slice(),
+                                 request.content_version,
+                                 backend,
+                                 request.content_identity,
+                                 bytes.is_zeroed());
         if (queued.is_err()) return Err(rstd::move(queued).unwrap_err_unchecked());
         (void)m_resources.insert(handle, physical.clone());
         return Ok(PreparedBuffer {
@@ -199,14 +233,15 @@ public:
 private:
     u64  m_allocations {};
     auto QueueWrite(Arc<BufferPhysical> physical, slice<u8> content, u64 source_generation,
-                    mut_ref<dyn<vulkan::BufferBackend>> backend, u64 source_identity)
-        -> Result<empty, resource::ResourceError> {
+                    mut_ref<dyn<vulkan::BufferBackend>> backend, u64 source_identity,
+                    bool zeroed = false) -> Result<empty, resource::ResourceError> {
         if (physical->source_generation == source_generation &&
             physical->source_identity == source_identity)
             return Ok(empty {});
         auto allocation =
             mut_ref<vulkan::BufferAllocation>::from_raw_parts(rstd::addressof(physical->buffer));
-        auto ticket = backend->QueueBufferWrite(allocation, content);
+        auto ticket = zeroed ? backend->QueueBufferZero(allocation)
+                             : backend->QueueBufferWrite(allocation, content);
         if (ticket.is_err()) {
             return Err(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::BackendFailure,

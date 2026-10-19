@@ -50,6 +50,14 @@ struct DrawBufferRequest {
     slice<resource::BufferUseHandle> buffer_uses;
 };
 
+struct DrawBufferPrepareRequest {
+    RenderItemId                     render_item;
+    const GeometryLayout&            geometry;
+    u32                              submesh_index {};
+    u64                              dynamic_allocation_generation {};
+    slice<resource::BufferUseHandle> buffer_uses;
+};
+
 enum class DrawBufferUpdateErrorKind
 {
     InvalidGeometry,
@@ -69,12 +77,16 @@ struct DrawBufferUpdateError {
 String BuildDrawBufferResourceName(DrawId, DrawBufferRole, u32 stream_index = u32());
 auto   BuildDrawBufferKeys(const DrawBufferRequest&, u64 allocation_generation = u64())
     -> Vec<DrawBufferKey>;
+auto BuildDrawBufferKeys(const DrawBufferPrepareRequest&, u64 allocation_generation = u64())
+    -> Vec<DrawBufferKey>;
 
 class RenderBufferResolver {
 public:
     explicit RenderBufferResolver(const resource_registry::PreparedResourceTable& resources)
         : m_resources(resources) {}
     auto tryPrepareDrawBuffers(const DrawBufferRequest&)
+        -> Result<DrawBufferRefs, resource::ResourceError>;
+    auto tryPrepareDrawBuffers(const DrawBufferPrepareRequest&)
         -> Result<DrawBufferRefs, resource::ResourceError>;
     auto        prepareDrawBuffers(const DrawBufferRequest&) -> Option<DrawBufferRefs>;
     static auto updateDrawBuffers(const DrawBufferRequest&, DrawBufferRefs&,

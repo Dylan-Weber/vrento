@@ -198,13 +198,13 @@ private:
 };
 
 struct BufferCopyOperation {
-    BufferAllocation  destination_lease;
-    Arc<UploadBlock>  source;
-    VkBuffer          destination { VK_NULL_HANDLE };
-    VkDeviceSize      source_offset { 0 };
-    VkDeviceSize      destination_offset { 0 };
-    VkDeviceSize      size { 0 };
-    BufferUploadClass usage { BufferUploadClass::Vertex };
+    BufferAllocation         destination_lease;
+    Option<Arc<UploadBlock>> source;
+    VkBuffer                 destination { VK_NULL_HANDLE };
+    VkDeviceSize             source_offset { 0 };
+    VkDeviceSize             destination_offset { 0 };
+    VkDeviceSize             size { 0 };
+    BufferUploadClass        usage { BufferUploadClass::Vertex };
 };
 
 struct ImageRegionOperation {
@@ -523,7 +523,7 @@ auto BufferManager::TryQueueWrite(BufferAllocation& allocation, slice<rstd::uint
     (*m_impl->pending)
         ->copies.push(BufferCopyOperation {
             .destination_lease  = BufferAllocation(allocation.m_state->clone()),
-            .source             = block.take().unwrap(),
+            .source             = block.take(),
             .destination        = allocation.buffer(),
             .source_offset      = upload_offset,
             .destination_offset = allocation.offset() + destination_offset,
@@ -534,6 +534,40 @@ auto BufferManager::TryQueueWrite(BufferAllocation& allocation, slice<rstd::uint
     auto category = unsigned((*allocation.m_state)->usage);
     ++m_impl->statistics.queued_copies[category];
     m_impl->statistics.queued_bytes[category] += data.len().to_primitive();
+    return Ok(ticket);
+}
+
+auto BufferManager::TryQueueZero(BufferAllocation& allocation)
+    -> Result<BufferUploadTicket, BackendError> {
+    if (! m_impl->initialized)
+        return Err(BackendError { "queue buffer zero"_Str, BackendCause::Closed() });
+    if (! allocation || allocation.offset() % 4 != 0 || allocation.size() % 4 != 0)
+        return Err(BackendError { "queue buffer zero"_Str,
+                                  BackendCause::Invalid("unaligned or empty allocation"_Str) });
+    if (m_impl->pending && (*m_impl->pending)->reserved)
+        return Err(BackendError { "queue buffer zero"_Str, BackendCause::Busy() });
+    if (! m_impl->pending) {
+        ++m_impl->next_batch;
+        if (m_impl->next_batch == u64()) ++m_impl->next_batch;
+        m_impl->pending            = Some(Arc<RecordedBufferUploads::State>::make());
+        (*m_impl->pending)->serial = m_impl->next_batch;
+        (*m_impl->pending)->owner  = this;
+    }
+    ++m_impl->next_ticket;
+    if (m_impl->next_ticket == u64()) ++m_impl->next_ticket;
+    BufferUploadTicket ticket { .value = m_impl->next_ticket };
+    (*m_impl->pending)
+        ->copies.push(BufferCopyOperation {
+            .destination_lease  = allocation.clone(),
+            .destination        = allocation.buffer(),
+            .destination_offset = allocation.offset(),
+            .size               = allocation.size(),
+            .usage              = allocation.usage(),
+        });
+    (*m_impl->pending)->tickets.push(BufferUploadTicket(ticket));
+    auto category = unsigned(allocation.usage());
+    ++m_impl->statistics.queued_copies[category];
+    m_impl->statistics.queued_bytes[category] += allocation.size();
     return Ok(ticket);
 }
 
@@ -632,13 +666,16 @@ auto BufferManager::TryRecordUploads(vvk::CommandBuffer& cmd, RecordedBufferUplo
                                           .size                = copy.size };
         cmd.PipelineBarrier(
             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, overwrite);
-        cmd.CopyBuffer(copy.source->handle(),
-                       copy.destination,
-                       VkBufferCopy {
-                           .srcOffset = copy.source_offset,
-                           .dstOffset = copy.destination_offset,
-                           .size      = copy.size,
-                       });
+        if (copy.source)
+            cmd.CopyBuffer((*copy.source)->handle(),
+                           copy.destination,
+                           VkBufferCopy {
+                               .srcOffset = copy.source_offset,
+                               .dstOffset = copy.destination_offset,
+                               .size      = copy.size,
+                           });
+        else
+            cmd.FillBuffer(copy.destination, copy.destination_offset, copy.size, 0);
         auto category = unsigned(copy.usage);
         ++m_impl->statistics.recorded_copies[category];
         m_impl->statistics.recorded_bytes[category] += copy.size;

@@ -1,10 +1,35 @@
 export module vrento:scene.geometry;
 export import :types.vertex;
+export import :resource.buffer;
 import rstd;
 using namespace rstd::prelude;
 export namespace vrento
 {
-// Bytes borrow their array until mutation, move, or destruction; never retain across frames.
+struct GeometryBufferLayout {
+    usize       byte_length {}, capacity {}, stride {}, count {};
+    u64         data_generation {}, storage_generation {};
+    friend bool operator==(const GeometryBufferLayout&, const GeometryBufferLayout&) = default;
+};
+} // namespace vrento
+
+export namespace rstd
+{
+template<>
+struct Impl<Copy, vrento::GeometryBufferLayout> {};
+} // namespace rstd
+
+export namespace vrento
+{
+
+struct GeometryLayout {
+    Vec<GeometryBufferLayout>    vertices;
+    Option<GeometryBufferLayout> index;
+    bool                         dynamic {};
+    friend bool                  operator==(const GeometryLayout&, const GeometryLayout&) = default;
+};
+
+// Bytes are the initialized prefix of the stream identified by storage_generation.
+// Views borrow their array until mutation, move, or destruction; never retain across frames.
 struct GeometryBufferView {
     slice<u8> bytes;
     usize     capacity {};
@@ -12,20 +37,30 @@ struct GeometryBufferView {
     usize     count {};
     u64       data_generation {};
     u64       storage_generation {};
+    auto      layout() const -> GeometryBufferLayout {
+        return { bytes.len(), capacity, stride, count, data_generation, storage_generation };
+    }
 };
 
 struct GeometryView {
     Vec<GeometryBufferView>    vertices;
     Option<GeometryBufferView> index;
     bool                       dynamic { false };
+    auto                       layout() const -> GeometryLayout {
+        GeometryLayout result { .dynamic = dynamic };
+        result.vertices.reserve(vertices.len());
+        for (const auto& buffer : vertices) result.vertices.push(buffer.layout());
+        if (index) result.index = Some(index->layout());
+        return result;
+    }
 };
 
 class GeometrySnapshot {
     struct Buffer {
-        Vec<u8> bytes;
-        usize   capacity {}, stride {}, count {};
-        u64     data_generation {}, storage_generation {};
-        auto    view() const -> GeometryBufferView {
+        resource::BufferContent bytes;
+        usize                   capacity {}, stride {}, count {};
+        u64                     data_generation {}, storage_generation {};
+        auto                    view() const -> GeometryBufferView {
             return {
                 bytes.as_slice(), capacity, stride, count, data_generation, storage_generation
             };
@@ -39,17 +74,31 @@ class GeometrySnapshot {
     bool           dynamic_ {};
 
 public:
-    static auto capture(const GeometryView& source) -> GeometrySnapshot {
+    static auto capture(const GeometryView& source, Option<ref<GeometrySnapshot>> previous = None())
+        -> GeometrySnapshot {
         GeometrySnapshot result;
         result.dynamic_ = source.dynamic;
-        auto buffer     = [](const GeometryBufferView& view) {
-            return Buffer {
-                Vec<u8>::from(view.bytes), view.capacity,          view.stride, view.count,
-                view.data_generation,      view.storage_generation
-            };
+        auto buffer     = [](const GeometryBufferView& view, const Buffer* old) {
+            const bool reuse = old && view.storage_generation != u64() &&
+                               old->storage_generation == view.storage_generation &&
+                               old->data_generation == view.data_generation &&
+                               old->bytes.len() == view.bytes.len();
+            return Buffer { reuse ? old->bytes.clone() : resource::BufferContent::from(view.bytes),
+                            view.capacity,
+                            view.stride,
+                            view.count,
+                            view.data_generation,
+                            view.storage_generation };
         };
-        for (const auto& view : source.vertices) result.vertices_.push(buffer(view));
-        if (source.index) result.index_ = Some(buffer(*source.index));
+        result.vertices_.reserve(source.vertices.len());
+        for (usize i {}; i < source.vertices.len(); ++i) {
+            const auto* old =
+                previous && i < (*previous)->vertices_.len() ? &(*previous)->vertices_[i] : nullptr;
+            result.vertices_.push(buffer(source.vertices[i], old));
+        }
+        if (source.index)
+            result.index_ = Some(buffer(
+                *source.index, previous && (*previous)->index_ ? &*(*previous)->index_ : nullptr));
         return result;
     }
     auto view() const -> GeometryView {
@@ -57,6 +106,40 @@ public:
         for (const auto& buffer : vertices_) result.vertices.push(buffer.view());
         if (index_) result.index = Some(index_->view());
         return result;
+    }
+    auto layout() const -> GeometryLayout {
+        GeometryLayout result { .dynamic = dynamic_ };
+        result.vertices.reserve(vertices_.len());
+        for (const auto& buffer : vertices_) result.vertices.push(buffer.view().layout());
+        if (index_) result.index = Some(index_->view().layout());
+        return result;
+    }
+    static auto from(GeometryLayout layout, Vec<resource::BufferContent> vertices,
+                     Option<resource::BufferContent> index = None()) -> Option<GeometrySnapshot> {
+        if (layout.vertices.len() != vertices.len() || layout.index.is_some() != index.is_some())
+            return None();
+        GeometrySnapshot result;
+        result.dynamic_ = layout.dynamic;
+        auto buffer     = [](const GeometryBufferLayout& meta, resource::BufferContent bytes) {
+            return Buffer { rstd::move(bytes), meta.capacity,        meta.stride,
+                            meta.count,        meta.data_generation, meta.storage_generation };
+        };
+        for (usize i {}; i < vertices.len(); ++i) {
+            if (vertices[i].is_zeroed() || vertices[i].len() != layout.vertices[i].byte_length)
+                return None();
+            result.vertices_.push(buffer(layout.vertices[i], rstd::move(vertices[i])));
+        }
+        if (index) {
+            if (index->is_zeroed() || index->len() != layout.index->byte_length) return None();
+            result.index_ = Some(buffer(*layout.index, index.take().unwrap()));
+        }
+        return Some(rstd::move(result));
+    }
+    auto vertexContent(usize index) const -> resource::BufferContent {
+        return vertices_[index].bytes.clone();
+    }
+    auto indexContent() const -> Option<resource::BufferContent> {
+        return index_ ? Some(index_->bytes.clone()) : None();
     }
     auto clone() const -> GeometrySnapshot {
         GeometrySnapshot result;

@@ -12,6 +12,89 @@ using namespace vrento;
 
 namespace vrento_test::geometry
 {
+TEST(BufferContent, PreservesAllocationAndAllocatorUntilLastOwner) {
+    rstd::alloc::AllocationTracker  tracker;
+    Option<resource::BufferContent> retained;
+    const void*                     pointer {};
+    {
+        auto bytes = Vec<u8, rstd::alloc::TrackingAllocator<>>::new_in(
+            rstd::alloc::TrackingAllocator<>(rstd::alloc::Global {}, tracker));
+        bytes.resize(usize(4096), u8(7));
+        pointer      = bytes.as_slice().as_raw_ptr();
+        auto content = resource::BufferContent::from(rstd::move(bytes));
+        EXPECT_EQ(content.as_slice().as_raw_ptr(), pointer);
+        retained = Some(content.clone());
+        EXPECT_EQ(retained->as_slice().as_raw_ptr(), pointer);
+        EXPECT_EQ(tracker.snapshot().allocations, u64(1));
+    }
+    EXPECT_EQ(retained->as_slice()[usize()], u8(7));
+    EXPECT_EQ(tracker.snapshot().deallocations, u64());
+    retained = None();
+    EXPECT_EQ(tracker.snapshot().live_bytes, u64());
+    EXPECT_EQ(tracker.snapshot().deallocations, u64(1));
+}
+
+TEST(BufferContent, DistinguishesBorrowedBytesEmptyAndZeroed) {
+    Vec<u8> input;
+    input.resize(usize(4), u8(7));
+    auto content   = resource::BufferContent::from(input.as_slice());
+    input[usize()] = u8(9);
+    EXPECT_EQ(content.as_slice()[usize()], u8(7));
+    EXPECT_FALSE(content.is_zeroed());
+    auto moved = rstd::move(content);
+    EXPECT_TRUE(content.as_slice().is_empty());
+    EXPECT_EQ(content.len(), usize());
+    EXPECT_EQ(moved.as_slice()[usize()], u8(7));
+    auto zeroed = resource::BufferContent::zeroed(usize(1024 * 1024));
+    EXPECT_TRUE(zeroed.clone().is_zeroed());
+    EXPECT_EQ(zeroed.len(), usize(1024 * 1024));
+    EXPECT_TRUE(zeroed.as_slice().is_empty());
+    EXPECT_FALSE(resource::BufferContent {}.is_zeroed());
+}
+
+TEST(Geometry, SnapshotSharesOwnedBytesAndSeparatesLayout) {
+    Vec<u8> bytes;
+    bytes.resize(usize(16), u8(3));
+    auto           pointer = bytes.as_slice().as_raw_ptr();
+    GeometryLayout layout;
+    layout.vertices.push({ .byte_length        = usize(16),
+                           .capacity           = usize(4096),
+                           .stride             = usize(16),
+                           .count              = usize(1),
+                           .data_generation    = u64(2),
+                           .storage_generation = u64(3) });
+    Vec<resource::BufferContent> content;
+    content.push(resource::BufferContent::from(rstd::move(bytes)));
+    auto snapshot = GeometrySnapshot::from(rstd::move(layout), rstd::move(content)).unwrap();
+    auto copy     = snapshot.clone();
+    snapshot      = {};
+    EXPECT_EQ(copy.vertexContent(usize()).as_slice().as_raw_ptr(), pointer);
+    EXPECT_EQ(copy.layout().vertices[usize()].capacity, usize(4096));
+    EXPECT_EQ(copy.layout().vertices[usize()].byte_length, usize(16));
+    EXPECT_EQ(copy.view().vertices[usize()].bytes[usize()], u8(3));
+    EXPECT_TRUE(GeometrySnapshot::from(copy.layout(), {}).is_none());
+}
+
+TEST(Geometry, RecaptureReusesUnchangedStreamsAndCountOnlyChanges) {
+    Vec<u8> bytes;
+    bytes.resize(usize(8), u8(2));
+    GeometryView source;
+    source.vertices.push({ bytes.as_slice(), usize(64), usize(4), usize(2), u64(1), u64(2) });
+    auto first                     = GeometrySnapshot::capture(source);
+    source.vertices[usize()].count = usize(1);
+    auto second =
+        GeometrySnapshot::capture(source, Some(ref<GeometrySnapshot>::from_raw_parts(&first)));
+    EXPECT_EQ(first.vertexContent(usize()).as_slice().as_raw_ptr(),
+              second.vertexContent(usize()).as_slice().as_raw_ptr());
+    EXPECT_EQ(second.layout().vertices[usize()].count, usize(1));
+    bytes[usize()] = u8(9);
+    ++source.vertices[usize()].data_generation;
+    auto changed =
+        GeometrySnapshot::capture(source, Some(ref<GeometrySnapshot>::from_raw_parts(&second)));
+    EXPECT_EQ(first.vertexContent(usize()).as_slice()[usize()], u8(2));
+    EXPECT_EQ(changed.vertexContent(usize()).as_slice()[usize()], u8(9));
+}
+
 TEST(Geometry, Mutations) {
     auto attributes = Vec<VertexArray::VertexAttribute>::with_capacity(usize(2));
     attributes.push({ "position"_Str, VertexType::FLOAT3, true });

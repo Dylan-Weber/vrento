@@ -585,7 +585,10 @@ TEST(VulkanRenderer, GeometrySnapshotSurvivesSourceMutation) {
                            .count              = usize(1),
                            .data_generation    = u64(3),
                            .storage_generation = u64(4) });
-    auto snapshot  = vrento::GeometrySnapshot::capture(source);
+    auto snapshot = vrento::GeometrySnapshot::capture(source);
+    auto shared   = snapshot.clone();
+    EXPECT_EQ(shared.vertexContent(usize()).as_slice().as_raw_ptr(),
+              snapshot.vertexContent(usize()).as_slice().as_raw_ptr());
     bytes[usize()] = u8(9);
     bytes.clear();
     auto moved = rstd::move(snapshot);

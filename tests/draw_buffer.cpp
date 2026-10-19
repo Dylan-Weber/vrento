@@ -57,7 +57,13 @@ TEST(DrawBuffer, Allocations) {
         .geometry    = geometry,
         .buffer_uses = slice<resource::BufferUseHandle>::from_raw_parts(uses.begin(), usize(2)),
     };
-    auto prepared = resolver.prepareDrawBuffers(request);
+    auto metadata = geometry.layout();
+    auto prepared =
+        resolver
+            .tryPrepareDrawBuffers(DrawBufferPrepareRequest { .render_item = request.render_item,
+                                                              .geometry    = metadata,
+                                                              .buffer_uses = request.buffer_uses })
+            .ok();
     rstd_assert(prepared.is_some());
     auto primary    = rstd::move(prepared).unwrap();
     auto reflection = resolver.prepareDrawBuffers(request).unwrap();

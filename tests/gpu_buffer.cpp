@@ -522,4 +522,82 @@ TEST(GpuBuffer, UploadedRangeOverwrite) {
     check(second, 0x02020202, 0x02020202);
     rstd_assert(session.validation_errors() == 0);
 }
+
+TEST(GpuBuffer, ZeroAndCopiedSourceSurviveCancellationAndRestore) {
+    auto          session = DeviceSession::create({ .validation = true }).unwrap();
+    auto          queue   = TextureContext::create(session).unwrap();
+    BufferManager buffers(session.device());
+    ASSERT_TRUE(buffers.init());
+    auto source    = buffers.TryAllocate({ 16, 4, BufferUploadClass::Transfer }).unwrap();
+    auto unaligned = buffers.TryAllocate({ 6, 4, BufferUploadClass::Transfer }).unwrap();
+    EXPECT_TRUE(buffers.TryQueueZero(unaligned).is_err());
+    auto zero = buffers.TryQueueZero(source).unwrap();
+    {
+        rstd::uint8_t bytes[4] { 3, 3, 3, 3 };
+        buffers.TryQueueWrite(source, slice<rstd::uint8_t>::from_raw_parts(bytes, usize(4)), 4)
+            .unwrap();
+        for (auto& byte : bytes) byte = 9;
+    }
+    {
+        RecordedBufferUploads reserved;
+        buffers.TryPreparePendingUploads(reserved).unwrap();
+        EXPECT_TRUE(buffers.TryQueueZero(source).unwrap_err().cause.is_Busy());
+    }
+    {
+        auto                  abandoned = queue.Begin().unwrap();
+        vvk::CommandBuffer    command(native_recording(abandoned, session).unwrap(),
+                                      session.device().handle().Dispatch());
+        RecordedBufferUploads recorded;
+        buffers.TryPreparePendingUploads(recorded).unwrap();
+        buffers.TryRecordUploads(command, recorded).unwrap();
+        auto lease = buffers.CommitRecordedUploads(rstd::move(recorded)).unwrap();
+        EXPECT_EQ(lease.Tickets().len(), usize(2));
+        EXPECT_EQ(lease.Tickets()[usize()].value, zero.value);
+        ASSERT_TRUE(buffers.RestoreUploads(rstd::move(lease)));
+    }
+    auto destination =
+        GpuBuffer::create(
+            session, 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, vvk::MemoryRequest::Readback())
+            .unwrap();
+    auto submit = [&] {
+        auto                  work = queue.Begin().unwrap();
+        vvk::CommandBuffer    command(native_recording(work, session).unwrap(),
+                                      session.device().handle().Dispatch());
+        RecordedBufferUploads recorded;
+        buffers.TryPreparePendingUploads(recorded).unwrap();
+        buffers.TryRecordUploads(command, recorded).unwrap();
+        work.retain(buffers.CommitRecordedUploads(rstd::move(recorded)).unwrap());
+        rg::PassResourceUse use {
+            { 1, 1 }, 0, rg::GraphAccess::Read, rg::PassUsage::Transfer, rg::PassStages::Transfer
+        };
+        use.range.size = 16;
+        GraphUploadedBufferBinding(session, source.clone()).Use(work, use).unwrap();
+        destination
+            .use(work,
+                 { 0,
+                   16,
+                   VK_ACCESS_TRANSFER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_TRANSFER_BIT,
+                   true,
+                   false })
+            .unwrap();
+        VkBufferCopy region { source.offset(), 0, 16 };
+        session.device().handle().Dispatch().vkCmdCopyBuffer(
+            native_recording(work, session).unwrap(),
+            source.buffer(),
+            destination.native(),
+            1,
+            &region);
+        host(work, destination);
+        queue.wait(queue.Submit(rstd::move(work)).unwrap()).unwrap();
+        return destination.readback().unwrap();
+    };
+    auto first = submit();
+    for (usize i {}; i < usize(16); ++i)
+        EXPECT_EQ(first[i], i >= usize(4) && i < usize(8) ? u8(3) : u8());
+    buffers.TryQueueZero(source).unwrap();
+    auto cleared = submit();
+    for (auto byte : cleared) EXPECT_EQ(byte, u8());
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
 } // namespace vrento_test::gpu_buffer

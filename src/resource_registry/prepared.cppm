@@ -733,22 +733,7 @@ public:
         if (! entry.definition.valid())
             return Err(
                 resource::ResourceError { .kind = resource::ResourceErrorKind::MissingDefinition });
-        if (content.is_none()) {
-            return Err(resource::ResourceError {
-                .kind = resource::ResourceErrorKind::MissingContent,
-                .message =
-                    rstd::format("buffer content {} unavailable", entry.request().name.as_str()),
-            });
-        }
-        auto loaded = (*content)->LoadBuffer(entry.request());
-        if (loaded.is_err()) {
-            auto error = loaded.unwrap_err();
-            error.contexts.push(resource::ResourceErrorContext::Buffer(
-                entry.definition.id(), entry.definition.revision(), entry.handle));
-            return Err(rstd::move(error));
-        }
-        auto prepared =
-            m_buffers.Ensure(entry.definition.clone(), loaded.unwrap_unchecked(), m_buffer_backend);
+        auto prepared = m_buffers.Ensure(entry.definition.clone(), content, m_buffer_backend);
         if (prepared.is_err()) {
             auto error = prepared.unwrap_err();
             error.contexts.push(resource::ResourceErrorContext::Buffer(

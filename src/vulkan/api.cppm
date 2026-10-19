@@ -1046,6 +1046,7 @@ public:
         -> Result<BufferAllocation, BackendError>;
     auto TryQueueWrite(BufferAllocation&, slice<rstd::uint8_t>, VkDeviceSize destination_offset = 0)
         -> Result<BufferUploadTicket, BackendError>;
+    auto TryQueueZero(BufferAllocation&) -> Result<BufferUploadTicket, BackendError>;
     auto TryPreparePendingUploads(RecordedBufferUploads&) -> Result<empty, BackendError>;
     auto TryRecordUploads(vvk::CommandBuffer&, RecordedBufferUploads&)
         -> Result<empty, BackendError>;
@@ -1081,15 +1082,20 @@ struct BufferBackend {
             return rstd::trait_call<0>(this, request);
         }
 
+        // Success consumes the borrowed bytes; GPU retirement owns staging independently.
         auto QueueBufferWrite(rstd::mut_ref<BufferAllocation> allocation,
                               rstd::slice<rstd::u8> content, VkDeviceSize destination_offset = 0)
             -> Result<BufferUploadTicket, BackendError> {
             return rstd::trait_call<1>(this, allocation, content, destination_offset);
         }
+        auto QueueBufferZero(rstd::mut_ref<BufferAllocation> allocation)
+            -> Result<BufferUploadTicket, BackendError> {
+            return rstd::trait_call<2>(this, allocation);
+        }
     };
 
     template<typename T>
-    using Funcs = rstd::TraitFuncs<&T::AllocateBuffer, &T::QueueBufferWrite>;
+    using Funcs = rstd::TraitFuncs<&T::AllocateBuffer, &T::QueueBufferWrite, &T::QueueBufferZero>;
 };
 
 // ---------- GraphicsPipeline.hpp ----------
@@ -1399,6 +1405,10 @@ struct Impl<vrento::vulkan::BufferBackend, vrento::vulkan::BufferManager>
             slice<rstd::uint8_t>::from_raw_parts(
                 reinterpret_cast<const rstd::uint8_t*>(content.as_raw_ptr()), content.len()),
             destination_offset);
+    }
+    auto QueueBufferZero(mut_ref<vrento::vulkan::BufferAllocation> allocation)
+        -> Result<vrento::vulkan::BufferUploadTicket, vrento::vulkan::BackendError> {
+        return this->self().TryQueueZero(*allocation);
     }
 };
 
