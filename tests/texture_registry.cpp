@@ -338,6 +338,41 @@ TEST(RegistryTextureContext, ImageIdentityReusesPreparedAllocationAndCancelledUp
     EXPECT_EQ(session.validation_errors(), 0u);
 }
 
+TEST(RegistryTextureContext, InitializesUnwrittenAllocationWithoutReplacingOrClearingItAgain) {
+    auto created = vk::DeviceSession::create({ .validation = true });
+    if (created.is_err()) GTEST_SKIP() << "Vulkan unavailable";
+    auto                                session = created.unwrap();
+    registry::RegistryTextureContext    textures(vk::TextureContext::create(session).unwrap());
+    vrento::resource::TextureDefinition definition;
+    definition.width = definition.height = i32(8);
+    definition.mip_levels                = u32(3);
+    auto original                        = textures.AllocateTexture(definition, false).unwrap();
+    auto view                            = original.allocation->Slots()[usize()].view;
+    EXPECT_EQ(view.texture().content_revision(), 0u);
+    auto initialized = textures.InitializeTexture(original.allocation.clone()).unwrap();
+    EXPECT_TRUE(initialized.upload);
+    EXPECT_TRUE(
+        Arc<registry::TextureAllocation>::ptr_eq(original.allocation, initialized.allocation));
+    EXPECT_FALSE(textures.InitializeTexture(original.allocation.clone()).unwrap().upload);
+    EXPECT_EQ(textures.PendingCount(), usize(1));
+    textures.DiscardPendingUploads();
+    EXPECT_EQ(original.allocation->InitialReadiness().unwrap(),
+              registry::ImageReadiness::Allocated);
+    EXPECT_TRUE(textures.InitializeTexture(original.allocation.clone()).unwrap().upload);
+    {
+        auto cancelled = textures.Context().Begin().unwrap();
+        EXPECT_TRUE(textures.RecordPendingUploads(cancelled));
+    }
+    textures.CancelRecording();
+    textures.Flush().unwrap();
+    textures.WaitForUploads(5'000'000'000).unwrap();
+    EXPECT_EQ(view.texture().content_revision(), 1u);
+    EXPECT_FALSE(textures.InitializeTexture(original.allocation.clone()).unwrap().upload);
+    EXPECT_EQ(textures.PendingCount(), usize());
+    EXPECT_EQ(textures.Statistics().target_allocations, u64(1));
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
+
 TEST(RegistryTextureContext, UploadBeforeGraphKeepsDescriptionsAndRequiresSameSubmission) {
     namespace fg = vrento::fg;
     auto created = vk::DeviceSession::create({ .validation = true });

@@ -27,6 +27,7 @@ struct TexturePlanEntry {
     u32                version { 0 };
     Option<TextureDefinitionId> source;
     bool                        preserve_contents {};
+    bool                        initialize_transparent {};
 
     auto source_request() const -> TextureRequest {
         auto result = request().clone();
@@ -78,7 +79,8 @@ struct ResourcePlan {
                                    entry.access,
                                    entry.version,
                                    entry.source,
-                                   entry.preserve_contents });
+                                   entry.preserve_contents,
+                                   entry.initialize_transparent });
         for (const auto& entry : buffers)
             result.buffers.push(
                 { entry.handle, entry.definition.clone(), entry.access, entry.version });

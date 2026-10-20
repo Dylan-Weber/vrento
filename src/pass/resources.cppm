@@ -20,14 +20,20 @@ struct TextureSpec {
     Option<String>                        allocation_family;
     Option<vrento::texture::TextureDesc>  metadata;
     Option<resource::TextureDefinitionId> source;
+    bool                                  initialize_history_transparent {};
     auto                                  source_request() const -> resource::TextureRequest {
         auto result = request().clone();
         if (source) result.source = source;
         return result;
     }
     auto clone() const -> TextureSpec {
-        return { key.clone(), imported, definition.clone(), allocation_family.clone(),
-                 metadata,    source };
+        return { key.clone(),
+                 imported,
+                 definition.clone(),
+                 allocation_family.clone(),
+                 metadata,
+                 source,
+                 initialize_history_transparent };
     }
 };
 struct TextureUse {
@@ -270,6 +276,8 @@ public:
                 existing.spec.imported != spec.imported ||
                 existing.spec.metadata != spec.metadata || existing.spec.source != spec.source ||
                 existing.spec.allocation_family != spec.allocation_family ||
+                existing.spec.initialize_history_transparent !=
+                    spec.initialize_history_transparent ||
                 ! resource::SameTextureRequest(existing.spec.request(), spec.request()))
                 return Err(fg::Error { fg::ErrorKind::Conflict, {}, existing.id });
             return Ok(fg::ResourceVersion { existing.id, 0 });
@@ -392,14 +400,25 @@ public:
             const auto* texture  = find(use.version.resource);
             const auto* version  = graph.find_version(use.version);
             const auto* resource = graph.find_resource(use.version.resource);
-            auto        request  = texture->spec.request().clone();
-            if (resource->imported && ! texture->spec.imported) {
-                request.lifetime = resource::TextureLifetimeClass::Retained;
-                request.content |=
-                    resource::TextureContentFlag(resource::TextureContent::PreserveAcrossFrames);
+            const auto& request  = texture->spec.request();
+            const bool  preserve = resource->imported && ! texture->spec.imported;
+            bool        initialize {};
+            if (preserve && texture->spec.initialize_history_transparent &&
+                request.kind == resource::TextureRequestKind::RenderTarget && request.definition &&
+                ! resource::HasTextureUsage(request.definition->usage,
+                                            resource::TextureUsage::DepthAttachment)) {
+                bool reads_initial {}, writes_current {};
+                for (const auto& pass : graph.passes())
+                    for (const auto& access : pass.uses)
+                        if (access.version.resource == texture->id) {
+                            reads_initial |=
+                                access.version.version == 0 && access.access == fg::Access::Read;
+                            writes_current |= access.access == fg::Access::Write;
+                        }
+                initialize = reads_initial && writes_current;
             }
             String key;
-            if (texture->spec.allocation_family &&
+            if (! preserve && texture->spec.allocation_family &&
                 request.lifetime == resource::TextureLifetimeClass::FrameLocal)
                 for (auto allocation : graph.inspect().allocations)
                     if (allocation.version == use.version)
@@ -411,16 +430,17 @@ public:
             for (const auto& pass : graph.passes())
                 for (const auto& access : pass.uses)
                     read |= access.version == use.version && access.access == fg::Access::Read;
-            result.textures.push(
-                { .handle            = use.handle,
-                  .definition        = texture->spec.definition.clone(),
-                  .allocation_key    = rstd::move(key),
-                  .access            = version->writer ? (read ? resource::ResourceAccess::ReadWrite
-                                                               : resource::ResourceAccess::Write)
-                                                       : resource::ResourceAccess::Read,
-                  .version           = u32(use.version.version),
-                  .source            = texture->spec.source,
-                  .preserve_contents = resource->imported && ! texture->spec.imported });
+            result.textures.push({ .handle         = use.handle,
+                                   .definition     = texture->spec.definition.clone(),
+                                   .allocation_key = rstd::move(key),
+                                   .access  = version->writer
+                                                  ? (read ? resource::ResourceAccess::ReadWrite
+                                                          : resource::ResourceAccess::Write)
+                                                  : resource::ResourceAccess::Read,
+                                   .version = u32(use.version.version),
+                                   .source  = texture->spec.source,
+                                   .preserve_contents      = preserve,
+                                   .initialize_transparent = initialize });
         }
         return Ok(rstd::move(result));
     }

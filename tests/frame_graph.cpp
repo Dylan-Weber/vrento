@@ -350,4 +350,69 @@ TEST(FrameGraphResources, StableIdentityKeepsGraphPolicyOutsideDefinition) {
         }
     }
 }
+
+TEST(FrameGraphResources, TransparentBootstrapRequiresExplicitOwnedColorFeedback) {
+    namespace resource = vrento::resource;
+    struct Case {
+        bool enabled, read_initial, write, imported, depth;
+        bool expected;
+    };
+    for (auto test : array<Case, 6> { Case { false, true, true, false, false, false },
+                                      Case { true, true, true, false, false, true },
+                                      Case { true, true, false, false, false, false },
+                                      Case { true, false, true, false, false, false },
+                                      Case { true, true, true, true, false, false },
+                                      Case { true, true, true, false, true, false } }) {
+        FrameGraphBuilder            graph(103);
+        vrento::pass::GraphResources resources(u64(103));
+        resource::TextureResourceRef definition(resource::TextureRequest {
+            .kind       = test.imported ? resource::TextureRequestKind::Imported
+                                        : resource::TextureRequestKind::RenderTarget,
+            .name       = "feedback"_Str,
+            .definition = Some(resource::TextureDefinition {
+                .width  = i32(8),
+                .height = i32(8),
+                .usage  = test.depth ? resource::TextureUsage::DepthAttachment
+                                     : resource::TextureUsage::Color }),
+            .lifetime   = resource::TextureLifetimeClass::FrameLocal });
+        vrento::pass::TextureSpec    spec { .key                            = "feedback"_Str,
+                                            .imported                       = test.imported,
+                                            .definition                     = definition.clone(),
+                                            .allocation_family              = Some("temporary"_Str),
+                                            .initialize_history_transparent = test.enabled };
+        auto                         initial = resources.initial(graph, spec.clone()).unwrap();
+        if (test.read_initial) {
+            resources.import_history(graph, initial).unwrap();
+            auto reader = graph.add_pass({ 1 }).unwrap();
+            graph.read(reader, initial.version()).unwrap();
+            resources.handle(initial).unwrap();
+        }
+        if (test.write) {
+            auto writer  = graph.add_pass({ 2 }).unwrap();
+            auto written = graph.write(writer, initial.version()).unwrap();
+            resources.handle(written).unwrap();
+            auto reader = graph.add_pass({ 3 }).unwrap();
+            graph.read(reader, written).unwrap();
+        }
+        auto built  = rstd::move(graph).finish().unwrap();
+        auto plan   = resources.resourcePlan(built).unwrap();
+        auto copied = plan.clone();
+        ASSERT_FALSE(plan.textures.is_empty());
+        for (usize index {}; index < plan.textures.len(); ++index) {
+            const auto& entry = plan.textures[index];
+            EXPECT_EQ(entry.initialize_transparent, test.expected);
+            EXPECT_EQ(copied.textures[index].initialize_transparent, test.expected);
+            EXPECT_EQ(entry.definition.id(), definition.id());
+            EXPECT_EQ(entry.definition.revision(), definition.revision());
+            EXPECT_TRUE(resource::SameTextureRequest(entry.request(), definition.definition()));
+            if (test.expected) {
+                EXPECT_TRUE(entry.preserve_contents);
+                EXPECT_TRUE(entry.allocation_key.is_empty());
+            }
+        }
+        auto bindings = resources.bindings(built, plan).unwrap();
+        for (const auto& binding : bindings.textures)
+            EXPECT_EQ(binding.content.texture()->revision(), definition.revision());
+    }
+}
 } // namespace vrento_test::frame_graph

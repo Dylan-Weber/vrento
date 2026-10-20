@@ -101,6 +101,10 @@ public:
         m_pending    = false;
         m_completion = rstd::move(completion);
     }
+    void CancelPending() {
+        m_pending = m_recorded = false;
+        m_receipt              = None();
+    }
     auto Pump(vulkan::TextureContext& context, double seconds)
         -> Result<empty, resource::ResourceError> {
         return m_producer.is_some() ? (*m_producer)->Pump(context, seconds) : Ok(empty {});
@@ -267,9 +271,13 @@ struct TexturePrepareBackend {
             -> Result<PreparedImageAllocation, resource::ResourceError> {
             return rstd::trait_call<1>(this, definition, transparent);
         }
+        auto InitializeTexture(Arc<TextureAllocation> allocation)
+            -> Result<PreparedImageAllocation, resource::ResourceError> {
+            return rstd::trait_call<2>(this, rstd::move(allocation));
+        }
     };
     template<typename T>
-    using Funcs = TraitFuncs<&T::CreateImportedTexture, &T::AllocateTexture>;
+    using Funcs = TraitFuncs<&T::CreateImportedTexture, &T::AllocateTexture, &T::InitializeTexture>;
 };
 
 struct TextureUploadPublisher {
@@ -472,6 +480,32 @@ public:
         return Queue(rstd::move(slots), {}, transparent);
     }
 
+    auto InitializeTexture(Arc<TextureAllocation> allocation)
+        -> Result<PreparedImageAllocation, resource::ResourceError> {
+        auto readiness = allocation->InitialReadiness();
+        if (readiness.is_err())
+            return Failure("texture readiness unavailable", Some(readiness.unwrap_err()));
+        if (readiness.unwrap() == ImageReadiness::Uncertain)
+            return Failure("texture initialization uncertain");
+        if (readiness.unwrap() != ImageReadiness::Allocated)
+            return Ok(PreparedImageAllocation { rstd::move(allocation), None() });
+        // Only bootstrap an allocation that has never received a submitted write.
+        for (const auto& slot : allocation->Slots())
+            if (slot.view.texture().content_revision() != 0)
+                return Ok(PreparedImageAllocation { rstd::move(allocation), None() });
+        if (allocation->Slots().is_empty()) return Failure("texture slots unavailable");
+        for (const auto& slot : allocation->Slots()) {
+            const auto& desc = slot.view.texture().description();
+            if (texture::format_layout(desc.format).aspect != texture::Aspect::Color ||
+                ! texture::has(desc.usage, texture::Usage::TransferDestination))
+                return Failure("texture cannot be initialized transparent");
+        }
+        auto window = MakeRoom();
+        if (window.is_err())
+            return Failure("texture upload window failed", Some(window.unwrap_err()));
+        return QueueUpdate(rstd::move(allocation), {}, true);
+    }
+
     bool HasPendingUploads() const { return ! m_pending.is_empty(); }
     auto PendingCount() const -> usize { return m_pending.len(); }
     auto InFlightCount() const -> usize { return m_in_flight.len(); }
@@ -534,6 +568,7 @@ public:
         m_images.retain([](const CachedImage& cached) {
             return cached.allocation->UploadCompletion().valid();
         });
+        for (const auto& pending : m_pending) pending.allocation->CancelPending();
         m_pending.clear();
         CancelRecording();
     }
@@ -680,6 +715,10 @@ private:
         }
         auto allocation = Arc<TextureAllocation>::make(
             rstd::move(slots), rstd::move(native), rstd::move(producer));
+        return QueueUpdate(rstd::move(allocation), rstd::move(uploads), transparent);
+    }
+    auto QueueUpdate(Arc<TextureAllocation> allocation, Vec<texture::TextureUpload> uploads,
+                     bool transparent) -> Result<PreparedImageAllocation, resource::ResourceError> {
         Option<vulkan::ImageUploadTicket> ticket;
         if (! uploads.is_empty() || transparent) {
             ++m_next_ticket;
@@ -722,6 +761,11 @@ struct Impl<vrento::resource_registry::TexturePrepareBackend,
         -> Result<vrento::resource_registry::PreparedImageAllocation,
                   vrento::resource::ResourceError> {
         return self().AllocateTexture(definition, transparent);
+    }
+    auto InitializeTexture(sync::Arc<vrento::resource_registry::TextureAllocation> allocation)
+        -> Result<vrento::resource_registry::PreparedImageAllocation,
+                  vrento::resource::ResourceError> {
+        return self().InitializeTexture(rstd::move(allocation));
     }
 };
 } // namespace rstd

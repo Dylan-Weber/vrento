@@ -839,7 +839,27 @@ public:
                 physical = m_textures.ResolveCurrent(handle);
                 if (! physical) physical = m_textures.ResolvePending(handle);
             }
+            const bool initialize_transparent =
+                entry.initialize_transparent ||
+                (entry.request().content &
+                 resource::TextureContentFlag(resource::TextureContent::InitializeTransparent)) !=
+                    u32();
             if (physical.is_some()) {
+                if (initialize_transparent) {
+                    if (! m_textures_backend)
+                        return Err(TextureFailure(
+                            resource::ResourceError { resource::ResourceErrorKind::Closed },
+                            entry.definition,
+                            entry.handle));
+                    auto initialized =
+                        (*m_textures_backend)->InitializeTexture((*physical)->allocation.clone());
+                    if (initialized.is_err())
+                        return Err(TextureFailure(
+                            initialized.unwrap_err(), entry.definition, entry.handle));
+                    if (initialized->upload)
+                        (void)m_textures.Publish(
+                            handle, initialized->allocation.clone(), initialized->upload);
+                }
                 auto inserted = InsertPrepared(
                     entry.handle, handle, entry.definition.clone(), **physical, session.m_table);
                 if (inserted.is_err())
@@ -852,10 +872,6 @@ public:
                 auto allocation_request = entry.request().clone();
                 if (! entry.allocation_key.is_empty())
                     allocation_request.name = entry.allocation_key.clone();
-                const bool initialize_transparent =
-                    (entry.request().content &
-                     resource::TextureContentFlag(
-                         resource::TextureContent::InitializeTransparent)) != u32();
                 if (initialize_transparent) {
                     auto prepared = AllocateTransparentTexture(allocation_request);
                     if (prepared.is_err()) {
