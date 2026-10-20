@@ -101,6 +101,112 @@ TEST(FrameGraph, InPlaceAndHistory) {
     retry.depends_on(consume, update).unwrap();
     rstd_assert(rstd::move(retry).finish().unwrap_err().kind == ErrorKind::Cycle);
 }
+TEST(FrameGraph, InPlaceChainsKeepStorageDependenciesLinear) {
+    constexpr unsigned nodes = 768;
+    for (bool inherits : array<bool, 2> { false, true }) {
+        FrameGraphBuilder graph(21);
+        auto              description = texture(1);
+        description.storage           = 1;
+        auto value                    = graph.import_resource(rstd::move(description)).unwrap();
+        for (unsigned index {}; index < nodes; ++index) {
+            auto pass = graph.add_pass({ index + 1 }).unwrap();
+            value     = graph.write(pass, value, None(), true, inherits).unwrap();
+        }
+        auto result = rstd::move(graph).finish({ .dependencies = nodes - 1 });
+        ASSERT_TRUE(result.is_ok());
+        const auto& compiled = result.unwrap();
+        EXPECT_EQ(compiled.inspect().dependencies.len(), usize(nodes - 1));
+        EXPECT_TRUE(compiled.inspect().precedes(0, nodes - 1));
+    }
+}
+TEST(FrameGraph, OldVersionReadersRemainBeforeStorageOverwrite) {
+    FrameGraphBuilder graph(22);
+    auto              initial        = graph.import_resource(texture(1)).unwrap();
+    auto              first          = graph.add_pass({ 1 }, { 1 }).unwrap();
+    auto              a              = graph.write(first, initial, None(), true).unwrap();
+    auto              second         = graph.add_pass({ 2 }, { 2 }).unwrap();
+    auto              b              = graph.write(second, a, None(), true).unwrap();
+    auto              initial_reader = graph.add_pass({ 3 }, { 3 }).unwrap();
+    graph.read(initial_reader, initial).unwrap();
+    auto first_reader = graph.add_pass({ 4 }, { 4 }).unwrap();
+    graph.read(first_reader, a).unwrap();
+    auto other_reader = graph.add_pass({ 5 }, { 5 }).unwrap();
+    graph.read(other_reader, a).unwrap();
+    graph.read(graph.add_pass({ 6 }, { 6 }).unwrap(), b).unwrap();
+    auto compiled = rstd::move(graph).finish().unwrap();
+    EXPECT_TRUE(compiled.inspect().precedes(2, 0));
+    EXPECT_TRUE(compiled.inspect().precedes(0, 3));
+    EXPECT_TRUE(compiled.inspect().precedes(0, 4));
+    EXPECT_TRUE(compiled.inspect().precedes(3, 1));
+    EXPECT_TRUE(compiled.inspect().precedes(4, 1));
+    EXPECT_TRUE(compiled.inspect().precedes(1, 5));
+    EXPECT_FALSE(compiled.inspect().precedes(3, 4));
+    EXPECT_FALSE(compiled.inspect().precedes(4, 3));
+
+    auto reordered = compiled.clone_data();
+    auto versions  = rstd::move(reordered.versions);
+    for (usize index = versions.len(); index > usize(); --index)
+        reordered.versions.push(VersionNode(versions[index - usize(1)]));
+    auto rebuilt = FrameGraph::create(rstd::move(reordered)).unwrap();
+    EXPECT_EQ(rebuilt.inspect().order, compiled.inspect().order);
+}
+TEST(FrameGraph, StorageFrontierPreservesUncoveredBufferRanges) {
+    FrameGraphBuilder graph(23);
+    auto              initial =
+        graph.import_resource({ .id = { 1, 1 }, .kind = ResourceKind::Buffer, .bytes = 64 })
+            .unwrap();
+    const ResourceRange left { .size = 32 };
+    const ResourceRange right { .offset = 32, .size = 32 };
+    auto                read_initial = graph.add_pass({ 1 }, { 1 }).unwrap();
+    graph.read(read_initial, initial, Some(ResourceRange(right))).unwrap();
+    auto first     = graph.add_pass({ 2 }, { 2 }).unwrap();
+    auto a         = graph.write(first, initial, Some(ResourceRange(left)), true).unwrap();
+    auto read_left = graph.add_pass({ 3 }, { 3 }).unwrap();
+    graph.read(read_left, a, Some(ResourceRange(left))).unwrap();
+    auto second = graph.add_pass({ 4 }, { 4 }).unwrap();
+    auto b      = graph.write(second, a, Some(ResourceRange(right)), true).unwrap();
+    auto third  = graph.add_pass({ 5 }, { 5 }).unwrap();
+    graph.write(third, b, Some(ResourceRange(left)), true).unwrap();
+    auto compiled = rstd::move(graph).finish().unwrap();
+    EXPECT_TRUE(compiled.inspect().precedes(0, 3));
+    EXPECT_TRUE(compiled.inspect().precedes(1, 2));
+    EXPECT_TRUE(compiled.inspect().precedes(2, 4));
+    EXPECT_FALSE(compiled.inspect().precedes(0, 1));
+    EXPECT_FALSE(compiled.inspect().precedes(1, 3));
+    EXPECT_FALSE(compiled.inspect().precedes(3, 4));
+}
+TEST(FrameGraph, StorageFrontierPreservesUncoveredTextureSubresources) {
+    FrameGraphBuilder graph(24);
+    auto              description = texture(1);
+    description.mip_levels        = 2;
+    description.layers            = 2;
+    description.aspects           = 3;
+    auto                initial   = graph.import_resource(rstd::move(description)).unwrap();
+    const ResourceRange color { .aspect = 1 };
+    const ResourceRange depth { .aspect = 2 };
+    const ResourceRange other_mip { .aspect = 1, .first_mip = 1 };
+    const ResourceRange other_layer { .aspect = 1, .first_layer = 1 };
+    auto                reader = graph.add_pass({ 1 }, { 1 }).unwrap();
+    graph.read(reader, initial).unwrap();
+    auto first  = graph.add_pass({ 2 }, { 2 }).unwrap();
+    auto a      = graph.write(first, initial, Some(ResourceRange(color)), true).unwrap();
+    auto second = graph.add_pass({ 3 }, { 3 }).unwrap();
+    auto b      = graph.write(second, a, Some(ResourceRange(depth)), true).unwrap();
+    auto third  = graph.add_pass({ 4 }, { 4 }).unwrap();
+    auto c      = graph.write(third, b, Some(ResourceRange(other_mip)), true).unwrap();
+    auto fourth = graph.add_pass({ 5 }, { 5 }).unwrap();
+    graph.write(fourth, c, Some(ResourceRange(other_layer)), true).unwrap();
+    auto compiled = rstd::move(graph).finish().unwrap();
+    EXPECT_TRUE(compiled.inspect().precedes(0, 1));
+    EXPECT_TRUE(compiled.inspect().precedes(0, 2));
+    EXPECT_TRUE(compiled.inspect().precedes(0, 3));
+    EXPECT_TRUE(compiled.inspect().precedes(0, 4));
+    EXPECT_FALSE(compiled.inspect().precedes(1, 2));
+    EXPECT_FALSE(compiled.inspect().precedes(1, 3));
+    EXPECT_FALSE(compiled.inspect().precedes(1, 4));
+    EXPECT_FALSE(compiled.inspect().precedes(2, 3));
+    EXPECT_FALSE(compiled.inspect().precedes(3, 4));
+}
 TEST(FrameGraph, ParallelQueuesCannotAlias) {
     FrameGraphBuilder graph(1);
     auto              a      = graph.create_resource(texture(1)).unwrap();

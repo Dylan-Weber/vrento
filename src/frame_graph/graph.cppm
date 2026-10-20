@@ -474,20 +474,57 @@ auto FrameGraph::analyze(const FrameGraphData& data, Limits limits)
                     if (! edge(before, p, DependencySource::Contents))
                         return Err(Error { ErrorKind::Limit });
                 }
-            } else {
-                auto kind = data.resources[usize(resource_index(use.version.resource))].kind;
-                for (Index q {}; q < data.passes.len().to_primitive(); ++q)
-                    for (const auto& prior : data.passes[usize(q)].uses) {
-                        if (q == p || prior.version.resource != use.version.resource ||
-                            prior.version.version >= use.version.version ||
-                            root(version_index(prior.version)) != root(v) ||
-                            ! overlaps(kind, prior.range, use.range))
-                            continue;
-                        if (! edge(q, p, DependencySource::Storage))
-                            return Err(Error { ErrorKind::Limit });
-                    }
             }
         }
+
+    struct StorageAccess {
+        Index         pass;
+        ResourceRange range;
+    };
+    HashMap<u64, Vec<StorageAccess>> frontiers;
+    Vec<Index>                       ordered_versions;
+    for (Index v {}; v < data.versions.len().to_primitive(); ++v) ordered_versions.push(Index(v));
+    rstd::slice_::sort_unstable_by(ordered_versions.as_mut_slice().as_mut_ref(),
+                                   [&](Index a, Index b) {
+                                       const auto& left  = data.versions[usize(a)].id;
+                                       const auto& right = data.versions[usize(b)].id;
+                                       if (left.resource.value != right.resource.value)
+                                           return left.resource.value < right.resource.value;
+                                       return left.version < right.version;
+                                   });
+    for (auto v : ordered_versions) {
+        const auto& node  = data.versions[usize(v)];
+        auto        r     = resource_index(node.id.resource);
+        auto        kind  = data.resources[usize(r)].kind;
+        auto        key   = u64((Serial(r) << 32) | root(v));
+        auto        found = frontiers.get_mut(key);
+        if (found.is_none()) {
+            (void)frontiers.insert(u64(key), Vec<StorageAccess> {});
+            found = frontiers.get_mut(key);
+        }
+        auto& frontier = **found;
+        if (node.writer) {
+            auto p = pass_index(*node.writer);
+            for (auto written : writes[usize(v)]) {
+                Vec<StorageAccess> remaining;
+                for (const auto& prior : frontier) {
+                    if (p != prior.pass && overlaps(kind, prior.range, written) &&
+                        ! edge(prior.pass, p, DependencySource::Storage))
+                        return Err(Error { ErrorKind::Limit });
+                    // The new writer orders covered accesses transitively; keep uncovered
+                    // ranges so partial writes cannot hide outstanding storage hazards.
+                    auto pieces = subtract_range(kind, prior.range, written);
+                    for (auto range : pieces) remaining.push({ prior.pass, range });
+                }
+                remaining.push({ p, written });
+                frontier = rstd::move(remaining);
+            }
+        }
+        for (auto p : version_uses[usize(v)])
+            for (const auto& use : data.passes[usize(p)].uses)
+                if (use.access == Access::Read && use.version == node.id)
+                    frontier.push({ p, use.range });
+    }
     for (auto exported : data.exports) {
         auto r = resource_index(exported.resource), v = version_index(exported);
         if (r == invalid_index || v == invalid_index)
