@@ -203,8 +203,8 @@ TEST(TextureVulkan, UploadLayoutsPreserveMipAndLayerPayloads) {
     auto  session = vk::DeviceSession::create({ .validation = true }).unwrap();
     auto  device  = vk::TextureContext::create(session).unwrap();
     usize tested_formats {};
-    for (auto format : array<vrento::TextureFormat, 2> { vrento::TextureFormat::RGBA8,
-                                                         vrento::TextureFormat::BC1 }) {
+    for (auto format : array<vrento::TextureFormat, 3> { vrento::TextureFormat::RGBA8,
+                                                         vrento::TextureFormat::BC1, vrento::TextureFormat::R11G11B10F }) {
         tex::TextureDesc desc;
         desc.dimension  = tex::Dimension::Array2D;
         desc.extent     = { 12, 8 };
@@ -253,6 +253,7 @@ TEST(TextureVulkan, UploadLayoutsPreserveMipAndLayerPayloads) {
                 }
             }
         }
+        if (format==vrento::TextureFormat::R11G11B10F) rstd::io::println("R11G11B10F mip, layer and pitched payloads verified");
     }
     EXPECT_GT(tested_formats, usize());
     EXPECT_EQ(session.validation_errors(), 0u);

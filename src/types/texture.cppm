@@ -18,7 +18,8 @@ enum class TextureFormat
     RGBA32F,
     BGRA8,
     BGRA8_SRGB,
-    RGBA16F
+    RGBA16F,
+    R11G11B10F
 };
 enum class TextureWrap
 {

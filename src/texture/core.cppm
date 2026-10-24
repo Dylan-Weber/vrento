@@ -139,6 +139,7 @@ inline auto format_layout(TextureFormat format) -> FormatLayout {
     case TextureFormat::RGBA8:
     case TextureFormat::RGBA8_SRGB:
     case TextureFormat::BGRA8:
+    case TextureFormat::R11G11B10F:
     case TextureFormat::BGRA8_SRGB: return { 1, 1, 4 };
     case TextureFormat::RG8: return { 1, 1, 2 };
     case TextureFormat::R8: return { 1, 1, 1 };
