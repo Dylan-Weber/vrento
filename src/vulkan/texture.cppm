@@ -100,7 +100,7 @@ inline auto texture_format(VkFormat format) -> Result<TextureFormat, tex::Error>
                              TextureFormat::R8,         TextureFormat::D32F,
                              TextureFormat::RGBA8_SRGB, TextureFormat::RGBA32F,
                              TextureFormat::BGRA8,      TextureFormat::BGRA8_SRGB,
-                             TextureFormat::RGBA16F, TextureFormat::R11G11B10F };
+                             TextureFormat::RGBA16F,    TextureFormat::R11G11B10F };
     for (auto value : values)
         if (ToVkType(value) == format) return Ok(TextureFormat(value));
     return Err(tex::Error { tex::ErrorKind::Unsupported });
@@ -1004,6 +1004,7 @@ public:
     auto Begin() -> Result<tex::Submission, tex::Error>;
     auto Submit(tex::Submission work) -> Result<tex::SubmissionToken, tex::Error>;
     auto Poll() -> Result<empty, tex::Error>;
+    bool hasPendingSubmissions() const { return ! pending_.is_empty() || ! producers_.is_empty(); }
     auto wait(const tex::SubmissionToken& token, tex::Serial timeout = 5'000'000'000)
         -> Result<empty, tex::Error>;
 };

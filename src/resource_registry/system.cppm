@@ -231,6 +231,7 @@ struct ResourceStatistics {
     u64                            buffer_allocations {};
     vulkan::BufferUploadStatistics buffer_uploads;
     TexturePreparationStatistics   textures;
+    vulkan::UploadCacheStatistics  upload_cache;
 };
 class RenderResourceSystem {
 public:
@@ -238,7 +239,8 @@ public:
         if (! Ready()) return {};
         return { m_registries.Buffers().Allocations(),
                  m_registries.BufferManager().statistics(),
-                 m_registries.Textures().Statistics() };
+                 m_registries.Textures().Statistics(),
+                 m_registries.BufferManager().uploadCacheStatistics() };
     }
     ~RenderResourceSystem() {
         m_prepare_session = None();
@@ -939,18 +941,26 @@ public:
         return Ok(empty {});
     }
 
-    void Collect(mut_ref<dyn<vulkan::MemoryBudgetSource>> memory) { Collect(memory.as_ref()); }
-    void Collect(ref<dyn<vulkan::MemoryBudgetSource>> memory) {
+    bool Collect(mut_ref<dyn<vulkan::MemoryBudgetSource>> memory) {
+        return Collect(memory.as_ref());
+    }
+    bool Collect(ref<dyn<vulkan::MemoryBudgetSource>> memory) {
+        if (! Ready()) return false;
+        auto polled = m_registries.Textures().Poll();
+        if (polled.is_err()) return false;
         m_registries.PipelineCache().PruneExpired();
         m_registries.PipelineLayouts().PruneExpired();
         m_registries.RenderPassCache().PruneExpired();
         m_registries.FramebufferCache().PruneExpired();
         m_registries.Memory().Refresh(memory);
-        if (! m_registries.Memory().ShouldEvictTransient()) return;
-        m_registries.TextureEntries().EvictUnused();
-        m_registries.Buffers().EvictUnused();
-        m_registries.BufferManager().Trim();
-        (void)m_registries.Textures().Poll();
+        if (m_registries.Memory().ShouldEvictTransient()) {
+            m_registries.TextureEntries().EvictUnused();
+            m_registries.Buffers().EvictUnused();
+            m_registries.BufferManager().Trim();
+        }
+        const bool cached =
+            m_registries.BufferManager().CollectUploadCache(m_registries.Memory().upload_cache);
+        return cached || TextureContext().hasPendingSubmissions();
     }
 
     auto TryPumpTextureProducers(double seconds) -> Result<empty, resource::ResourceError> {

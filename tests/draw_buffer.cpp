@@ -92,7 +92,7 @@ TEST(DrawBuffer, Allocations) {
     writer.fail_on = usize();
     rstd_assert(
         RenderBufferResolver::updateDrawBuffers(request, reprepared, sink.as_mut_ref()).is_ok());
-    rstd_assert(writer.writes == usize(6));
+    rstd_assert(writer.writes == usize(5));
     rstd_assert(reprepared.content_confirmed);
     writer.writes       = usize();
     auto old_generation = primary.vertex_keys[usize()].data_generation;
@@ -103,19 +103,19 @@ TEST(DrawBuffer, Allocations) {
     auto failed    = RenderBufferResolver::updateDrawBuffers(request, primary, sink.as_mut_ref());
     rstd_assert(failed.is_err());
     rstd_assert(failed.unwrap_err_unchecked().kind == DrawBufferUpdateErrorKind::UploadFailed);
-    rstd_assert(primary.vertex_keys[usize()].data_generation == old_generation);
+    rstd_assert(primary.vertex_keys[usize()].data_generation != old_generation);
     rstd_assert(primary.draw_count == u32(2));
     writer.fail_on = usize();
     rstd_assert(
         RenderBufferResolver::updateDrawBuffers(request, primary, sink.as_mut_ref()).is_ok());
-    rstd_assert(writer.writes == usize(4));
+    rstd_assert(writer.writes == usize(3));
     rstd_assert(primary.draw_count == u32());
     rstd_assert(
         RenderBufferResolver::updateDrawBuffers(request, reflection, sink.as_mut_ref()).is_ok());
-    rstd_assert(writer.writes == usize(6));
+    rstd_assert(writer.writes == usize(5));
     rstd_assert(
         RenderBufferResolver::updateDrawBuffers(request, primary, sink.as_mut_ref()).is_ok());
-    rstd_assert(writer.writes == usize(6));
+    rstd_assert(writer.writes == usize(5));
 
     auto        storage = first.BufferView().storage_generation;
     VertexArray moved(rstd::move(first));
@@ -126,19 +126,19 @@ TEST(DrawBuffer, Allocations) {
     auto replaced = RenderBufferResolver::updateDrawBuffers(request, primary, sink.as_mut_ref());
     rstd_assert(replaced.is_ok());
     rstd_assert(replaced.unwrap() == DrawUpdateOutcome::NeedsReprepare);
-    rstd_assert(writer.writes == usize(6));
+    rstd_assert(writer.writes == usize(5));
 
     geometry.index      = Some(indices.BufferView());
     request.buffer_uses = uses.as_slice();
     auto indexed        = resolver.prepareDrawBuffers(request).unwrap();
     rstd_assert(
         RenderBufferResolver::updateDrawBuffers(request, indexed, sink.as_mut_ref()).is_ok());
-    rstd_assert(writer.writes == usize(9));
+    rstd_assert(writer.writes == usize(8));
     indices.SetRenderDataCount(usize(1));
     geometry.index = Some(indices.BufferView());
     rstd_assert(
         RenderBufferResolver::updateDrawBuffers(request, indexed, sink.as_mut_ref()).is_ok());
-    rstd_assert(indexed.draw_count == u32(1) && writer.writes == usize(9));
+    rstd_assert(indexed.draw_count == u32(1) && writer.writes == usize(8));
     geometry.index = None<GeometryBufferView>();
     rstd_assert(
         RenderBufferResolver::updateDrawBuffers(request, indexed, sink.as_mut_ref()).unwrap() ==
@@ -164,10 +164,10 @@ TEST(DrawBuffer, Allocations) {
     auto changed_static =
         RenderBufferResolver::updateDrawBuffers(request, retained, sink.as_mut_ref());
     rstd_assert(changed_static.is_ok());
-    rstd_assert(writer.writes == usize(10));
+    rstd_assert(writer.writes == usize(9));
     rstd_assert(
         RenderBufferResolver::updateDrawBuffers(request, retained, sink.as_mut_ref()).is_ok());
-    rstd_assert(writer.writes == usize(10));
+    rstd_assert(writer.writes == usize(9));
 
     GeometryView empty;
     auto         empty_request = DrawBufferRequest { .geometry = empty };

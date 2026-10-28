@@ -16,6 +16,7 @@ enum class MemoryPressure
 
 class MemoryBudgetPolicy {
 public:
+    vulkan::UploadCachePolicy upload_cache;
     void Refresh(ref<dyn<vulkan::MemoryBudgetSource>> source) { Refresh(source->MemoryBudget()); }
 
     void Refresh(vulkan::MemoryBudgetSnapshot snapshot) {

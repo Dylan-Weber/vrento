@@ -511,6 +511,53 @@ TEST(BackendErrors, BufferRangeBusyAndCancellation) {
     buffers.TryQueueWrite(allocation, data).unwrap();
     EXPECT_EQ(session.validation_errors(), 0u);
 }
+TEST(BufferUploadCache, RetiresOnlyIdleBlocksAndReusesWorkingSet) {
+    auto          session = DeviceSession::create({ .validation = true }).unwrap();
+    auto          queue   = TextureContext::create(session).unwrap();
+    BufferManager buffers(session.device());
+    ASSERT_TRUE(buffers.init());
+    constexpr VkDeviceSize block_size = 2 * 1024 * 1024;
+    auto                   allocation = buffers.TryAllocate({ .size = 3 * block_size }).unwrap();
+    Vec<rstd::uint8_t>     bytes;
+    bytes.resize(usize(block_size), rstd::uint8_t());
+    auto              now = rstd::time::Instant::now();
+    UploadCachePolicy policy { .max_idle_bytes = 2 * block_size,
+                               .idle_timeout   = rstd::time::Duration::from_secs(u64(2)) };
+    auto              upload = [&](unsigned count) {
+        for (unsigned i {}; i < count; ++i)
+            buffers.TryQueueWrite(allocation, bytes.as_slice(), i * block_size).unwrap();
+        EXPECT_FALSE(buffers.CollectUploadCache(policy, now));
+        EXPECT_EQ(buffers.uploadCacheStatistics().active_bytes, count * bytes.len().to_primitive());
+        auto                  work   = queue.Begin().unwrap();
+        auto                  native = native_recording(work, session).unwrap();
+        vvk::CommandBuffer    command(native, session.device().handle().Dispatch());
+        RecordedBufferUploads recorded;
+        buffers.TryPreparePendingUploads(recorded).unwrap();
+        buffers.TryRecordUploads(command, recorded).unwrap();
+        auto lease = buffers.CommitRecordedUploads(rstd::move(recorded)).unwrap();
+        work.retain(rstd::move(lease));
+        EXPECT_FALSE(buffers.CollectUploadCache(policy, now));
+        auto token = queue.Submit(rstd::move(work)).unwrap();
+        queue.wait(token).unwrap();
+    };
+    upload(3);
+    EXPECT_EQ(buffers.uploadCacheStatistics().allocations, u64(3));
+    EXPECT_TRUE(buffers.CollectUploadCache(policy, now));
+    EXPECT_EQ(buffers.uploadCacheStatistics().idle_bytes, 2 * block_size);
+    upload(2);
+    EXPECT_EQ(buffers.uploadCacheStatistics().allocations, u64(3));
+    EXPECT_TRUE(buffers.CollectUploadCache(policy, now));
+    EXPECT_TRUE(buffers.CollectUploadCache(policy, now + rstd::time::Duration::from_secs(u64(1))));
+    EXPECT_FALSE(buffers.CollectUploadCache(policy, now + policy.idle_timeout));
+    EXPECT_EQ(buffers.uploadCacheStatistics().blocks, u64());
+
+    bytes.resize(usize(3 * block_size), rstd::uint8_t());
+    upload(1);
+    EXPECT_FALSE(buffers.CollectUploadCache(policy, now));
+    EXPECT_EQ(buffers.uploadCacheStatistics().blocks, u64());
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
+
 TEST(BackendErrors, TextureSnapshotPreservesAllocationFailure) {
     auto make = [] {
         vvk::MemoryError memory { .kind            = vvk::MemoryErrorKind::PoolCapacity,

@@ -81,6 +81,7 @@ auto BuildDrawBufferKeys(const DrawBufferPrepareRequest& request, u64 allocation
             .storage_generation    = view.storage_generation,
             .capacity              = view.capacity,
             .stride                = view.stride,
+            .content_confirmed     = ! request.geometry.dynamic,
         });
     };
     for (usize i {}; i < request.geometry.vertices.len(); ++i)
@@ -175,20 +176,22 @@ auto RenderBufferResolver::updateDrawBuffers(const DrawBufferRequest&           
                                      ! SameStorage(*buffers.index_key, *geometry.index)))
         return reprepare();
 
+    buffers.content_confirmed = false;
     for (usize i {}; i < geometry.vertices.len(); ++i) {
         const auto& view = geometry.vertices[i];
-        if (buffers.content_confirmed &&
-            buffers.vertex_keys[i].data_generation == view.data_generation)
-            continue;
+        auto&       key  = buffers.vertex_keys[i];
+        if (key.content_confirmed && key.data_generation == view.data_generation) continue;
         auto updated = writer->UpdateBuffer(buffers.vertices[i], view.bytes);
         if (updated.is_err())
             return Err(
                 DrawBufferUpdateError { DrawBufferUpdateErrorKind::UploadFailed,
                                         "buffer upload failed"_Str,
                                         resource::ResourceErrorSnapshot(updated.unwrap_err()) });
+        key.data_generation   = view.data_generation;
+        key.content_confirmed = true;
     }
     if (geometry.index.is_some() &&
-        (! buffers.content_confirmed ||
+        (! buffers.index_key->content_confirmed ||
          buffers.index_key->data_generation != geometry.index->data_generation)) {
         auto updated = writer->UpdateBuffer(*buffers.index, geometry.index->bytes);
         if (updated.is_err())
@@ -196,12 +199,9 @@ auto RenderBufferResolver::updateDrawBuffers(const DrawBufferRequest&           
                 DrawBufferUpdateError { DrawBufferUpdateErrorKind::UploadFailed,
                                         "buffer upload failed"_Str,
                                         resource::ResourceErrorSnapshot(updated.unwrap_err()) });
+        buffers.index_key->data_generation   = geometry.index->data_generation;
+        buffers.index_key->content_confirmed = true;
     }
-    // Confirm only after all writes succeed; a partial failure retries unchanged input.
-    for (usize i {}; i < geometry.vertices.len(); ++i)
-        buffers.vertex_keys[i].data_generation = geometry.vertices[i].data_generation;
-    if (geometry.index.is_some())
-        buffers.index_key->data_generation = geometry.index->data_generation;
     buffers.draw_count        = *count;
     buffers.content_confirmed = true;
     return Ok(DrawUpdateOutcome::Updated);

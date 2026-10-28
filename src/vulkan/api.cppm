@@ -581,12 +581,18 @@ struct ImageSlotsRef {
 
 // ---------- Swapchain.hpp ----------
 
-enum class PresentationMode { Fifo, Immediate, Mailbox, FifoRelaxed };
+enum class PresentationMode
+{
+    Fifo,
+    Immediate,
+    Mailbox,
+    FifoRelaxed
+};
 struct SwapchainOptions {
     bool              require_srgb { false };
     VkImageUsageFlags usage { VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT };
-    PresentationMode presentation { PresentationMode::Fifo };
+    PresentationMode  presentation { PresentationMode::Fifo };
 };
 
 class Swapchain {
@@ -1030,6 +1036,16 @@ struct BufferUploadStatistics {
     rstd::uint64_t recorded_copies[5] {}, recorded_bytes[5] {};
 };
 
+struct UploadCachePolicy {
+    VkDeviceSize         max_idle_bytes { 32 * 1024 * 1024 };
+    rstd::time::Duration idle_timeout { rstd::time::Duration::from_secs(u64(5)) };
+};
+
+struct UploadCacheStatistics {
+    VkDeviceSize active_bytes {}, idle_bytes {}, peak_bytes {};
+    u64          blocks {}, allocations {};
+};
+
 class BufferManager {
 public:
     BufferManager(const BufferManager&)            = delete;
@@ -1056,6 +1072,10 @@ public:
 
     bool HasPendingUploads() const noexcept;
     auto statistics() const -> BufferUploadStatistics;
+    auto uploadCacheStatistics() const -> UploadCacheStatistics;
+    // Returns whether idle blocks still have a retirement deadline.
+    bool CollectUploadCache(const UploadCachePolicy& = {},
+                            rstd::time::Instant now  = rstd::time::Instant::now());
     bool PreparePendingUploads(RecordedBufferUploads& prepared);
     bool RecordUploads(vvk::CommandBuffer& cmd, RecordedBufferUploads& prepared);
     bool RecordPendingUploads(vvk::CommandBuffer& cmd, RecordedBufferUploads& recorded);

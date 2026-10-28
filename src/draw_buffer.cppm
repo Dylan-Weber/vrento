@@ -26,6 +26,7 @@ struct DrawBufferKey {
     u64            storage_generation {};
     usize          capacity {};
     usize          stride {};
+    bool           content_confirmed {};
 };
 
 struct DrawBufferRefs {

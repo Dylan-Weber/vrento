@@ -127,6 +127,7 @@ public:
     }
 
     void Reset() {
+        idle_since        = None();
         m_cursor          = 0;
         m_allocated_bytes = 0;
         m_touched_begin   = m_size;
@@ -165,6 +166,8 @@ public:
     VkDeviceSize allocated_bytes() const noexcept { return m_allocated_bytes; }
 
     UploadBlock(const Device& device, VkDeviceSize size): m_device(device), m_size(size) {}
+
+    Option<rstd::time::Instant> idle_since;
 
 private:
     auto Initialize() -> Result<rstd::empty, BackendError> {
@@ -258,6 +261,8 @@ struct BufferManager::Impl {
     Vec<Arc<UploadBlock>>                     upload_blocks;
     Option<Arc<RecordedBufferUploads::State>> pending;
     BufferUploadStatistics                    statistics;
+    VkDeviceSize                              peak_upload_bytes {};
+    u64                                       upload_allocations {};
 };
 
 struct ImageUploadManager::Impl {
@@ -509,6 +514,10 @@ auto BufferManager::TryQueueWrite(BufferAllocation& allocation, slice<rstd::uint
                 return Err(
                     BackendError { "allocate upload range"_Str, BackendCause::Capacity(required) });
             m_impl->upload_blocks.push(block->clone());
+            ++m_impl->upload_allocations;
+            VkDeviceSize total {};
+            for (const auto& allocated : m_impl->upload_blocks) total += allocated->size();
+            m_impl->peak_upload_bytes = max(m_impl->peak_upload_bytes, total);
             rstd_info("new upload buffer block, size: {}, blocks: {}",
                       block_size,
                       m_impl->upload_blocks.len());
@@ -572,6 +581,36 @@ auto BufferManager::TryQueueZero(BufferAllocation& allocation)
 }
 
 auto BufferManager::statistics() const -> BufferUploadStatistics { return m_impl->statistics; }
+
+auto BufferManager::uploadCacheStatistics() const -> UploadCacheStatistics {
+    UploadCacheStatistics result { .peak_bytes  = m_impl->peak_upload_bytes,
+                                   .blocks      = u64(m_impl->upload_blocks.len().to_primitive()),
+                                   .allocations = m_impl->upload_allocations };
+    for (const auto& block : m_impl->upload_blocks) {
+        if (block.strong_count() == usize(1))
+            result.idle_bytes += block->size();
+        else
+            result.active_bytes += block->size();
+    }
+    return result;
+}
+
+bool BufferManager::CollectUploadCache(const UploadCachePolicy& policy, rstd::time::Instant now) {
+    VkDeviceSize kept {};
+    m_impl->upload_blocks.retain([&](const auto& block) {
+        if (block.strong_count() != usize(1)) {
+            block->idle_since = None();
+            return true;
+        }
+        if (! block->idle_since) block->idle_since = Some(now);
+        if (now - *block->idle_since >= policy.idle_timeout ||
+            block->size() > policy.max_idle_bytes - kept)
+            return false;
+        kept += block->size();
+        return true;
+    });
+    return kept != 0;
+}
 auto BufferAllocation::usage() const noexcept -> BufferUploadClass {
     return m_state ? (*m_state)->usage : BufferUploadClass::Vertex;
 }
