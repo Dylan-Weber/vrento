@@ -25,6 +25,7 @@ VkFormat ToVkType(TextureFormat format) {
     case TextureFormat::BGRA8_SRGB: return VK_FORMAT_B8G8R8A8_SRGB;
     case TextureFormat::RGBA16F: return VK_FORMAT_R16G16B16A16_SFLOAT;
     case TextureFormat::R11G11B10F: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    case TextureFormat::R16F: return VK_FORMAT_R16_SFLOAT;
     }
     rstd_assert(false);
     return VK_FORMAT_UNDEFINED;
