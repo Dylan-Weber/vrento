@@ -1632,8 +1632,8 @@ auto TextureContext::CreateSampler(const tex::SamplerDesc& desc)
             p.minFilter == s.minFilter && p.mipFilter == s.mipFilter &&
             p.compare_enable == s.compare_enable && p.compare_op == s.compare_op &&
             p.border_color == s.border_color && d.wrap_w == desc.wrap_w &&
-            d.min_lod == desc.min_lod && d.max_lod == desc.max_lod && d.lod_bias == desc.lod_bias &&
-            d.max_anisotropy == desc.max_anisotropy)
+            p.max_anisotropy == s.max_anisotropy && d.min_lod == desc.min_lod &&
+            d.max_lod == desc.max_lod && d.lod_bias == desc.lod_bias)
             return Ok(tex::SamplerRef(previous));
     }
     VkSamplerCreateInfo info { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -1647,10 +1647,11 @@ auto TextureContext::CreateSampler(const tex::SamplerDesc& desc)
     info.mipLodBias   = desc.lod_bias;
     info.minLod       = desc.min_lod;
     info.maxLod       = s.mipFilter == TextureMipmapFilter::None ? 0 : desc.max_lod;
-    if (desc.max_anisotropy > 1 && session().device().sampler_anisotropy()) {
+    if (s.max_anisotropy > 1 && session().device().sampler_anisotropy()) {
         const float limit     = session().device().limits().maxSamplerAnisotropy;
+        const float wanted    = static_cast<float>(s.max_anisotropy);
         info.anisotropyEnable = VK_TRUE;
-        info.maxAnisotropy    = desc.max_anisotropy < limit ? desc.max_anisotropy : limit;
+        info.maxAnisotropy    = wanted < limit ? wanted : limit;
     }
     info.compareEnable = s.compare_enable;
     info.compareOp     = ToVkType(s.compare_op);
