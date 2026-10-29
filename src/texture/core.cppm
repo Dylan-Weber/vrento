@@ -114,6 +114,9 @@ struct SamplerDesc {
     TextureSample sample;
     TextureWrap   wrap_w { TextureWrap::REPEAT };
     float         min_lod {}, max_lod { 1000 }, lod_bias {};
+    // the most anisotropic filtering takes samples (1: none); capped at the device's limit, and
+    // none where the device has no anisotropic filtering
+    float max_anisotropy { 1 };
 };
 inline auto validate_sampler(const SamplerDesc& desc) -> Result<empty, Error> {
     auto& sample = desc.sample;
@@ -122,6 +125,7 @@ inline auto validate_sampler(const SamplerDesc& desc) -> Result<empty, Error> {
         Count(sample.compare_op) > 7 || Count(sample.border_color) > 2 ||
         ! rstd::f32(desc.min_lod).is_finite() || ! rstd::f32(desc.max_lod).is_finite() ||
         ! rstd::f32(desc.lod_bias).is_finite() || desc.min_lod < 0 || desc.max_lod < desc.min_lod ||
+        ! rstd::f32(desc.max_anisotropy).is_finite() || desc.max_anisotropy < 1 ||
         (sample.mipFilter == TextureMipmapFilter::None && desc.min_lod != 0))
         return Err(Error { ErrorKind::Invalid });
     return Ok(empty {});

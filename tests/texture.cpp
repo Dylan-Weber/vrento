@@ -234,6 +234,15 @@ TEST(Texture, PublicApi) {
     SamplerDesc invalid_sampler;
     invalid_sampler.min_lod = -1;
     rstd_assert(validate_sampler(invalid_sampler).is_err());
+    // anisotropy is a factor of at least 1 (1: none)
+    SamplerDesc anisotropic;
+    anisotropic.max_anisotropy = 8;
+    rstd_assert(validate_sampler(anisotropic).is_ok());
+    anisotropic.max_anisotropy = 0.5f;
+    rstd_assert(validate_sampler(anisotropic).is_err());
+    float zero                 = 0;
+    anisotropic.max_anisotropy = 1.0f / zero;
+    rstd_assert(validate_sampler(anisotropic).is_err());
 
     FakeQueue queue;
     auto      submission_api = dyn<SubmissionQueue>::from_ref(queue);
