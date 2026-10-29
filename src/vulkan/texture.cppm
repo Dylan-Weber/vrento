@@ -101,7 +101,7 @@ inline auto texture_format(VkFormat format) -> Result<TextureFormat, tex::Error>
                              TextureFormat::RGBA8_SRGB, TextureFormat::RGBA32F,
                              TextureFormat::BGRA8,      TextureFormat::BGRA8_SRGB,
                              TextureFormat::RGBA16F,    TextureFormat::R11G11B10F,
-                             TextureFormat::R16F };
+                             TextureFormat::R16F,       TextureFormat::R32F };
     for (auto value : values)
         if (ToVkType(value) == format) return Ok(TextureFormat(value));
     return Err(tex::Error { tex::ErrorKind::Unsupported });
