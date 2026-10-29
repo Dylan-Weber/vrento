@@ -217,9 +217,16 @@ auto Device::TryCreate(Instance& inst, slice<Extension> exts, VkExtent2D extent,
     if (maintenance) supported_ycbcr.pNext = &supported_maintenance;
     supported_maintenance.pNext = &supported_sync2;
     supported_timeline.pNext    = &supported_ycbcr;
+    const bool has_draw_parameters = inst.api_version() >= VK_API_VERSION_1_1 &&
+                                     device.m_gpu.GetProperties().apiVersion >= VK_API_VERSION_1_1;
+    VkPhysicalDeviceShaderDrawParametersFeatures supported_draw_parameters {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES,
+        .pNext = &supported_timeline,
+    };
     VkPhysicalDeviceFeatures2KHR supported2 {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR,
-        .pNext = &supported_timeline,
+        .pNext = has_draw_parameters ? static_cast<void*>(&supported_draw_parameters)
+                                    : &supported_timeline,
     };
     device.m_gpu.GetFeatures2KHR(supported2);
     if (! supported_timeline.timelineSemaphore) {
@@ -289,13 +296,21 @@ auto Device::TryCreate(Instance& inst, slice<Extension> exts, VkExtent2D extent,
         enabled_ycbcr.pNext = &enabled_maintenance;
     }
     enabled_timeline.pNext = &enabled_ycbcr;
+    const bool enable_draw_parameters =
+        has_draw_parameters && supported_draw_parameters.shaderDrawParameters;
+    VkPhysicalDeviceShaderDrawParametersFeatures enabled_draw_parameters {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES,
+        .pNext = &enabled_timeline,
+        .shaderDrawParameters = enable_draw_parameters ? VK_TRUE : VK_FALSE,
+    };
 
     auto queues = device.ChooseDeviceQueue(*inst.surface());
     if (queues.is_err()) return Err(queues.unwrap_err());
     auto               queue_create_infos = queues.unwrap();
     VkDeviceCreateInfo device_info {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = &enabled_timeline,
+        .pNext = has_draw_parameters ? static_cast<void*>(&enabled_draw_parameters)
+                                    : &enabled_timeline,
         .queueCreateInfoCount =
             static_cast<rstd::uint32_t>(queue_create_infos.len().to_primitive()),
         .pQueueCreateInfos       = queue_create_infos.data(),
@@ -337,6 +352,7 @@ auto Device::TryCreate(Instance& inst, slice<Extension> exts, VkExtent2D extent,
     }
     device.m_capabilities = DeviceCapabilities {
         .timeline_semaphore = true,
+        .shader_draw_parameters = enable_draw_parameters,
         .geometry_shader    = supported2.features.geometryShader != VK_FALSE,
         .synchronization2   = enable_sync2,
         .push_descriptor    = tested_exts.contains(
