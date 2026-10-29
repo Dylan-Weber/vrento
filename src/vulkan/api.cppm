@@ -804,6 +804,8 @@ public:
         return m_enabled_device_extensions.as_slice();
     }
     const auto& limits() const { return m_limits; }
+    // whether samplers may filter anisotropically (the device's samplerAnisotropy feature)
+    bool        sampler_anisotropy() const { return m_sampler_anisotropy; }
     const auto& memory_allocator() const { return m_allocator; }
     const auto& cmd_pool() const { return m_command_pool; }
     const auto& swapchain() const { return m_swapchain; }
@@ -833,6 +835,7 @@ private:
     vvk::MemoryAllocator         m_allocator;
 
     VkPhysicalDeviceLimits m_limits;
+    bool                   m_sampler_anisotropy {};
     DeviceCapabilities     m_capabilities;
     BTreeSet<String>       m_extensions { BTreeSet<String>::make() };
     Vec<CString>           m_enabled_instance_extensions;
