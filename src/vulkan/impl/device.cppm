@@ -250,6 +250,7 @@ auto Device::TryCreate(Instance& inst, slice<Extension> exts, VkExtent2D extent,
 #endif
     enabled.sampleRateShading = supported2.features.sampleRateShading;
     enabled.samplerAnisotropy = supported2.features.samplerAnisotropy;
+    device.m_sampler_anisotropy = enabled.samplerAnisotropy == VK_TRUE;
     enabled.multiViewport     = enable_multi_viewport ? VK_TRUE : VK_FALSE;
     enabled.depthClamp        = supported2.features.depthClamp;
     VkPhysicalDeviceTimelineSemaphoreFeaturesKHR enabled_timeline {

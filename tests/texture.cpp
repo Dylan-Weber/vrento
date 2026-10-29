@@ -234,6 +234,16 @@ TEST(Texture, PublicApi) {
     SamplerDesc invalid_sampler;
     invalid_sampler.min_lod = -1;
     rstd_assert(validate_sampler(invalid_sampler).is_err());
+    // anisotropy is a factor of at least 1 (1: none)
+    SamplerDesc anisotropic;
+    anisotropic.sample.max_anisotropy = 8;
+    rstd_assert(validate_sampler(anisotropic).is_ok());
+    anisotropic.sample.max_anisotropy = 0;
+    rstd_assert(validate_sampler(anisotropic).is_err());
+    // textures that differ only in their anisotropy are not the same texture
+    vrento::resource::TextureDefinition plain, sharp;
+    sharp.sample.max_anisotropy = 8;
+    rstd_assert(! (plain == sharp));
 
     FakeQueue queue;
     auto      submission_api = dyn<SubmissionQueue>::from_ref(queue);

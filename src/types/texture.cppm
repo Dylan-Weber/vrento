@@ -61,6 +61,9 @@ struct TextureSample {
     CompareOp          compare_op { CompareOp::Never };
     TextureBorderColor border_color { TextureBorderColor::OpaqueBlack };
     TextureMipmapFilter mipFilter { TextureMipmapFilter::Linear };
+    // the most samples anisotropic filtering takes (1: none); capped at the device's limit, and
+    // none where the device has no anisotropic filtering
+    rstd::uint8_t max_anisotropy { 1 };
 };
 
 } // namespace vrento
@@ -82,6 +85,7 @@ struct Impl<hash::Hash, vrento::TextureSample> : ImplBase<vrento::TextureSample>
         hash::hash_into(u32(static_cast<rstd::uint32_t>(sample.compare_op)), state);
         hash::hash_into(u32(static_cast<rstd::uint32_t>(sample.border_color)), state);
         hash::hash_into(u32(static_cast<rstd::uint32_t>(sample.mipFilter)), state);
+        hash::hash_into(u32(static_cast<rstd::uint32_t>(sample.max_anisotropy)), state);
     }
 };
 

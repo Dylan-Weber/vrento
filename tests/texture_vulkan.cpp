@@ -461,6 +461,13 @@ TEST(TextureVulkan, Resources) {
     linear.sample.minFilter = linear.sample.magFilter = vrento::TextureFilter::LINEAR;
     auto smooth                                       = factory->CreateSampler(linear).unwrap();
     rstd_assert(vk::native_sampler(nearest).unwrap() != vk::native_sampler(smooth).unwrap());
+    // an anisotropic sampler is a sampler of its own, and asking again gives it back
+    tex::SamplerDesc anisotropic = linear;
+    anisotropic.sample.max_anisotropy = 8;
+    auto sharp                   = factory->CreateSampler(anisotropic).unwrap();
+    rstd_assert(vk::native_sampler(sharp).unwrap() != vk::native_sampler(smooth).unwrap());
+    rstd_assert(vk::native_sampler(sharp).unwrap() ==
+                vk::native_sampler(factory->CreateSampler(anisotropic).unwrap()).unwrap());
     {
         auto cancelled = queue->Begin().unwrap();
         cancelled.commands()
