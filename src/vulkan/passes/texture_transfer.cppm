@@ -128,7 +128,8 @@ auto TextureTransferBackend::Prepare(const PassExecutionInfo&   pass,
          to                 = graph_texture::mip_extent(target_desc, target.first_mip);
     if (from != to || source_desc.samples != target_desc.samples ||
         a.block_width != b.block_width || a.block_height != b.block_height ||
-        a.block_bytes != b.block_bytes || a.aspect != b.aspect)
+        a.block_bytes != b.block_bytes || a.aspect != b.aspect ||
+        (a.aspect == graph_texture::Aspect::Depth && source_desc.format != target_desc.format))
         return unsupported();
     VkImageCopy region {};
     auto        aspect = source.aspect == graph_texture::Aspect::Depth ? VK_IMAGE_ASPECT_DEPTH_BIT

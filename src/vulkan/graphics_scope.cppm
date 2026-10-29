@@ -129,6 +129,10 @@ auto GraphicsScopeCache::Prepare(const GraphicsDescription& description,
             info.signature.depth_format         = ToVkType(desc.format);
             info.signature.depth_load_op        = attachment_load(declared.load);
             info.signature.depth_store_op       = attachment_store(declared.store);
+            if (texture::format_layout(desc.format).stencil) {
+                info.signature.depth_stencil_load_op = attachment_load(declared.load);
+                info.signature.depth_stencil_store_op = attachment_store(declared.store);
+            }
             info.signature.depth_initial_layout = info.signature.depth_final_layout =
                 VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         } else if (! resolve) {

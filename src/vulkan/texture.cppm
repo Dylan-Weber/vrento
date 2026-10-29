@@ -19,6 +19,12 @@ inline auto texture_error(VkResult result) -> tex::Error {
                                             : tex::ErrorKind::Backend,
              rstd::int32_t(result) };
 }
+inline auto texture_aspects(TextureFormat format) -> VkImageAspectFlags {
+    const auto layout = tex::format_layout(format);
+    if (! layout.block_bytes) return 0;
+    if (layout.aspect == tex::Aspect::Color) return VK_IMAGE_ASPECT_COLOR_BIT;
+    return VK_IMAGE_ASPECT_DEPTH_BIT | (layout.stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+}
 inline auto texture_stages(tex::Stages stages) -> VkPipelineStageFlags {
     if (stages == tex::Stages::All) return VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkPipelineStageFlags result {};
@@ -101,7 +107,8 @@ inline auto texture_format(VkFormat format) -> Result<TextureFormat, tex::Error>
                              TextureFormat::RGBA8_SRGB, TextureFormat::RGBA32F,
                              TextureFormat::BGRA8,      TextureFormat::BGRA8_SRGB,
                              TextureFormat::RGBA16F,    TextureFormat::R11G11B10F,
-                             TextureFormat::R16F,       TextureFormat::R32F };
+                             TextureFormat::R16F,       TextureFormat::R32F,
+                             TextureFormat::D32FS8 };
     for (auto value : values)
         if (ToVkType(value) == format) return Ok(TextureFormat(value));
     return Err(tex::Error { tex::ErrorKind::Unsupported });
@@ -794,9 +801,7 @@ public:
                 if (transfer && ! acquire && source.queue_family == family)
                     barrier.dstAccessMask = 0;
                 barrier.image            = native.unwrap();
-                barrier.subresourceRange = { range.aspect == tex::Aspect::Depth
-                                                 ? VK_IMAGE_ASPECT_DEPTH_BIT
-                                                 : VK_IMAGE_ASPECT_COLOR_BIT,
+                barrier.subresourceRange = { texture_aspects(texture.description().format),
                                              mip,
                                              1,
                                              layer,

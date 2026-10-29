@@ -129,6 +129,7 @@ inline auto validate_sampler(const SamplerDesc& desc) -> Result<empty, Error> {
 struct FormatLayout {
     Count  block_width { 1 }, block_height { 1 }, block_bytes {};
     Aspect aspect { Aspect::Color };
+    bool   stencil {};
 };
 inline auto format_layout(TextureFormat format) -> FormatLayout {
     switch (format) {
@@ -146,6 +147,8 @@ inline auto format_layout(TextureFormat format) -> FormatLayout {
     case TextureFormat::R32F: return { 1, 1, 4 };
     case TextureFormat::R8: return { 1, 1, 1 };
     case TextureFormat::D32F: return { 1, 1, 4, Aspect::Depth };
+    // Depth payloads contain only the depth aspect, even when the image also has stencil.
+    case TextureFormat::D32FS8: return { 1, 1, 4, Aspect::Depth, true };
     case TextureFormat::RGBA16F: return { 1, 1, 8 };
     case TextureFormat::RGBA32F: return { 1, 1, 16 };
     }
