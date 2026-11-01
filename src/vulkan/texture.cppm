@@ -2003,7 +2003,7 @@ auto TextureContext::Submit(tex::Submission work) -> Result<tex::SubmissionToken
     }
     next_submission_    = serial;
     recording.submitted = true;
-    tex::BackendAccess::Submitted(work);
+    tex::BackendAccess::Submitted(work, token);
     for (auto& participant : recording.participants) participant->Commit(token);
     for (auto& reservation : recording.prepared_reads) reservation->release();
     for (auto& entry : recording.textures) {

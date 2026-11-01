@@ -428,7 +428,7 @@ private:
 class Submission;
 // Backend construction and commit hooks; consumers use references and traits.
 struct BackendAccess {
-    static void Submitted(Submission& work);
+    static void Submitted(Submission& work, const SubmissionToken& token = {});
     static void Uncertain(Submission& work);
     static auto Storage(const TextureRef& value) -> const Arc<StorageState>& {
         return value.backend_state();
@@ -634,6 +634,7 @@ struct SubmissionState {
         Uncertain
     };
     Status status { Status::Recording };
+    Option<SubmissionToken> token;
 };
 using SubmissionStatus = SubmissionState::Status;
 class SubmissionReceipt {
@@ -655,6 +656,9 @@ public:
     bool submitted() const { return status() == SubmissionStatus::Submitted; }
     bool cancelled() const { return status() == SubmissionStatus::Cancelled; }
     bool uncertain() const { return status() == SubmissionStatus::Uncertain; }
+    auto token() const -> Option<SubmissionToken> {
+        return submitted() && state_->token ? Some(SubmissionToken(*state_->token)) : None();
+    }
     bool same(const SubmissionReceipt& other) const {
         return Arc<SubmissionState>::ptr_eq(state_, other.state_);
     }
@@ -703,7 +707,8 @@ public:
         (*commands_)->Retain(Box<dyn<rstd::any::Any>>::make(rstd::move(value)));
     }
 };
-inline void BackendAccess::Submitted(Submission& work) {
+inline void BackendAccess::Submitted(Submission& work, const SubmissionToken& token) {
+    work.state_->token = token.valid() ? Some(SubmissionToken(token)) : None();
     work.state_->status = SubmissionStatus::Submitted;
 }
 inline void BackendAccess::Uncertain(Submission& work) {
