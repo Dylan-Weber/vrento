@@ -1,6 +1,7 @@
 export module vrento:texture.core;
 export import :types.texture;
 export import :texture.image;
+export import :error_diagnostic;
 import rstd;
 import :vulkan.error;
 
@@ -35,6 +36,12 @@ struct Error {
                  static_cast<rstd::int32_t>(native),
                  Some(rstd::move(error)) };
     }
+};
+struct ErrorSnapshot {
+    ErrorKind       kind;
+    rstd::int32_t   native {};
+    ErrorDiagnostic diagnostic;
+    static auto capture(const Error&) -> ErrorSnapshot;
 };
 enum class Dimension
 {
@@ -767,3 +774,10 @@ struct Impl<error::Error, vrento::texture::Error> : ImplBase<vrento::texture::Er
     }
 };
 } // namespace rstd
+
+namespace vrento::texture
+{
+inline auto ErrorSnapshot::capture(const Error& error) -> ErrorSnapshot {
+    return { error.kind, error.native, ErrorDiagnostic::capture(error) };
+}
+} // namespace vrento::texture

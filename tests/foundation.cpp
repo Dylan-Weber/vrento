@@ -625,6 +625,34 @@ TEST(BackendErrors, DiagnosticDoesNotRetainOwnedCause) {
     ASSERT_FALSE(snapshot.diagnostic.sources.is_empty());
     EXPECT_EQ(snapshot.diagnostic.sources[usize()].as_str(), "owned failure"_str);
 }
+TEST(BackendErrors, TextureSnapshotDoesNotRetainOwnedCause) {
+    int drops {};
+    Option<texture::ErrorSnapshot> snapshot;
+    {
+        auto io = rstd::io::error::Error::with_source(
+            { rstd::io::error::ErrorKind::Other },
+            Box<dyn<rstd::error::Error>>::make(vrento_test::foundation::OwnedFailure(drops)));
+        auto error = texture::Error::from_backend(
+            { "upload texture"_Str,
+              BackendCause::Io(rstd::move(io), "/texture/input"_Str) });
+        snapshot = Some(texture::ErrorSnapshot::capture(error));
+        EXPECT_EQ(drops, 0);
+    }
+    EXPECT_EQ(drops, 1);
+    auto copied = snapshot.clone();
+    snapshot = None();
+    EXPECT_EQ(copied->kind, texture::ErrorKind::Backend);
+    EXPECT_EQ(copied->native, 0);
+    EXPECT_FALSE(copied->diagnostic.debug.is_empty());
+    ASSERT_FALSE(copied->diagnostic.sources.is_empty());
+    EXPECT_TRUE(copied->diagnostic.sources[usize()].as_str().contains("upload texture"_str));
+    EXPECT_EQ(copied->diagnostic.sources.last().unwrap()->as_str(), "owned failure"_str);
+    auto lost = texture::Error::from_backend(
+        { "wait texture"_Str, BackendCause::Native(VK_ERROR_DEVICE_LOST) });
+    auto native = texture::ErrorSnapshot::capture(lost);
+    EXPECT_EQ(native.kind, texture::ErrorKind::Lost);
+    EXPECT_EQ(native.native, VK_ERROR_DEVICE_LOST);
+}
 TEST(BackendErrors, DriverCacheOwnsIoPath) {
     vrento::vulkan::Device              device;
     vrento::vulkan::DriverPipelineCache cache;
