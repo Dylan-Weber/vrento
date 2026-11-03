@@ -357,8 +357,7 @@ auto GraphicsDrawFactory::Compile(const GraphicsDrawDesc& desc, const PassExecut
     if (prepared.is_err()) {
         auto                source = rstd::move(prepared).unwrap_err();
         GraphExecutionError error { GraphExecutionStage::Prepare, pass.id };
-        error.cause = vrento::vulkan::GraphExecutionCause::Resource(
-            vrento::resource::ResourceErrorSnapshot(rstd::move(source)));
+        error.cause = vrento::vulkan::GraphExecutionCause::Resource(rstd::move(source));
         return Err(rstd::move(error));
     }
     if (! prepared->ready()) return Ok(PendingPreparation {});

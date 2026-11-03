@@ -45,7 +45,7 @@ private:
                      .identity = identity,
                      .error    = Some(FrameSurfaceError {
                          FrameSurfaceErrorKind::SessionLost,
-                         Some(Arc<dyn<rstd::error::Error>>::make(vulkan::BackendError {
+                         Some(Box<dyn<rstd::error::Error>>::make(vulkan::BackendError {
                              "submit surface"_Str,
                              vulkan::BackendCause::Native(VK_ERROR_DEVICE_LOST) })) }) };
         return { .status = FrameSurfaceCompletionStatus::Submitted, .identity = identity };
@@ -154,7 +154,7 @@ TEST(ExternalSwapchain, SurfaceErrors) {
     rstd_assert(::fcntl(fd, F_GETFD) == -1);
     rstd_assert(! frame.completion.valid() && counts.destroyed == 1);
     rstd_assert(! failed.completed() && failed.error->kind == FrameSurfaceErrorKind::SessionLost);
-    auto saved   = failed.error->clone();
+    auto saved   = failed.error.take().unwrap();
     failed.error = None();
     auto cause   = rstd::as<rstd::error::Error>(saved).source();
     rstd_assert(cause.is_some());

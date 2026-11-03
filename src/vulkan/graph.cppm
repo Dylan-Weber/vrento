@@ -257,7 +257,7 @@ class GraphBindings {
             if (frozen.is_err()) {
                 auto error     = frozen.unwrap_err();
                 error.resource = entry.id;
-                return Err(error);
+                return Err(rstd::move(error));
             }
             result.append({ entry.id, frozen.unwrap(), entry.version });
         }
@@ -739,7 +739,7 @@ inline auto record_prepared_pass(const DeviceSession& session, const PassExecuti
     auto fail = [&](GraphExecutionError error) -> Result<empty, GraphExecutionError> {
         error.pass = pass.id;
         work.discard();
-        return Err(error);
+        return Err(rstd::move(error));
     };
     auto recording = native_recording(work, session);
     if (recording.is_err())
@@ -821,7 +821,7 @@ inline auto record_vulkan_pass(DeviceSession session, PassExecutionInfo pass,
     auto fail = [&](GraphExecutionError error) -> Result<FrameProgress, GraphExecutionError> {
         error.pass = pass.id;
         work.discard();
-        return Err(error);
+        return Err(rstd::move(error));
     };
     auto resources = bindings.descriptions();
     auto valid     = validate_pass_execution(pass, resources.as_slice());
@@ -982,7 +982,7 @@ public:
                     if (scope.is_err()) {
                         auto error = scope.unwrap_err();
                         error.pass = pass.id;
-                        return Err(error);
+                        return Err(rstd::move(error));
                     }
                     if (! scope->ready()) return Ok(FrameProgress::Pending);
                     data.group_scope = Some(scope->take_ready());
@@ -997,7 +997,7 @@ public:
             if (prepared.is_err()) {
                 auto error = prepared.unwrap_err();
                 error.pass = pass.id;
-                return Err(error);
+                return Err(rstd::move(error));
             }
             if (! prepared->ready()) return Ok(FrameProgress::Pending);
             data.passes.push(prepared->take_ready());
@@ -1080,7 +1080,7 @@ public:
                         auto error = accessed.unwrap_err();
                         error.pass = pass.id;
                         work.discard();
-                        return Err(error);
+                        return Err(rstd::move(error));
                     }
                 }
             for (usize index = first; index <= last; ++index) {

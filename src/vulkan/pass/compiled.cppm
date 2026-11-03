@@ -267,7 +267,7 @@ inline auto prepare_native(const Arc<Owner>& owner, PassId id, Arc<dyn<VulkanPas
         auto error = prepared.unwrap_err();
         owner->execution->fail();
         error.pass = id;
-        return Err(error);
+        return Err(rstd::move(error));
     }
     if (! prepared->ready()) {
         owner->execution->pending();
@@ -318,9 +318,9 @@ struct StandaloneFrameBackend {
     }
 };
 class GraphPreparation {
-    PreparedGraphProgram        program_;
-    NativeFrameBackend          backend_;
-    Option<GraphExecutionError> failure_;
+    PreparedGraphProgram                program_;
+    NativeFrameBackend                  backend_;
+    Option<GraphExecutionErrorSnapshot> failure_;
     friend class CompiledGraph;
     GraphPreparation(PreparedGraphProgram program, NativeFrameBackend backend)
         : program_(rstd::move(program)), backend_(rstd::move(backend)) {}
@@ -329,12 +329,19 @@ public:
     GraphPreparation(const GraphPreparation&) = delete;
     GraphPreparation(GraphPreparation&&)      = default;
     auto advance() -> Result<FrameProgress, GraphExecutionError> {
-        if (failure_) return Err(*failure_);
+        if (failure_)
+            return Err(
+                GraphExecutionError { GraphExecutionStage::Prepare,
+                                      {},
+                                      {},
+                                      GraphExecutionCause::Reason(GraphFailure::InvalidState) });
         auto result = program_.continue_prepare(backend_);
-        if (result.is_err()) failure_ = Some(GraphExecutionError(result.as_ref().unwrap_err()));
+        if (result.is_err())
+            failure_ = Some(GraphExecutionErrorSnapshot::capture(result.as_ref().unwrap_err()));
         return result;
     }
     auto ready() const -> bool { return ! failure_ && program_.ready(); }
+    auto failure() const -> Option<GraphExecutionErrorSnapshot> { return failure_.clone(); }
     auto program() const -> Option<PreparedGraphProgram> {
         return ready() ? Some(PreparedGraphProgram(program_)) : None<PreparedGraphProgram>();
     }

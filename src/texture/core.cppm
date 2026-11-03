@@ -28,12 +28,12 @@ enum class ErrorKind
 struct Error {
     ErrorKind                    kind;
     rstd::int32_t                native {};
-    vulkan::BackendErrorSnapshot backend;
+    Option<vulkan::BackendError> backend;
     static auto                  from_backend(vulkan::BackendError error) -> Error {
         auto native = error.cause.native();
         return { error.cause.lost() ? ErrorKind::Lost : ErrorKind::Backend,
                  static_cast<rstd::int32_t>(native),
-                 vulkan::BackendErrorSnapshot(rstd::move(error)) };
+                 Some(rstd::move(error)) };
     }
 };
 enum class Dimension
@@ -633,7 +633,7 @@ struct SubmissionState {
         Cancelled,
         Uncertain
     };
-    Status status { Status::Recording };
+    Status                  status { Status::Recording };
     Option<SubmissionToken> token;
 };
 using SubmissionStatus = SubmissionState::Status;
@@ -708,7 +708,7 @@ public:
     }
 };
 inline void BackendAccess::Submitted(Submission& work, const SubmissionToken& token) {
-    work.state_->token = token.valid() ? Some(SubmissionToken(token)) : None();
+    work.state_->token  = token.valid() ? Some(SubmissionToken(token)) : None();
     work.state_->status = SubmissionStatus::Submitted;
 }
 inline void BackendAccess::Uncertain(Submission& work) {
@@ -762,7 +762,7 @@ template<>
 struct Impl<error::Error, vrento::texture::Error> : ImplBase<vrento::texture::Error> {
     auto source() const noexcept -> Option<error::ErrorRef> {
         const auto& value = this->self();
-        if (value.backend) return Some(dyn<error::Error>::from_ref(value.backend.error()));
+        if (value.backend) return Some(dyn<error::Error>::from_ref(*value.backend));
         return None();
     }
 };

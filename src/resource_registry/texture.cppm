@@ -658,7 +658,7 @@ private:
         -> Result<PreparedImageAllocation, resource::ResourceError> {
         return Err(resource::ResourceError {
             .message = rstd::format("{}", message),
-            .source  = source ? Some(resource::ResourceErrorSource::Texture(*source))
+            .source  = source ? Some(resource::ResourceErrorSource::Texture(source.take().unwrap()))
                               : None<resource::ResourceErrorSource>() });
     }
     auto MakeRoom() -> Result<empty, texture::Error> {

@@ -360,7 +360,7 @@ void queue_output(vk::DeviceSession session, vk::QueueParameters transfer, bool 
         rstd::io::eprintln("queue graph stage={} resource={} native={}",
                            unsigned(error.stage),
                            error.resource.value,
-                           error.texture_error() ? int(error.texture_error()->kind)
+                           error.texture_error() ? int((*error.texture_error())->kind)
                                                  : int(error.native_result()));
     }
     if (uncertain) {
@@ -379,6 +379,17 @@ void queue_output(vk::DeviceSession session, vk::QueueParameters transfer, bool 
     if (fail) rstd_assert(! submitted.ready().unwrap());
     submitted.wait().unwrap();
     if (fail) {
+        auto diagnostic = submitted.failure();
+        ASSERT_TRUE(diagnostic);
+        auto error = submitted.take_error();
+        ASSERT_TRUE(error);
+        EXPECT_EQ(error->stage, diagnostic->stage);
+        EXPECT_FALSE(submitted.take_error());
+        EXPECT_FALSE(submitted.error());
+        EXPECT_EQ(submitted.status(), vk::GraphSubmissionStatus::Partial);
+        error = None();
+        EXPECT_EQ(submitted.failure()->diagnostic.message.as_str(),
+                  diagnostic->diagnostic.message.as_str());
         rstd_assert(views[usize(2)].texture().content_revision() == 0);
         auto recovery = queue.Begin().unwrap();
         recovery.commands()
@@ -1551,8 +1562,7 @@ TEST(GraphBindings, PreparationScale) {
         const auto& error = created.as_ref().unwrap_err();
         rstd::io::eprintln(
             "device session stage={} result={}", unsigned(error.stage), int(error.result));
-        if (error.cause)
-            rstd::io::eprintln("{}: {}", error.cause.error(), error.cause.error().cause);
+        if (error.cause) rstd::io::eprintln("{}: {}", *error.cause, error.cause->cause);
     }
     auto session = created.unwrap();
     for (unsigned count : array<unsigned, 4> { 16u, 128u, 512u, 1024u }) {

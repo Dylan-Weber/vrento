@@ -19,6 +19,7 @@ struct PipelinePrepareResult {
     PipelineReadiness                                 status;
     Option<resource_registry::PipelineResourceResult> pipeline;
     Option<resource::ResourceError>                   error;
+    Option<resource::ResourceErrorSnapshot>           diagnostic;
 };
 enum class PipelinePreparationMode
 {
@@ -131,7 +132,8 @@ public:
                         static_cast<rstd::int32_t>(VK_ERROR_DEVICE_LOST))) }) });
         auto                                              status = request.build->status();
         Option<resource_registry::PipelineResourceResult> pipeline;
-        auto                                              failure = request.build->error();
+        auto                                              diagnostic = request.build->error();
+        Option<resource::ResourceError>                   failure;
         if (status == PipelineReadiness::Ready) {
             auto& owner    = session_.graphics_resources();
             auto  prepared = owner.pipelines.TryEnsureRecipe(
@@ -144,7 +146,12 @@ public:
             else
                 status = PipelineReadiness::Pending;
         }
-        return Ok(PipelinePrepareResult { status, rstd::move(pipeline), rstd::move(failure) });
+        return Ok(PipelinePrepareResult {
+            status, rstd::move(pipeline), rstd::move(failure), rstd::move(diagnostic) });
+    }
+    auto take_error(const PipelinePrepareRequest& request) -> Option<resource::ResourceError> {
+        if (request.session.epoch() != session_.epoch()) return None();
+        return request.build->take_error();
     }
     void close() {
         for (auto& work : queued_) work.build->cancel();
@@ -194,7 +201,15 @@ public:
                 worker_->advance();
                 return Ok(PipelinePrepareResult { PipelineReadiness::Pending, None() });
             }
-            return worker_->poll(work);
+            auto result = worker_->poll(work);
+            if (result.is_ok() && result->status == PipelineReadiness::Failed && ! result->error) {
+                result->error = worker_->take_error(work);
+                if (! result->error)
+                    result->error = Some(resource::ResourceError {
+                        .kind    = resource::ResourceErrorKind::Closed,
+                        .message = "pipeline failure already taken"_Str });
+            }
+            return result;
         }
         auto& graphics = session_.graphics_resources();
         auto  result   = graphics.pipelines.TryEnsureRecipe(

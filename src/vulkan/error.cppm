@@ -37,24 +37,6 @@ class BackendCause {
               (Dispatch, (DispatchFailure error;)), (Memory, (vvk::MemoryError error;)),
               (Loader, (vvk::LoaderErrorKind kind; String message; DispatchFailure dispatch;)))
 public:
-    auto clone() const -> BackendCause {
-        if (is_Io()) return Io(as_Io().error, as_Io().path.clone());
-        if (is_Closed()) return Closed();
-        if (is_Busy()) return Busy();
-        if (is_Range()) {
-            const auto& r = as_Range();
-            return Range(r.offset, r.size, r.capacity);
-        }
-        if (is_Capacity()) return Capacity(as_Capacity().size);
-        if (is_Invalid()) return Invalid(as_Invalid().detail.clone());
-        if (is_Unsupported()) return Unsupported(as_Unsupported().capability.clone());
-        if (is_State()) return State(as_State().detail.clone());
-        if (is_Native()) return Native(as_Native().result);
-        if (is_Dispatch()) return Dispatch(as_Dispatch().error.clone());
-        if (is_Memory()) return Memory(as_Memory().error);
-        const auto& v = as_Loader();
-        return Loader(v.kind, v.message.clone(), v.dispatch.clone());
-    }
     auto lost() const -> bool { return native() == VK_ERROR_DEVICE_LOST; }
     auto native() const -> VkResult {
         if (is_Native()) return as_Native().result;
@@ -67,24 +49,6 @@ public:
 struct BackendError {
     String       operation;
     BackendCause cause;
-    auto         clone() const -> BackendError { return { operation.clone(), cause.clone() }; }
-};
-class BackendErrorSnapshot {
-    Option<rstd::sync::Arc<BackendError>> error_;
-
-public:
-    BackendErrorSnapshot() = default;
-    explicit BackendErrorSnapshot(BackendError error)
-        : error_(Some(rstd::sync::Arc<BackendError>::make(rstd::move(error)))) {}
-    BackendErrorSnapshot(const BackendErrorSnapshot& other): error_(other.error_.clone()) {}
-    auto operator=(const BackendErrorSnapshot& other) -> BackendErrorSnapshot& {
-        error_ = other.error_.clone();
-        return *this;
-    }
-    BackendErrorSnapshot(BackendErrorSnapshot&&)                        = default;
-    auto     operator=(BackendErrorSnapshot&&) -> BackendErrorSnapshot& = default;
-    explicit operator bool() const { return error_.is_some(); }
-    auto     error() const -> const BackendError& { return **error_; }
 };
 } // namespace vrento::vulkan
 export namespace rstd

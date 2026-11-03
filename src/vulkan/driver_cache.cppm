@@ -18,13 +18,14 @@ enum class DriverCacheStage
 struct DriverCacheError {
     DriverCacheStage     stage;
     VkResult             native { VK_SUCCESS };
-    BackendErrorSnapshot cause;
+    Option<BackendError> cause;
     static auto io(ref<rstd::path::Path> path, rstd::io::error::Error error, String operation)
         -> DriverCacheError {
         return { DriverCacheStage::File,
                  VK_SUCCESS,
-                 BackendErrorSnapshot(BackendError {
-                     rstd::move(operation), BackendCause::Io(error, path.to_string_lossy()) }) };
+                 Some(BackendError {
+                     rstd::move(operation),
+                     BackendCause::Io(rstd::move(error), path.to_string_lossy()) }) };
     }
 };
 struct DriverCacheStats {
@@ -163,7 +164,7 @@ public:
                 return Err(DriverCacheError {
                     DriverCacheStage::File,
                     VK_SUCCESS,
-                    BackendErrorSnapshot(BackendError {
+                    Some(BackendError {
                         "read pipeline cache"_Str,
                         BackendCause::Invalid("unexpected end of cache file"_Str) }) });
             offset += *read;
@@ -203,8 +204,7 @@ struct Impl<error::Error, vrento::vulkan::DriverCacheError>
     : ImplBase<vrento::vulkan::DriverCacheError> {
     auto source() const noexcept -> Option<error::ErrorRef> {
         const auto& e = this->self();
-        return e.cause ? Some(dyn<error::Error>::from_ref(e.cause.error()))
-                       : None<error::ErrorRef>();
+        return e.cause ? Some(dyn<error::Error>::from_ref(*e.cause)) : None<error::ErrorRef>();
     }
 };
 } // namespace rstd

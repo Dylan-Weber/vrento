@@ -147,10 +147,10 @@ auto Compiler::Compile(const Configuration& desc, const vk::PassExecutionInfo&,
     }
     if (desc.state->fail) {
         vk::GraphExecutionError error { vk::GraphExecutionStage::Prepare };
-        error.cause = vrento::vulkan::GraphExecutionCause::Resource(
-            vrento::resource::ResourceErrorSnapshot(vrento::resource::ResourceError {
+        error.cause =
+            vrento::vulkan::GraphExecutionCause::Resource(vrento::resource::ResourceError {
                 .message = String::make("native factory failure"_str),
-                .source  = Some(vrento::resource::ResourceErrorSource::Native(-3)) }));
+                .source  = Some(vrento::resource::ResourceErrorSource::Native(-3)) });
         return Err(rstd::move(error));
     }
     return Ok(Arc<dyn<vk::VulkanPass>>::make(Native { desc.state.clone() }));
@@ -381,14 +381,14 @@ TEST(VulkanRenderer, CompileTransactionsRejectStaleContinuationAndKeepCompletedP
     EXPECT_EQ(renderer.status().state, vk::CompileState::Failed);
     auto failure = renderer.status();
     EXPECT_EQ(failure.error->pass.value, 2u);
-    EXPECT_TRUE(failure.error->cause.is_Resource());
-    EXPECT_EQ(failure.error->cause.as_Resource().error.error().source->as_Native().code, -3);
+    EXPECT_FALSE(failure.error->diagnostic.sources.is_empty());
+    EXPECT_TRUE(failure.error->diagnostic.sources.last().unwrap()->as_str().contains("-3"_str));
     EXPECT_TRUE(renderer.compiled());
     EXPECT_FALSE(renderer.ready());
     renderer.clear();
     EXPECT_EQ(renderer.status().state, vk::CompileState::Idle);
     EXPECT_FALSE(renderer.compiled());
-    EXPECT_EQ(failure.error->cause.as_Resource().error.error().source->as_Native().code, -3);
+    EXPECT_TRUE(failure.error->diagnostic.sources.last().unwrap()->as_str().contains("-3"_str));
     auto before = renderer.status().id;
     EXPECT_TRUE(renderer.continue_compile(failure.id).is_err());
     EXPECT_EQ(renderer.status().id, before);
@@ -974,6 +974,13 @@ TEST(VulkanRenderer, TextureRegionSurvivesPendingFailureAndCancellationWithoutCo
     state->frame_fail = true;
     auto failed       = begin(update);
     EXPECT_EQ(failed.advance().unwrap_err().pass.value, 1u);
+    ASSERT_TRUE(failed.error());
+    EXPECT_EQ(failed.state(), vk::FrameState::Failed);
+    EXPECT_EQ(failed.error()->pass.value, 1u);
+    auto repeated = failed.advance().unwrap_err();
+    ASSERT_TRUE(repeated.cause.is_Reason());
+    EXPECT_EQ(repeated.cause.as_Reason().value, vk::GraphFailure::InvalidState);
+    EXPECT_EQ(failed.error()->pass.value, 1u);
     EXPECT_EQ(update.Readiness().unwrap(), registry::ImageReadiness::Pending);
     state->frame_fail = false;
     auto retry        = begin(update);

@@ -3,6 +3,7 @@ module;
 
 export module vrento:resource.error;
 import rstd;
+export import :error_diagnostic;
 export import :preparation;
 import :texture.core;
 import :resource.handle;
@@ -36,7 +37,7 @@ enum class ResourceErrorKind
 class ResourceErrorSource {
     RSTD_ENUM(ResourceErrorSource, (Texture, (texture::Error source;)),
               (Native, (rstd::int32_t code;)), (Backend, (vulkan::BackendError source;)),
-              (External, (rstd::sync::Arc<dyn<rstd::error::Error>> source;)),
+              (External, (Box<dyn<rstd::error::Error>> source;)),
               (Io, (rstd::io::error::Error source;)))
 };
 
@@ -78,8 +79,7 @@ struct ResourceError {
     Option<ResourceErrorSource> source;
     Vec<TextureErrorContext>    textures;
     Vec<ResourceErrorContext>   contexts;
-    static auto external(String operation, rstd::sync::Arc<dyn<rstd::error::Error>> error)
-        -> ResourceError {
+    static auto external(String operation, Box<dyn<rstd::error::Error>> error) -> ResourceError {
         return { .message = rstd::move(operation),
                  .source  = Some(ResourceErrorSource::External(rstd::move(error))) };
     }
@@ -89,54 +89,34 @@ struct ResourceError {
     }
     static auto texture(texture::Error error, String operation) -> ResourceError {
         return { .message = rstd::move(operation),
-                 .source  = Some(ResourceErrorSource::Texture(error)) };
-    }
-    auto clone() const -> ResourceError {
-        Option<ResourceErrorSource> copied;
-        if (source) {
-            if (source->is_Texture())
-                copied = Some(ResourceErrorSource::Texture(source->as_Texture().source));
-            else if (source->is_Native())
-                copied = Some(ResourceErrorSource::Native(source->as_Native().code));
-            else if (source->is_External())
-                copied = Some(ResourceErrorSource::External(source->as_External().source.clone()));
-            else if (source->is_Backend())
-                copied = Some(ResourceErrorSource::Backend(source->as_Backend().source.clone()));
-            else
-                copied = Some(ResourceErrorSource::Io(source->as_Io().source));
-        }
-        Vec<TextureErrorContext> contexts;
-        for (const auto& texture : textures) contexts.push(texture.clone());
-        Vec<ResourceErrorContext> details;
-        for (const auto& context : this->contexts) details.push(context.clone());
-        return {
-            kind, message.clone(), rstd::move(copied), rstd::move(contexts), rstd::move(details)
-        };
+                 .source  = Some(ResourceErrorSource::Texture(rstd::move(error))) };
     }
 };
 
-class ResourceErrorSnapshot {
-    Option<rstd::sync::Arc<ResourceError>> error_;
-
-public:
-    ResourceErrorSnapshot() = default;
-    explicit ResourceErrorSnapshot(ResourceError error)
-        : error_(Some(rstd::sync::Arc<ResourceError>::make(rstd::move(error)))) {}
-    ResourceErrorSnapshot(const ResourceErrorSnapshot& other): error_(other.error_.clone()) {}
-    auto operator=(const ResourceErrorSnapshot& other) -> ResourceErrorSnapshot& {
-        error_ = other.error_.clone();
-        return *this;
+struct ResourceErrorSnapshot {
+    ResourceErrorKind         kind { ResourceErrorKind::BackendFailure };
+    ErrorDiagnostic           diagnostic;
+    Vec<TextureErrorContext>  textures;
+    Vec<ResourceErrorContext> contexts;
+    auto                      clone() const -> ResourceErrorSnapshot {
+        ResourceErrorSnapshot result { kind, diagnostic };
+        for (const auto& texture : textures) result.textures.push(texture.clone());
+        for (const auto& context : contexts) result.contexts.push(context.clone());
+        return result;
     }
-    ResourceErrorSnapshot(ResourceErrorSnapshot&&)                        = default;
-    auto     operator=(ResourceErrorSnapshot&&) -> ResourceErrorSnapshot& = default;
-    explicit operator bool() const { return error_.is_some(); }
-    auto     error() const -> const ResourceError& { return **error_; }
+    static auto capture(const ResourceError&) -> ResourceErrorSnapshot;
 };
 
 } // namespace vrento::resource
 
 export namespace rstd
 {
+
+template<>
+struct Impl<clone::Clone, vrento::resource::ResourceErrorSnapshot>
+    : DefaultInImpl<clone::Clone, vrento::resource::ResourceErrorSnapshot> {
+    auto clone() const -> vrento::resource::ResourceErrorSnapshot { return self().clone(); }
+};
 
 template<>
 struct Impl<fmt::Display, vrento::resource::ResourceErrorSource>
@@ -249,3 +229,13 @@ struct Impl<error::Error, vrento::resource::ResourceError>
 } // namespace rstd
 
 static_assert(rstd::Impled<vrento::resource::ResourceError, rstd::error::Error>);
+
+namespace vrento::resource
+{
+inline auto ResourceErrorSnapshot::capture(const ResourceError& error) -> ResourceErrorSnapshot {
+    ResourceErrorSnapshot result { error.kind, ErrorDiagnostic::capture(error) };
+    for (const auto& texture : error.textures) result.textures.push(texture.clone());
+    for (const auto& context : error.contexts) result.contexts.push(context.clone());
+    return result;
+}
+} // namespace vrento::resource

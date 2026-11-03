@@ -737,10 +737,11 @@ enum class PipelineReadiness
 };
 class PipelineBuild {
     struct Outcome {
-        PipelineReadiness                  status { PipelineReadiness::Pending };
-        Option<Arc<PipelineResourceEntry>> result;
-        bool                               started {};
-        Option<resource::ResourceError>    error;
+        PipelineReadiness                       status { PipelineReadiness::Pending };
+        Option<Arc<PipelineResourceEntry>>      result;
+        bool                                    started {};
+        Option<resource::ResourceError>         error;
+        Option<resource::ResourceErrorSnapshot> diagnostic;
     };
     Option<PipelineResourceDesc>             desc_;
     Option<Arc<vvk::RenderPass>>             pass_;
@@ -763,23 +764,29 @@ public:
         auto state = outcome_.lock().unwrap();
         return state->status == PipelineReadiness::Ready ? Some(state->result->clone()) : None();
     }
-    auto error() const -> Option<resource::ResourceError> {
+    auto error() const -> Option<resource::ResourceErrorSnapshot> {
         auto state = outcome_.lock().unwrap();
-        return state->error ? Some(state->error->clone()) : None<resource::ResourceError>();
+        return state->diagnostic.clone();
+    }
+    auto take_error() -> Option<resource::ResourceError> {
+        auto state = outcome_.lock().unwrap();
+        return state->error.take();
     }
     void fail(resource::ResourceError error) {
         auto state = outcome_.lock().unwrap();
         if (state->started || state->status != PipelineReadiness::Pending) return;
-        state->status = PipelineReadiness::Failed;
-        state->error  = Some(rstd::move(error));
+        state->status     = PipelineReadiness::Failed;
+        state->diagnostic = Some(resource::ResourceErrorSnapshot::capture(error));
+        state->error      = Some(rstd::move(error));
     }
     void cancel() {
         auto state = outcome_.lock().unwrap();
         if (! state->started && state->status == PipelineReadiness::Pending) {
-            state->status = PipelineReadiness::Failed;
-            state->error  = Some(resource::ResourceError {
+            state->status     = PipelineReadiness::Failed;
+            state->error      = Some(resource::ResourceError {
                 .kind    = resource::ResourceErrorKind::Cancelled,
                 .message = "pipeline build cancelled before execution"_Str });
+            state->diagnostic = Some(resource::ResourceErrorSnapshot::capture(*state->error));
         }
     }
     void execute(const Device& device) {
@@ -799,14 +806,16 @@ public:
         }();
         auto state = outcome_.lock().unwrap();
         if (created.is_err()) {
-            state->status = PipelineReadiness::Failed;
-            state->error  = Some(rstd::move(created).unwrap_err());
+            state->status     = PipelineReadiness::Failed;
+            state->error      = Some(rstd::move(created).unwrap_err());
+            state->diagnostic = Some(resource::ResourceErrorSnapshot::capture(*state->error));
         } else if (device.lost()) {
             state->status = PipelineReadiness::Failed;
             state->error  = Some(
                 resource::ResourceError { .message = "pipeline device lost"_Str,
                                           .source  = Some(resource::ResourceErrorSource::Native(
                                               static_cast<rstd::int32_t>(VK_ERROR_DEVICE_LOST))) });
+            state->diagnostic = Some(resource::ResourceErrorSnapshot::capture(*state->error));
         } else {
             state->status = PipelineReadiness::Ready;
             state->result = Some(rstd::move(created).unwrap());
@@ -980,8 +989,12 @@ private:
         if (pending) {
             created = (**pending)->result();
             if (created.is_none() || device.lost()) {
-                auto error = (**pending)->error();
+                auto error = (**pending)->take_error();
                 if (error) return Err(rstd::move(*error));
+                if ((**pending)->status() == PipelineReadiness::Failed)
+                    return Err(resource::ResourceError {
+                        .kind    = resource::ResourceErrorKind::Closed,
+                        .message = "pipeline failure already taken"_Str });
                 if (device.lost())
                     return Err(resource::ResourceError::backend(
                         { "pipeline build"_Str, BackendCause::Native(VK_ERROR_DEVICE_LOST) }));

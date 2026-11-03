@@ -183,10 +183,9 @@ auto RenderBufferResolver::updateDrawBuffers(const DrawBufferRequest&           
         if (key.content_confirmed && key.data_generation == view.data_generation) continue;
         auto updated = writer->UpdateBuffer(buffers.vertices[i], view.bytes);
         if (updated.is_err())
-            return Err(
-                DrawBufferUpdateError { DrawBufferUpdateErrorKind::UploadFailed,
-                                        "buffer upload failed"_Str,
-                                        resource::ResourceErrorSnapshot(updated.unwrap_err()) });
+            return Err(DrawBufferUpdateError { DrawBufferUpdateErrorKind::UploadFailed,
+                                               "buffer upload failed"_Str,
+                                               Some(updated.unwrap_err()) });
         key.data_generation   = view.data_generation;
         key.content_confirmed = true;
     }
@@ -195,10 +194,9 @@ auto RenderBufferResolver::updateDrawBuffers(const DrawBufferRequest&           
          buffers.index_key->data_generation != geometry.index->data_generation)) {
         auto updated = writer->UpdateBuffer(*buffers.index, geometry.index->bytes);
         if (updated.is_err())
-            return Err(
-                DrawBufferUpdateError { DrawBufferUpdateErrorKind::UploadFailed,
-                                        "buffer upload failed"_Str,
-                                        resource::ResourceErrorSnapshot(updated.unwrap_err()) });
+            return Err(DrawBufferUpdateError { DrawBufferUpdateErrorKind::UploadFailed,
+                                               "buffer upload failed"_Str,
+                                               Some(updated.unwrap_err()) });
         buffers.index_key->data_generation   = geometry.index->data_generation;
         buffers.index_key->content_confirmed = true;
     }

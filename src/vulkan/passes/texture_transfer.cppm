@@ -13,10 +13,11 @@ struct TextureTransferPrepared {
     Option<TextureMipmapProgram>  mips;
     auto Record(GraphRecordContext& context) const -> Result<empty, GraphExecutionError> {
         auto fail = [](graph_texture::Error error) -> Result<empty, GraphExecutionError> {
-            return Err(GraphExecutionError { GraphExecutionStage::Record,
-                                             {},
-                                             {},
-                                             vrento::vulkan::GraphExecutionCause::Texture(error) });
+            return Err(GraphExecutionError {
+                GraphExecutionStage::Record,
+                {},
+                {},
+                vrento::vulkan::GraphExecutionCause::Texture(rstd::move(error)) });
         };
         if (mips) {
             auto generated = mips->record(context.submission);

@@ -1106,7 +1106,7 @@ struct Impl<registry::TextureProducerFactory, vrento_test::producers::Factory>
         if (self().calls->fail_drain)
             return Err(vrento::resource::ResourceError::external(
                 rstd::format("producer drain"),
-                Arc<dyn<error::Error>>::make(tex::Error { tex::ErrorKind::Timeout })));
+                Box<dyn<error::Error>>::make(tex::Error { tex::ErrorKind::Timeout })));
         return Ok(empty {});
     }
 };
@@ -1175,7 +1175,7 @@ TEST(TextureProducerFactory, DrainPreservesOwnedDiagnostic) {
     calls->fail_drain = true;
     auto failed       = textures.DrainProducers(u64());
     ASSERT_TRUE(failed.is_err());
-    auto saved = failed.unwrap_err().clone();
+    auto saved = failed.unwrap_err();
     textures.ClearProducers();
     auto cause    = as<rstd::error::Error>(saved).source().unwrap()->source().unwrap();
     auto concrete = rstd::error::downcast_ref<tex::Error>(cause);

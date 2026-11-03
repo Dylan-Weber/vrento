@@ -37,12 +37,12 @@ enum class CompileKind
     Pass
 };
 struct CompileStatus {
-    GraphSerial                 id {};
-    CompileState                state { CompileState::Idle };
-    Option<GraphExecutionError> error;
-    CompileKind                 kind { CompileKind::Graph };
-    GraphSerial                 scope {};
-    CompileReason               reason { CompileReason::Initial };
+    GraphSerial                         id {};
+    CompileState                        state { CompileState::Idle };
+    Option<GraphExecutionErrorSnapshot> error;
+    CompileKind                         kind { CompileKind::Graph };
+    GraphSerial                         scope {};
+    CompileReason                       reason { CompileReason::Initial };
 };
 class Renderer {
     GraphSerial            next_compile_id_ {};
@@ -144,7 +144,7 @@ private:
         } else {
             const auto& error = result.as_ref().unwrap_err();
             status_.state     = CompileState::Failed;
-            status_.error     = Some(GraphExecutionError(error));
+            status_.error     = Some(GraphExecutionErrorSnapshot::capture(error));
             if (status_.state == CompileState::Failed) {
                 ++statistics_.compile_failures;
                 pending_ = None();
@@ -293,7 +293,7 @@ private:
                         auto error = result.unwrap_err();
                         error.pass = desc.execution().id;
                         pending_   = None();
-                        return Err(error);
+                        return Err(rstd::move(error));
                     }
                     if (! result->ready()) return Ok(CompileProgress::Pending);
                     auto completed = result->take_ready();

@@ -218,13 +218,11 @@ enum class ResourcePrepareState
     Cancelled
 };
 struct ResourcePrepareStatus {
-    u64                             id {};
-    ResourcePrepareState            state { ResourcePrepareState::Idle };
-    resource::ResourcePlanSections  sections {};
-    Option<resource::ResourceError> error;
-    auto                            clone() const -> ResourcePrepareStatus {
-        return { id, state, sections, error ? Some(error->clone()) : None() };
-    }
+    u64                                     id {};
+    ResourcePrepareState                    state { ResourcePrepareState::Idle };
+    resource::ResourcePlanSections          sections {};
+    Option<resource::ResourceErrorSnapshot> error;
+    auto clone() const -> ResourcePrepareStatus { return { id, state, sections, error.clone() }; }
 };
 
 struct ResourceStatistics {
@@ -381,7 +379,7 @@ public:
                 .message = rstd::format("texture prepare transaction is already active")
             };
             m_prepare_status.state = ResourcePrepareState::Failed;
-            m_prepare_status.error = Some(error.clone());
+            m_prepare_status.error = Some(resource::ResourceErrorSnapshot::capture(error));
             return Err(rstd::move(error));
         }
         auto image_backend  = dyn<TexturePrepareBackend>::from_ref(m_registries.Textures());
@@ -1088,7 +1086,7 @@ private:
     void FailPreparePlan(const resource::ResourceError& error) {
         AbortPreparePlan();
         m_prepare_status.state = ResourcePrepareState::Failed;
-        m_prepare_status.error = Some(error.clone());
+        m_prepare_status.error = Some(resource::ResourceErrorSnapshot::capture(error));
     }
     struct PipelineRecipeEntry {
         resource::PipelineUseHandle    use;

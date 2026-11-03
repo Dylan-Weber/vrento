@@ -55,6 +55,16 @@ struct Counts {
     bool fail {};
 };
 
+struct OwnedFailure {
+    int* drops;
+    explicit OwnedFailure(int& value): drops(&value) {}
+    OwnedFailure(const OwnedFailure&) = delete;
+    OwnedFailure(OwnedFailure&& other): drops(other.drops) { other.drops = nullptr; }
+    ~OwnedFailure() {
+        if (drops) ++*drops;
+    }
+};
+
 struct FakeTextureLoader {
     rstd::sync::Arc<Image> image;
 
@@ -74,6 +84,24 @@ struct FakeTextureLoader {
 
 namespace rstd
 {
+template<>
+struct Impl<fmt::Display, vrento_test::foundation::OwnedFailure>
+    : ImplBase<vrento_test::foundation::OwnedFailure> {
+    auto fmt(fmt::Formatter& formatter) const -> bool {
+        return formatter.write_str("owned failure"_str);
+    }
+};
+template<>
+struct Impl<fmt::Debug, vrento_test::foundation::OwnedFailure>
+    : ImplBase<vrento_test::foundation::OwnedFailure> {
+    auto fmt(fmt::Formatter& formatter) const -> bool {
+        return formatter.write_str("OwnedFailure"_str);
+    }
+};
+template<>
+struct Impl<error::Error, vrento_test::foundation::OwnedFailure>
+    : DefaultInImpl<error::Error, vrento_test::foundation::OwnedFailure> {};
+
 template<>
 struct Impl<resource::TextureLoader, vrento_test::foundation::FakeTextureLoader>
     : ImplBase<vrento_test::foundation::FakeTextureLoader> {
@@ -457,7 +485,7 @@ TEST(RenderFoundation, OutputRecipeRetainsShaderFailure) {
 }
 } // namespace vrento_test::foundation
 
-TEST(BackendErrors, DispatchSnapshotOwnsCommandAndMemoryDetails) {
+TEST(BackendErrors, OwnsCommandAndMemoryDetails) {
     using Cause = vrento::vulkan::BackendCause;
     auto make   = [] {
         auto               command = rstd::ffi::CString::from_raw_parts("vkCreateDevice");
@@ -470,13 +498,14 @@ TEST(BackendErrors, DispatchSnapshotOwnsCommandAndMemoryDetails) {
         };
     };
     auto error    = make();
-    auto snapshot = vrento::vulkan::BackendErrorSnapshot(error.clone());
-    EXPECT_EQ(snapshot.error().cause.as_Dispatch().error.command.as_str(), "vkCreateDevice"_str);
-    EXPECT_EQ(snapshot.error().cause.native(), VK_ERROR_INITIALIZATION_FAILED);
-    EXPECT_TRUE(as<rstd::error::Error>(snapshot.error()).source().is_some());
+    auto retained = rstd::move(error);
+    EXPECT_EQ(retained.cause.as_Dispatch().error.command.as_str(), "vkCreateDevice"_str);
+    EXPECT_EQ(retained.cause.native(), VK_ERROR_INITIALIZATION_FAILED);
+    EXPECT_TRUE(as<rstd::error::Error>(retained).source().is_some());
     vvk::MemoryError memory { .kind = vvk::MemoryErrorKind::PoolCapacity, .allocation_size = 4096 };
     auto             cause = Cause::Memory(memory);
-    EXPECT_EQ(cause.clone().as_Memory().error.allocation_size, 4096u);
+    auto             moved = rstd::move(cause);
+    EXPECT_EQ(moved.as_Memory().error.allocation_size, 4096u);
 }
 TEST(BackendErrors, MissingExtensionSurvivesSessionFailure) {
     vrento::vulkan::Extension            extension { true, "VK_VRENTO_missing_extension"_str };
@@ -487,8 +516,8 @@ TEST(BackendErrors, MissingExtensionSurvivesSessionFailure) {
     ASSERT_TRUE(result.is_err());
     auto error = result.unwrap_err();
     ASSERT_TRUE(error.cause);
-    ASSERT_TRUE(error.cause.error().cause.is_Unsupported());
-    EXPECT_EQ(error.cause.error().cause.as_Unsupported().capability.as_str(), extension.name);
+    ASSERT_TRUE(error.cause->cause.is_Unsupported());
+    EXPECT_EQ(error.cause->cause.as_Unsupported().capability.as_str(), extension.name);
 }
 
 TEST(BackendErrors, BufferRangeBusyAndCancellation) {
@@ -558,21 +587,43 @@ TEST(BufferUploadCache, RetiresOnlyIdleBlocksAndReusesWorkingSet) {
     EXPECT_EQ(session.validation_errors(), 0u);
 }
 
-TEST(BackendErrors, TextureSnapshotPreservesAllocationFailure) {
+TEST(BackendErrors, TextureOwnsAllocationFailureAndSnapshotsText) {
     auto make = [] {
         vvk::MemoryError memory { .kind            = vvk::MemoryErrorKind::PoolCapacity,
                                   .allocation_size = 8192 };
         return vrento::texture::Error::from_backend(
             { "flush image upload"_Str, vrento::vulkan::BackendCause::Memory(memory) });
     };
-    auto error    = make();
-    auto wrapped  = vrento::resource::ResourceError::texture(error, "record image upload"_Str);
-    auto snapshot = vrento::resource::ResourceErrorSnapshot(wrapped.clone());
-    wrapped       = {};
-    const auto& retained = snapshot.error().source->as_Texture().source;
+    auto error = make();
+    auto wrapped =
+        vrento::resource::ResourceError::texture(rstd::move(error), "record image upload"_Str);
+    auto        snapshot = vrento::resource::ResourceErrorSnapshot::capture(wrapped);
+    auto        owned    = rstd::move(wrapped);
+    const auto& retained = owned.source->as_Texture().source;
     ASSERT_TRUE(retained.backend);
-    EXPECT_EQ(retained.backend.error().cause.as_Memory().error.allocation_size, 8192u);
+    EXPECT_EQ(retained.backend->cause.as_Memory().error.allocation_size, 8192u);
     EXPECT_TRUE(as<rstd::error::Error>(retained).source().is_some());
+    owned = {};
+    EXPECT_FALSE(snapshot.diagnostic.sources.is_empty());
+}
+TEST(BackendErrors, DiagnosticDoesNotRetainOwnedCause) {
+    int                             drops {};
+    resource::ResourceErrorSnapshot snapshot;
+    {
+        auto error = resource::ResourceError::external(
+            "resource failed"_Str,
+            Box<dyn<rstd::error::Error>>::make(vrento_test::foundation::OwnedFailure(drops)));
+        snapshot   = resource::ResourceErrorSnapshot::capture(error);
+        auto moved = rstd::move(error);
+        auto cause = moved.source->as_External().source.deref();
+        EXPECT_TRUE(rstd::error::downcast_ref<vrento_test::foundation::OwnedFailure>(cause));
+        EXPECT_EQ(drops, 0);
+    }
+    EXPECT_EQ(drops, 1);
+    EXPECT_TRUE(snapshot.diagnostic.message.as_str().contains("resource failed"_str));
+    EXPECT_FALSE(snapshot.diagnostic.debug.is_empty());
+    ASSERT_FALSE(snapshot.diagnostic.sources.is_empty());
+    EXPECT_EQ(snapshot.diagnostic.sources[usize()].as_str(), "owned failure"_str);
 }
 TEST(BackendErrors, DriverCacheOwnsIoPath) {
     vrento::vulkan::Device              device;
@@ -581,7 +632,7 @@ TEST(BackendErrors, DriverCacheOwnsIoPath) {
     auto error = cache.load(device, path.as_path()).unwrap_err();
     path       = rstd::path::PathBuf {};
     ASSERT_TRUE(error.cause);
-    const auto& cause = error.cause.error().cause;
+    const auto& cause = error.cause->cause;
     ASSERT_TRUE(cause.is_Io());
     EXPECT_EQ(cause.as_Io().path.as_str(), "/vrento-missing-directory/errors-cache-test"_str);
     EXPECT_TRUE(as<rstd::error::Error>(cause).source().is_some());

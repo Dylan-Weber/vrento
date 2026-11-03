@@ -52,6 +52,7 @@ class GraphSubmission {
     Vec<graph_texture::SubmissionToken> tokens_;
     GraphSubmissionStatus               status_ { GraphSubmissionStatus::Submitted };
     Option<GraphExecutionError>         error_;
+    Option<GraphExecutionErrorSnapshot> diagnostic_;
     friend class GraphQueueProgram;
     explicit GraphSubmission(rstd::sync::Arc<GraphQueueState> owner): owner_(rstd::move(owner)) {}
 
@@ -59,6 +60,8 @@ public:
     GraphSubmission(GraphSubmission&&) = default;
     auto status() const -> GraphSubmissionStatus { return status_; }
     auto error() const -> const Option<GraphExecutionError>& { return error_; }
+    auto take_error() -> Option<GraphExecutionError> { return error_.take(); }
+    auto failure() const -> Option<GraphExecutionErrorSnapshot> { return diagnostic_.clone(); }
     auto accepted() const -> slice<graph_texture::SubmissionToken> { return tokens_.as_slice(); }
     auto poll() -> Result<bool, graph_texture::Error> {
         if (status_ == GraphSubmissionStatus::Uncertain)
@@ -237,10 +240,11 @@ public:
     auto execute() -> GraphSubmission {
         GraphSubmission result(state_.clone());
         auto            fail = [&](GraphExecutionError error, bool uncertain = false) {
-            result.status_ = uncertain                   ? GraphSubmissionStatus::Uncertain
-                             : result.tokens_.is_empty() ? GraphSubmissionStatus::Failed
-                                                         : GraphSubmissionStatus::Partial;
-            result.error_  = Some(rstd::move(error));
+            result.status_     = uncertain                   ? GraphSubmissionStatus::Uncertain
+                                 : result.tokens_.is_empty() ? GraphSubmissionStatus::Failed
+                                                             : GraphSubmissionStatus::Partial;
+            result.diagnostic_ = Some(GraphExecutionErrorSnapshot::capture(error));
+            result.error_      = Some(rstd::move(error));
         };
         if (state_->used) {
             fail(GraphExecutionError { GraphExecutionStage::Record });

@@ -72,7 +72,7 @@ enum class DrawUpdateOutcome
 struct DrawBufferUpdateError {
     DrawBufferUpdateErrorKind       kind;
     String                          message;
-    resource::ResourceErrorSnapshot source;
+    Option<resource::ResourceError> source;
 };
 
 String BuildDrawBufferResourceName(DrawId, DrawBufferRole, u32 stream_index = u32());
@@ -113,7 +113,7 @@ template<>
 struct Impl<error::Error, vrento::DrawBufferUpdateError> : ImplBase<vrento::DrawBufferUpdateError> {
     auto source() const noexcept -> Option<error::ErrorRef> {
         const auto& e = this->self();
-        if (e.source) return Some(dyn<error::Error>::from_ref(e.source.error()));
+        if (e.source) return Some(dyn<error::Error>::from_ref(*e.source));
         return None();
     }
 };

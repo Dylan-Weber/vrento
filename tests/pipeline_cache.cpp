@@ -9,6 +9,7 @@ using namespace rstd::prelude;
 using namespace rstd::literals;
 using namespace vrento::vulkan;
 using namespace vrento::resource_registry;
+using rstd::sync::Arc;
 
 namespace vrento_test::pipeline_cache
 {
@@ -53,6 +54,47 @@ TEST(PipelineCache, CompatibilityKey) {
     original.multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     original.raster.cullMode                  = VK_CULL_MODE_FRONT_BIT;
     rstd_assert(! SamePipelineCacheKey(key, MakePipelineCacheKey(original)));
+}
+TEST(PipelineCache, FailureIsTakenOnceAndDiagnosticRemains) {
+    PipelineBuild build({},
+                        Arc<vvk::RenderPass>::make(),
+                        Arc<PipelineLayoutResourceEntry>::make(),
+                        Arc<vvk::PipelineCache>::make());
+    EXPECT_FALSE(build.take_error());
+    build.fail(
+        vrento::resource::ResourceError { .message = "pipeline failure"_Str,
+                                          .source  = Some(vrento::resource::ResourceErrorSource::Io(
+                                              rstd::io::Error::from_raw_os_error(i32(5)))) });
+    EXPECT_EQ(build.status(), PipelineReadiness::Failed);
+    auto diagnostic = build.error();
+    ASSERT_TRUE(diagnostic);
+    EXPECT_TRUE(build.error());
+    auto owned = build.take_error();
+    ASSERT_TRUE(owned);
+    ASSERT_TRUE(owned->source->is_Io());
+    EXPECT_EQ(owned->source->as_Io().source.raw_os_error().unwrap(), i32(5));
+    EXPECT_FALSE(build.take_error());
+    EXPECT_EQ(build.status(), PipelineReadiness::Failed);
+    build.cancel();
+    build.fail(vrento::resource::ResourceError { .message = "late failure"_Str });
+    EXPECT_FALSE(build.take_error());
+    owned = None();
+    EXPECT_TRUE(build.error()->diagnostic.message.as_str().contains("pipeline failure"_str));
+    EXPECT_FALSE(diagnostic->diagnostic.sources.is_empty());
+}
+TEST(PipelineCache, CancelledBuildKeepsFailedStatusAfterDelivery) {
+    PipelineBuild build({},
+                        Arc<vvk::RenderPass>::make(),
+                        Arc<PipelineLayoutResourceEntry>::make(),
+                        Arc<vvk::PipelineCache>::make());
+    build.cancel();
+    auto owned = build.take_error();
+    ASSERT_TRUE(owned);
+    EXPECT_EQ(owned->kind, vrento::resource::ResourceErrorKind::Cancelled);
+    EXPECT_EQ(build.status(), PipelineReadiness::Failed);
+    build.cancel();
+    EXPECT_FALSE(build.take_error());
+    EXPECT_EQ(build.error()->kind, vrento::resource::ResourceErrorKind::Cancelled);
 }
 TEST(PipelineCache, ClonesShareCodeAndKeysCompareFullContent) {
     auto        original  = request({ u64(1), u64(1) });
@@ -244,11 +286,21 @@ TEST(PipelineCache, AsyncPreparation) {
     auto again = preparer.poll(duplicate).unwrap();
     rstd_assert(again.pipeline->handle == ready.pipeline->handle);
     rstd_assert(graphics.pipelines.stats().creations == u64(2));
-    rstd_assert(preparer.poll(low)->status == PipelineReadiness::Failed);
+    auto failed = preparer.poll(low).unwrap();
+    EXPECT_EQ(failed.status, PipelineReadiness::Failed);
+    EXPECT_FALSE(failed.error);
+    ASSERT_TRUE(failed.diagnostic);
+    EXPECT_EQ(failed.diagnostic->kind, vrento::resource::ResourceErrorKind::Cancelled);
+    auto cancelled = preparer.take_error(low);
+    ASSERT_TRUE(cancelled);
+    EXPECT_EQ(cancelled->kind, vrento::resource::ResourceErrorKind::Cancelled);
+    EXPECT_FALSE(preparer.take_error(low));
+    EXPECT_EQ(preparer.poll(low)->status, PipelineReadiness::Failed);
     rstd_assert(preparer.request(high_recipe, scope).unwrap_err().kind ==
                 vrento::resource::ResourceErrorKind::Closed);
     auto retry   = PipelinePreparer::create(session).unwrap();
     auto retried = retry.request(low_recipe, scope, 0, true).unwrap();
+    EXPECT_FALSE(rstd::sync::Arc<PipelineBuild>::ptr_eq(low.build, retried.build));
     retry.advance();
     retry.close();
     rstd_assert(retry.poll(retried)->status == PipelineReadiness::Ready);

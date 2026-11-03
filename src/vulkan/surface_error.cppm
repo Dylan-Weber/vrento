@@ -3,7 +3,6 @@ import rstd;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
-using rstd::sync::Arc;
 
 export namespace vrento
 {
@@ -19,9 +18,7 @@ enum class FrameSurfaceErrorKind
 
 struct FrameSurfaceError {
     FrameSurfaceErrorKind                kind;
-    Option<Arc<dyn<rstd::error::Error>>> cause;
-
-    auto clone() const -> FrameSurfaceError { return { kind, cause.clone() }; }
+    Option<Box<dyn<rstd::error::Error>>> cause;
 };
 } // namespace vrento
 

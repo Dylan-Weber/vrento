@@ -263,7 +263,7 @@ void compute_output(DeviceSession session, QueueParameters compute, QueueParamet
                            unsigned(error.stage),
                            error.pass.value,
                            error.resource.value,
-                           error.texture_error() ? int(error.texture_error()->kind)
+                           error.texture_error() ? int((*error.texture_error())->kind)
                                                  : int(error.native_result()));
     }
     auto program   = prepared.unwrap();
@@ -273,7 +273,7 @@ void compute_output(DeviceSession session, QueueParameters compute, QueueParamet
                            unsigned(submitted.error()->stage),
                            submitted.error()->resource.value,
                            submitted.error()->texture_error()
-                               ? unsigned(submitted.error()->texture_error()->kind)
+                               ? unsigned((*submitted.error()->texture_error())->kind)
                                : 0);
     rstd_assert(submitted.status() == GraphSubmissionStatus::Submitted);
     submitted.wait().unwrap();

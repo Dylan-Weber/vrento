@@ -22,10 +22,10 @@ enum class DeviceSessionStage
 struct DeviceSessionError {
     DeviceSessionStage   stage;
     VkResult             result { VK_SUCCESS };
-    BackendErrorSnapshot cause;
+    Option<BackendError> cause;
     static auto          from(DeviceSessionStage stage, BackendError error) -> DeviceSessionError {
         auto native = error.cause.native();
-        return { stage, native, BackendErrorSnapshot(rstd::move(error)) };
+        return { stage, native, Some(rstd::move(error)) };
     }
 };
 using SurfaceLifetime = rstd::any::Any;
@@ -250,8 +250,7 @@ struct Impl<error::Error, vrento::vulkan::DeviceSessionError>
     : ImplBase<vrento::vulkan::DeviceSessionError> {
     auto source() const noexcept -> Option<error::ErrorRef> {
         const auto& e = this->self();
-        return e.cause ? Some(dyn<error::Error>::from_ref(e.cause.error()))
-                       : None<error::ErrorRef>();
+        return e.cause ? Some(dyn<error::Error>::from_ref(*e.cause)) : None<error::ErrorRef>();
     }
 };
 } // namespace rstd
