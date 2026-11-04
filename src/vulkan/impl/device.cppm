@@ -219,14 +219,20 @@ auto Device::TryCreate(Instance& inst, slice<Extension> exts, VkExtent2D extent,
     supported_timeline.pNext    = &supported_ycbcr;
     const bool has_draw_parameters = inst.api_version() >= VK_API_VERSION_1_1 &&
                                      device.m_gpu.GetProperties().apiVersion >= VK_API_VERSION_1_1;
+    const bool has_demote = tested_exts.contains(
+        "VK_EXT_shader_demote_to_helper_invocation"_str);
+    VkPhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT supported_demote {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT,
+        .pNext = &supported_timeline,
+    };
     VkPhysicalDeviceShaderDrawParametersFeatures supported_draw_parameters {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES,
-        .pNext = &supported_timeline,
+        .pNext = has_demote ? static_cast<void*>(&supported_demote) : &supported_timeline,
     };
     VkPhysicalDeviceFeatures2KHR supported2 {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR,
         .pNext = has_draw_parameters ? static_cast<void*>(&supported_draw_parameters)
-                                    : &supported_timeline,
+                                    : (has_demote ? static_cast<void*>(&supported_demote) : &supported_timeline),
     };
     device.m_gpu.GetFeatures2KHR(supported2);
     if (! supported_timeline.timelineSemaphore) {
@@ -298,9 +304,15 @@ auto Device::TryCreate(Instance& inst, slice<Extension> exts, VkExtent2D extent,
     enabled_timeline.pNext = &enabled_ycbcr;
     const bool enable_draw_parameters =
         has_draw_parameters && supported_draw_parameters.shaderDrawParameters;
+    const bool enable_demote = has_demote && supported_demote.shaderDemoteToHelperInvocation;
+    VkPhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT enabled_demote {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT,
+        .pNext = &enabled_timeline,
+        .shaderDemoteToHelperInvocation = VK_TRUE,
+    };
     VkPhysicalDeviceShaderDrawParametersFeatures enabled_draw_parameters {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES,
-        .pNext = &enabled_timeline,
+        .pNext = enable_demote ? static_cast<void*>(&enabled_demote) : &enabled_timeline,
         .shaderDrawParameters = enable_draw_parameters ? VK_TRUE : VK_FALSE,
     };
 
@@ -310,7 +322,7 @@ auto Device::TryCreate(Instance& inst, slice<Extension> exts, VkExtent2D extent,
     VkDeviceCreateInfo device_info {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = has_draw_parameters ? static_cast<void*>(&enabled_draw_parameters)
-                                    : &enabled_timeline,
+                                    : (enable_demote ? static_cast<void*>(&enabled_demote) : &enabled_timeline),
         .queueCreateInfoCount =
             static_cast<rstd::uint32_t>(queue_create_infos.len().to_primitive()),
         .pQueueCreateInfos       = queue_create_infos.data(),
@@ -350,6 +362,18 @@ auto Device::TryCreate(Instance& inst, slice<Extension> exts, VkExtent2D extent,
         device.m_gpu.GetProperties2KHR(properties);
         max_push_descriptors = push_properties.maxPushDescriptors;
     }
+    VkPhysicalDeviceFloatControlsProperties float_properties {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES,
+    };
+    if (tested_exts.contains("VK_KHR_shader_float_controls"_str) ||
+        (inst.api_version() >= VK_API_VERSION_1_2 &&
+         device.m_gpu.GetProperties().apiVersion >= VK_API_VERSION_1_2)) {
+        VkPhysicalDeviceProperties2 properties {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &float_properties,
+        };
+        device.m_gpu.GetProperties2KHR(properties);
+    }
     device.m_capabilities = DeviceCapabilities {
         .timeline_semaphore = true,
         .shader_draw_parameters = enable_draw_parameters,
@@ -377,6 +401,9 @@ auto Device::TryCreate(Instance& inst, slice<Extension> exts, VkExtent2D extent,
             CStr::from_ptr(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME).to_str().unwrap()),
         .graphics_queue_family = device.m_graphics_queue.family_index,
         .present_queue_family  = device.m_present_queue.family_index,
+        .shader_demote_to_helper_invocation = enable_demote,
+        .shader_denorm_flush_to_zero_float32 = float_properties.shaderDenormFlushToZeroFloat32 != VK_FALSE,
+        .shader_signed_zero_inf_nan_preserve_float32 = float_properties.shaderSignedZeroInfNanPreserveFloat32 != VK_FALSE,
     };
 
     if (rq_surface) {

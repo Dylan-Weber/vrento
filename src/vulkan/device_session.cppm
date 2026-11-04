@@ -145,6 +145,8 @@ public:
         }
         Vec<Extension> extensions;
         extensions.push({ true, "VK_KHR_timeline_semaphore"_str });
+        extensions.push({ false, "VK_EXT_shader_demote_to_helper_invocation"_str });
+        extensions.push({ false, "VK_KHR_shader_float_controls"_str });
         for (const auto& extension : options.device_extensions)
             extensions.push(Extension(extension));
         Option<BackendError> rejected;

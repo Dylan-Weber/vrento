@@ -739,6 +739,9 @@ struct DeviceCapabilities {
     bool           foreign_queue { false };
     rstd::uint32_t graphics_queue_family { VK_QUEUE_FAMILY_IGNORED };
     rstd::uint32_t present_queue_family { VK_QUEUE_FAMILY_IGNORED };
+    bool           shader_demote_to_helper_invocation { false };
+    bool           shader_denorm_flush_to_zero_float32 { false };
+    bool           shader_signed_zero_inf_nan_preserve_float32 { false };
 
     bool shadow_multi_viewport() const noexcept {
         return multi_viewport && shader_output_viewport_index;
