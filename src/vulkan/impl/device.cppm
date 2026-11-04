@@ -215,12 +215,11 @@ auto Device::TryCreate(Instance& inst, slice<Extension> exts, VkExtent2D extent,
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT,
     };
     if (maintenance) supported_ycbcr.pNext = &supported_maintenance;
-    supported_maintenance.pNext = &supported_sync2;
-    supported_timeline.pNext    = &supported_ycbcr;
+    supported_maintenance.pNext    = &supported_sync2;
+    supported_timeline.pNext       = &supported_ycbcr;
     const bool has_draw_parameters = inst.api_version() >= VK_API_VERSION_1_1 &&
                                      device.m_gpu.GetProperties().apiVersion >= VK_API_VERSION_1_1;
-    const bool has_demote = tested_exts.contains(
-        "VK_EXT_shader_demote_to_helper_invocation"_str);
+    const bool has_demote = tested_exts.contains("VK_EXT_shader_demote_to_helper_invocation"_str);
     VkPhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT supported_demote {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT,
         .pNext = &supported_timeline,
@@ -231,8 +230,9 @@ auto Device::TryCreate(Instance& inst, slice<Extension> exts, VkExtent2D extent,
     };
     VkPhysicalDeviceFeatures2KHR supported2 {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR,
-        .pNext = has_draw_parameters ? static_cast<void*>(&supported_draw_parameters)
-                                    : (has_demote ? static_cast<void*>(&supported_demote) : &supported_timeline),
+        .pNext = has_draw_parameters
+                     ? static_cast<void*>(&supported_draw_parameters)
+                     : (has_demote ? static_cast<void*>(&supported_demote) : &supported_timeline),
     };
     device.m_gpu.GetFeatures2KHR(supported2);
     if (! supported_timeline.timelineSemaphore) {
@@ -321,8 +321,9 @@ auto Device::TryCreate(Instance& inst, slice<Extension> exts, VkExtent2D extent,
     auto               queue_create_infos = queues.unwrap();
     VkDeviceCreateInfo device_info {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = has_draw_parameters ? static_cast<void*>(&enabled_draw_parameters)
-                                    : (enable_demote ? static_cast<void*>(&enabled_demote) : &enabled_timeline),
+        .pNext = has_draw_parameters
+                     ? static_cast<void*>(&enabled_draw_parameters)
+                     : (enable_demote ? static_cast<void*>(&enabled_demote) : &enabled_timeline),
         .queueCreateInfoCount =
             static_cast<rstd::uint32_t>(queue_create_infos.len().to_primitive()),
         .pQueueCreateInfos       = queue_create_infos.data(),
@@ -375,11 +376,11 @@ auto Device::TryCreate(Instance& inst, slice<Extension> exts, VkExtent2D extent,
         device.m_gpu.GetProperties2KHR(properties);
     }
     device.m_capabilities = DeviceCapabilities {
-        .timeline_semaphore = true,
+        .timeline_semaphore     = true,
         .shader_draw_parameters = enable_draw_parameters,
-        .geometry_shader    = supported2.features.geometryShader != VK_FALSE,
-        .synchronization2   = enable_sync2,
-        .push_descriptor    = tested_exts.contains(
+        .geometry_shader        = supported2.features.geometryShader != VK_FALSE,
+        .synchronization2       = enable_sync2,
+        .push_descriptor        = tested_exts.contains(
             CStr::from_ptr(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME).to_str().unwrap()),
         .max_push_descriptors                 = max_push_descriptors,
         .multi_viewport                       = enable_multi_viewport,
@@ -399,11 +400,15 @@ auto Device::TryCreate(Instance& inst, slice<Extension> exts, VkExtent2D extent,
             CStr::from_ptr(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME).to_str().unwrap()),
         .foreign_queue = tested_exts.contains(
             CStr::from_ptr(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME).to_str().unwrap()),
-        .graphics_queue_family = device.m_graphics_queue.family_index,
-        .present_queue_family  = device.m_present_queue.family_index,
+        .graphics_queue_family              = device.m_graphics_queue.family_index,
+        .present_queue_family               = device.m_present_queue.family_index,
         .shader_demote_to_helper_invocation = enable_demote,
-        .shader_denorm_flush_to_zero_float32 = float_properties.shaderDenormFlushToZeroFloat32 != VK_FALSE,
-        .shader_signed_zero_inf_nan_preserve_float32 = float_properties.shaderSignedZeroInfNanPreserveFloat32 != VK_FALSE,
+        .shader_denorm_flush_to_zero_float32 =
+            float_properties.shaderDenormFlushToZeroFloat32 != VK_FALSE,
+        .shader_signed_zero_inf_nan_preserve_float32 =
+            float_properties.shaderSignedZeroInfNanPreserveFloat32 != VK_FALSE,
+        .max_sampler_anisotropy =
+            enabled.samplerAnisotropy ? device.m_limits.maxSamplerAnisotropy : 1,
     };
 
     if (rq_surface) {

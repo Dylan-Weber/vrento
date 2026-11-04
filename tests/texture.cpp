@@ -291,6 +291,18 @@ TEST(Texture, PublicApi) {
                     .unwrap_err()
                     .kind == ErrorKind::Invalid);
 }
+TEST(Texture, SamplerAnisotropy) {
+    SamplerDesc desc;
+    rstd_assert(desc.max_anisotropy == 1 && validate_sampler(desc).is_ok());
+    desc.max_anisotropy = 16;
+    rstd_assert(validate_sampler(desc).is_ok());
+    float invalid[] { -1, 0, 0.5f, f32::INFINITY_.to_primitive(), f32::NAN_.to_primitive() };
+    for (float value : invalid) {
+        desc.max_anisotropy = value;
+        rstd_assert(validate_sampler(desc).unwrap_err().kind == ErrorKind::Invalid);
+    }
+}
+
 TEST(Texture, MetadataAndContentDescriptionsAgree) {
     for (auto kind : array<ImageKind, 2> { ImageKind::Pixels, ImageKind::Video }) {
         Image image;

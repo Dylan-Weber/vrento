@@ -204,7 +204,8 @@ TEST(TextureVulkan, UploadLayoutsPreserveMipAndLayerPayloads) {
     auto  device  = vk::TextureContext::create(session).unwrap();
     usize tested_formats {};
     for (auto format : array<vrento::TextureFormat, 3> { vrento::TextureFormat::RGBA8,
-                                                         vrento::TextureFormat::BC1, vrento::TextureFormat::R11G11B10F }) {
+                                                         vrento::TextureFormat::BC1,
+                                                         vrento::TextureFormat::R11G11B10F }) {
         tex::TextureDesc desc;
         desc.dimension  = tex::Dimension::Array2D;
         desc.extent     = { 12, 8 };
@@ -253,7 +254,8 @@ TEST(TextureVulkan, UploadLayoutsPreserveMipAndLayerPayloads) {
                 }
             }
         }
-        if (format==vrento::TextureFormat::R11G11B10F) rstd::io::println("R11G11B10F mip, layer and pitched payloads verified");
+        if (format == vrento::TextureFormat::R11G11B10F)
+            rstd::io::println("R11G11B10F mip, layer and pitched payloads verified");
     }
     EXPECT_GT(tested_formats, usize());
     EXPECT_EQ(session.validation_errors(), 0u);
@@ -434,6 +436,37 @@ TEST(TextureVulkan, ImageStagingRowsAndLeaseLifetime) {
     EXPECT_EQ(uploads.statistics().capacity_bytes, 0u);
     EXPECT_EQ(session.validation_errors(), 0u);
 }
+TEST(TextureVulkan, SamplerAnisotropy) {
+    auto             session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto             context = vk::TextureContext::create(session).unwrap();
+    auto             factory = dyn<tex::TextureDevice>::from_ref(context);
+    tex::SamplerDesc desc;
+    desc.sample.minFilter = desc.sample.magFilter = vrento::TextureFilter::LINEAR;
+    auto isotropic                                = factory->CreateSampler(desc).unwrap();
+    rstd_assert(isotropic.description().max_anisotropy == 1);
+    rstd_assert(vk::native_sampler(isotropic).unwrap() ==
+                vk::native_sampler(factory->CreateSampler(desc).unwrap()).unwrap());
+    auto maximum = session.device().capabilities().max_sampler_anisotropy;
+    rstd_assert(rstd::f32(maximum).is_finite() && maximum >= 1);
+    if (maximum > 1) {
+        desc.max_anisotropy = maximum;
+        auto anisotropic    = factory->CreateSampler(desc).unwrap();
+        rstd_assert(anisotropic.description().max_anisotropy == maximum);
+        rstd_assert(vk::native_sampler(anisotropic).unwrap() !=
+                    vk::native_sampler(isotropic).unwrap());
+        rstd_assert(vk::native_sampler(anisotropic).unwrap() ==
+                    vk::native_sampler(factory->CreateSampler(desc).unwrap()).unwrap());
+    }
+    desc.max_anisotropy = maximum + 1;
+    rstd_assert(factory->CreateSampler(desc).unwrap_err().kind == tex::ErrorKind::Unsupported);
+    float invalid[] { 0.5f, f32::INFINITY_.to_primitive(), f32::NAN_.to_primitive() };
+    for (float value : invalid) {
+        desc.max_anisotropy = value;
+        rstd_assert(factory->CreateSampler(desc).unwrap_err().kind == tex::ErrorKind::Invalid);
+    }
+    rstd_assert(session.validation_errors() == 0);
+}
+
 TEST(TextureVulkan, Resources) {
     auto             session = vk::DeviceSession::create({ .validation = true }).unwrap();
     auto             device  = vk::TextureContext::create(session).unwrap();

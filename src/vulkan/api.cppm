@@ -742,6 +742,7 @@ struct DeviceCapabilities {
     bool           shader_demote_to_helper_invocation { false };
     bool           shader_denorm_flush_to_zero_float32 { false };
     bool           shader_signed_zero_inf_nan_preserve_float32 { false };
+    float          max_sampler_anisotropy { 1 };
 
     bool shadow_multi_viewport() const noexcept {
         return multi_viewport && shader_output_viewport_index;

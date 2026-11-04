@@ -100,15 +100,14 @@ inline auto image_usage(tex::Usage usage) -> VkImageUsageFlags {
     return flags;
 }
 inline auto texture_format(VkFormat format) -> Result<TextureFormat, tex::Error> {
-    TextureFormat values[] { TextureFormat::BC1,        TextureFormat::BC2,
-                             TextureFormat::BC3,        TextureFormat::RGB8,
-                             TextureFormat::RGBA8,      TextureFormat::RG8,
-                             TextureFormat::R8,         TextureFormat::D32F,
-                             TextureFormat::RGBA8_SRGB, TextureFormat::RGBA32F,
-                             TextureFormat::BGRA8,      TextureFormat::BGRA8_SRGB,
-                             TextureFormat::RGBA16F,    TextureFormat::R11G11B10F,
-                             TextureFormat::R16F,       TextureFormat::R32F,
-                             TextureFormat::D32FS8 };
+    TextureFormat values[] {
+        TextureFormat::BC1,     TextureFormat::BC2,        TextureFormat::BC3,
+        TextureFormat::RGB8,    TextureFormat::RGBA8,      TextureFormat::RG8,
+        TextureFormat::R8,      TextureFormat::D32F,       TextureFormat::RGBA8_SRGB,
+        TextureFormat::RGBA32F, TextureFormat::BGRA8,      TextureFormat::BGRA8_SRGB,
+        TextureFormat::RGBA16F, TextureFormat::R11G11B10F, TextureFormat::R16F,
+        TextureFormat::R32F,    TextureFormat::D32FS8
+    };
     for (auto value : values)
         if (ToVkType(value) == format) return Ok(TextureFormat(value));
     return Err(tex::Error { tex::ErrorKind::Unsupported });
@@ -801,11 +800,9 @@ public:
                 if (transfer && ! acquire && source.queue_family == family)
                     barrier.dstAccessMask = 0;
                 barrier.image            = native.unwrap();
-                barrier.subresourceRange = { texture_aspects(texture.description().format),
-                                             mip,
-                                             1,
-                                             layer,
-                                             1 };
+                barrier.subresourceRange = {
+                    texture_aspects(texture.description().format), mip, 1, layer, 1
+                };
                 if (emit_barrier)
                     device.Dispatch().vkCmdPipelineBarrier(
                         command,
@@ -1628,7 +1625,8 @@ auto TextureContext::CreateSampler(const tex::SamplerDesc& desc)
     auto valid = tex::validate_sampler(desc);
     if (valid.is_err()) return Err(valid.unwrap_err());
     if (rstd::f32(desc.lod_bias).abs().to_primitive() >
-        session().device().limits().maxSamplerLodBias)
+            session().device().limits().maxSamplerLodBias ||
+        desc.max_anisotropy > session().device().capabilities().max_sampler_anisotropy)
         return Err(tex::Error { tex::ErrorKind::Unsupported });
     auto& s = desc.sample;
     for (auto& previous : samplers_) {
@@ -1638,7 +1636,8 @@ auto TextureContext::CreateSampler(const tex::SamplerDesc& desc)
             p.minFilter == s.minFilter && p.mipFilter == s.mipFilter &&
             p.compare_enable == s.compare_enable && p.compare_op == s.compare_op &&
             p.border_color == s.border_color && d.wrap_w == desc.wrap_w &&
-            d.min_lod == desc.min_lod && d.max_lod == desc.max_lod && d.lod_bias == desc.lod_bias)
+            d.min_lod == desc.min_lod && d.max_lod == desc.max_lod && d.lod_bias == desc.lod_bias &&
+            d.max_anisotropy == desc.max_anisotropy)
             return Ok(tex::SamplerRef(previous));
     }
     VkSamplerCreateInfo info { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -1652,13 +1651,15 @@ auto TextureContext::CreateSampler(const tex::SamplerDesc& desc)
     info.mipLodBias   = desc.lod_bias;
     info.minLod       = desc.min_lod;
     info.maxLod       = s.mipFilter == TextureMipmapFilter::None ? 0 : desc.max_lod;
-    info.compareEnable = s.compare_enable;
-    info.compareOp     = ToVkType(s.compare_op);
-    info.borderColor   = s.border_color == TextureBorderColor::TransparentBlack
-                             ? VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
-                         : s.border_color == TextureBorderColor::OpaqueBlack
-                             ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK
-                             : VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    info.anisotropyEnable = desc.max_anisotropy > 1;
+    info.maxAnisotropy    = desc.max_anisotropy;
+    info.compareEnable    = s.compare_enable;
+    info.compareOp        = ToVkType(s.compare_op);
+    info.borderColor      = s.border_color == TextureBorderColor::TransparentBlack
+                                ? VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
+                            : s.border_color == TextureBorderColor::OpaqueBlack
+                                ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK
+                                : VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
     vvk::Sampler sampler;
     auto         result =
         session().observe_result(session().device().handle().CreateSampler(info, sampler));
