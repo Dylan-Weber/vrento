@@ -41,6 +41,7 @@ struct ErrorSnapshot {
     ErrorKind       kind;
     rstd::int32_t   native {};
     ErrorDiagnostic diagnostic;
+    auto            clone() const -> ErrorSnapshot { return *this; }
     static auto     capture(const Error&) -> ErrorSnapshot;
 };
 enum class Dimension

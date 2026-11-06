@@ -86,19 +86,28 @@ struct GraphExecutionError {
 };
 
 struct GraphExecutionErrorSnapshot {
-    GraphExecutionStage stage;
-    PassId              pass;
-    ResourceId          resource;
-    VkResult            native;
-    ErrorDiagnostic     diagnostic;
-    auto                native_result() const -> VkResult { return native; }
-    static auto         capture(const GraphExecutionError&) -> GraphExecutionErrorSnapshot;
+    GraphExecutionStage            stage;
+    PassId                         pass;
+    ResourceId                     resource;
+    VkResult                       native;
+    Option<texture::ErrorSnapshot> texture;
+    ErrorDiagnostic                diagnostic;
+    auto                           native_result() const -> VkResult { return native; }
+    auto                           clone() const -> GraphExecutionErrorSnapshot {
+        return { stage, pass, resource, native, texture.clone(), diagnostic };
+    }
+    static auto capture(const GraphExecutionError&) -> GraphExecutionErrorSnapshot;
 };
 
 } // namespace vrento::vulkan
 
 export namespace rstd
 {
+template<>
+struct Impl<clone::Clone, vrento::vulkan::GraphExecutionErrorSnapshot>
+    : DefaultInImpl<clone::Clone, vrento::vulkan::GraphExecutionErrorSnapshot> {
+    auto clone() const -> vrento::vulkan::GraphExecutionErrorSnapshot { return self().clone(); }
+};
 template<>
 struct Impl<fmt::Display, vrento::vulkan::GraphExecutionCause>
     : ImplBase<vrento::vulkan::GraphExecutionCause> {
@@ -162,6 +171,9 @@ inline auto GraphExecutionErrorSnapshot::capture(const GraphExecutionError& erro
              error.pass,
              error.resource,
              error.native_result(),
+             error.cause.is_Texture()
+                 ? Some(texture::ErrorSnapshot::capture(error.cause.as_Texture().error))
+                 : None<texture::ErrorSnapshot>(),
              ErrorDiagnostic::capture(error) };
 }
 } // namespace vrento::vulkan
