@@ -159,6 +159,56 @@ static void SourceOwnership() {
     rstd_assert(state->destroyed == u32(1));
 }
 
+TEST(Uniform, DetachesNodesAndReusesSourcesWithoutInvalidatingRetainedOwners) {
+    auto                    state = rstd::sync::Arc<State>::make();
+    UniformRegistry<NodeId> registry;
+    const NodeId            first { u32(1), u32(1) };
+    const NodeId            second { u32(2), u32(1) };
+    auto                    id       = registry.RegisterSource(Source(state.clone()));
+    auto                    retained = registry.Retain(id);
+    rstd_assert(registry.AttachNode(first, id));
+    rstd_assert(registry.AttachNode(first, id, i32(5)));
+    rstd_assert(registry.AttachNode(second, id));
+    rstd_assert(! registry.Unregister(id));
+    auto first_detached = registry.DetachNode(first);
+    rstd_assert(first_detached.len() == usize(1));
+    rstd_assert(first_detached[usize()].priority == i32(5));
+    rstd_assert(registry.DetachNode(first).is_empty());
+    rstd_assert(! registry.Unregister(id));
+    rstd_assert(registry.DetachNode(second).len() == usize(1));
+    rstd_assert(registry.Unregister(id));
+    rstd_assert(registry.Resolve(id).is_none());
+    rstd_assert(registry.Size() == usize());
+    rstd_assert(state->destroyed == u32());
+    auto replacement = registry.RegisterSource(Source(state.clone()));
+    rstd_assert(replacement.index == id.index);
+    rstd_assert(replacement.generation != id.generation);
+    rstd_assert(registry.Resolve(id).is_none());
+    rstd_assert(registry.Resolve(replacement).is_some());
+    registry.Reset();
+    auto after_reset = registry.RegisterSource(Source(state.clone()));
+    rstd_assert(registry.Resolve(replacement).is_none());
+    rstd_assert(registry.Resolve(after_reset).is_some());
+    retained = None();
+    rstd_assert(state->destroyed == u32(2));
+}
+
+TEST(Uniform, AttachedGlobalAndBlockSourcesCannotBeUnregistered) {
+    auto                    state = rstd::sync::Arc<State>::make();
+    UniformRegistry<NodeId> registry;
+    auto                    global = registry.RegisterSource(Source(state.clone()));
+    auto                    block  = registry.RegisterSource(Source(state.clone()));
+    rstd_assert(registry.AttachGlobal(global));
+    rstd_assert(! registry.Unregister(global));
+    UniformBlockDefinition definition {
+        .identity = u64(1),
+        .name     = "test"_Str,
+    };
+    definition.sources.push(UniformSourceAttachment { .source = block });
+    rstd_assert(registry.RegisterBlock(rstd::move(definition)));
+    rstd_assert(! registry.Unregister(block));
+}
+
 static void ValuesAndLayout() {
     rstd::array<float, 20> values {};
     for (usize index {}; index < values.len(); ++index) values[index] = float(index.to_primitive());

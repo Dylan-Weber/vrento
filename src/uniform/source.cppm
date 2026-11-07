@@ -269,11 +269,22 @@ template<typename NodeId>
 class UniformRegistry {
 public:
     auto Register(Box<dyn<UniformSource>> source) -> UniformSourceId {
+        auto generation   = m_next_generation;
+        m_next_generation = m_next_generation.checked_add(u32(1)).unwrap();
+        usize index;
+        if (m_free_sources.is_empty()) {
+            index = m_sources.len();
+            m_sources.push(SourceSlot {});
+        } else {
+            index = rstd::as_cast<usize>(m_free_sources.pop().unwrap());
+        }
         auto id = UniformSourceId {
-            .index      = rstd::as_cast<u32>(m_sources.len()),
-            .generation = m_generation,
+            .index      = rstd::as_cast<u32>(index),
+            .generation = generation,
         };
-        m_sources.push(UniformSourceOwner::make(rstd::move(source)));
+        m_sources[index].generation = generation;
+        m_sources[index].source     = Some(UniformSourceOwner::make(rstd::move(source)));
+        ++m_source_count;
         return id;
     }
 
@@ -283,21 +294,34 @@ public:
     }
 
     auto Resolve(UniformSourceId id) const -> Option<ref<dyn<UniformSource>>> {
-        if (! id.Valid() || id.generation != m_generation ||
-            rstd::as_cast<usize>(id.index) >= m_sources.len()) {
+        if (! id.Valid() || rstd::as_cast<usize>(id.index) >= m_sources.len()) {
             return None();
         }
-        return Some(m_sources[rstd::as_cast<usize>(id.index)]->as_ref());
+        const auto& slot = m_sources[rstd::as_cast<usize>(id.index)];
+        if (slot.generation != id.generation || slot.source.is_none()) return None();
+        return Some((*slot.source)->as_ref());
     }
 
     auto Retain(UniformSourceId id) const -> Option<UniformSourceOwner> {
         if (Resolve(id).is_none()) return None();
-        return Some(m_sources[rstd::as_cast<usize>(id.index)].clone());
+        return Some((*m_sources[rstd::as_cast<usize>(id.index)].source).clone());
+    }
+
+    bool Unregister(UniformSourceId id) {
+        if (Resolve(id).is_none()) return false;
+        auto& slot = m_sources[rstd::as_cast<usize>(id.index)];
+        if (slot.attachments != usize()) return false;
+        slot.source = None();
+        m_free_sources.push(u32(id.index));
+        --m_source_count;
+        return true;
     }
 
     bool AttachGlobal(UniformSourceId source, i32 priority = i32()) {
         if (Resolve(source).is_none()) return false;
-        return AttachUnique(m_global_sources, source, priority);
+        if (AttachUnique(m_global_sources, source, priority))
+            ++m_sources[rstd::as_cast<usize>(source.index)].attachments;
+        return true;
     }
 
     bool AttachNode(NodeId node, UniformSourceId source, i32 priority = i32()) {
@@ -308,7 +332,9 @@ public:
             (void)m_node_sources.insert(key, Vec<UniformSourceAttachment>::make());
             attachments = m_node_sources.get_mut(key);
         }
-        return AttachUnique(**attachments, source, priority);
+        if (AttachUnique(**attachments, source, priority))
+            ++m_sources[rstd::as_cast<usize>(source.index)].attachments;
+        return true;
     }
 
     auto GlobalSources() const -> slice<UniformSourceAttachment> {
@@ -318,6 +344,14 @@ public:
     auto NodeSources(NodeId node) const -> slice<UniformSourceAttachment> {
         auto found = m_node_sources.get(IdKey(node));
         return found.is_some() ? (**found).as_slice() : slice<UniformSourceAttachment> {};
+    }
+
+    auto DetachNode(NodeId node) -> Vec<UniformSourceAttachment> {
+        auto attachments = m_node_sources.remove(IdKey(node));
+        if (attachments.is_none()) return {};
+        for (const auto& attachment : *attachments)
+            --m_sources[rstd::as_cast<usize>(attachment.source.index)].attachments;
+        return rstd::move(*attachments);
     }
 
     bool RegisterBlock(UniformBlockDefinition definition) {
@@ -338,6 +372,8 @@ public:
             }
             return true;
         }
+        for (const auto& attachment : definition.sources)
+            ++m_sources[rstd::as_cast<usize>(attachment.source.index)].attachments;
         (void)m_blocks.insert(definition.identity, rstd::move(definition));
         return true;
     }
@@ -348,14 +384,14 @@ public:
 
     void Reset() {
         m_sources.clear();
+        m_free_sources.clear();
+        m_source_count = usize();
         m_global_sources.clear();
         m_node_sources.clear();
         m_blocks.clear();
-        ++m_generation;
-        if (m_generation == u32()) ++m_generation;
     }
 
-    usize Size() const noexcept { return m_sources.len(); }
+    usize Size() const noexcept { return m_source_count; }
 
 private:
     static u64 IdKey(NodeId id) {
@@ -367,17 +403,25 @@ private:
         for (auto& attachment : attachments) {
             if (attachment.source != source) continue;
             attachment.priority = priority;
-            return true;
+            return false;
         }
         attachments.push(UniformSourceAttachment { .source = source, .priority = priority });
         return true;
     }
 
-    Vec<UniformSourceOwner>                    m_sources;
+    struct SourceSlot {
+        Option<UniformSourceOwner> source;
+        u32                        generation {};
+        usize                      attachments {};
+    };
+
+    Vec<SourceSlot>                            m_sources;
+    Vec<u32>                                   m_free_sources;
+    usize                                      m_source_count {};
     Vec<UniformSourceAttachment>               m_global_sources;
     HashMap<u64, Vec<UniformSourceAttachment>> m_node_sources;
     HashMap<u64, UniformBlockDefinition>       m_blocks;
-    u32                                        m_generation { 1 };
+    u32                                        m_next_generation { 1 };
 };
 
 } // namespace vrento
