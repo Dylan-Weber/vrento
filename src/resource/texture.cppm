@@ -114,7 +114,9 @@ struct TextureDefinition {
                lhs.sample.compare_enable == rhs.sample.compare_enable &&
                lhs.sample.compare_op == rhs.sample.compare_op &&
                lhs.sample.border_color == rhs.sample.border_color &&
-               lhs.sample.mipFilter == rhs.sample.mipFilter && lhs.mip_levels == rhs.mip_levels &&
+               lhs.sample.mipFilter == rhs.sample.mipFilter &&
+               lhs.sample.max_anisotropy == rhs.sample.max_anisotropy &&
+               lhs.mip_levels == rhs.mip_levels &&
                lhs.samples == rhs.samples;
     }
 };

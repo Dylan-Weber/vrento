@@ -131,7 +131,7 @@ inline auto validate_sampler(const SamplerDesc& desc) -> Result<empty, Error> {
         Count(sample.compare_op) > 7 || Count(sample.border_color) > 2 ||
         ! rstd::f32(desc.min_lod).is_finite() || ! rstd::f32(desc.max_lod).is_finite() ||
         ! rstd::f32(desc.lod_bias).is_finite() || ! rstd::f32(desc.max_anisotropy).is_finite() ||
-        desc.max_anisotropy < 1 || desc.min_lod < 0 || desc.max_lod < desc.min_lod ||
+        desc.max_anisotropy < 1 || sample.max_anisotropy < 1 || desc.min_lod < 0 || desc.max_lod < desc.min_lod ||
         (sample.mipFilter == TextureMipmapFilter::None && desc.min_lod != 0))
         return Err(Error { ErrorKind::Invalid });
     return Ok(empty {});

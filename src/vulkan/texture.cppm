@@ -1629,6 +1629,14 @@ auto TextureContext::CreateSampler(const tex::SamplerDesc& desc)
         desc.max_anisotropy > session().device().capabilities().max_sampler_anisotropy)
         return Err(tex::Error { tex::ErrorKind::Unsupported });
     auto& s = desc.sample;
+    // a sample's own anisotropy, capped at the device's limit, where the description asks for less
+    float anisotropy = desc.max_anisotropy;
+    if (s.max_anisotropy > 1) {
+        const float limit  = session().device().capabilities().max_sampler_anisotropy;
+        const float wanted = static_cast<float>(s.max_anisotropy);
+        const float capped = wanted < limit ? wanted : limit;
+        if (capped > anisotropy) anisotropy = capped;
+    }
     for (auto& previous : samplers_) {
         auto& d = previous.description();
         auto& p = d.sample;
@@ -1637,7 +1645,7 @@ auto TextureContext::CreateSampler(const tex::SamplerDesc& desc)
             p.compare_enable == s.compare_enable && p.compare_op == s.compare_op &&
             p.border_color == s.border_color && d.wrap_w == desc.wrap_w &&
             d.min_lod == desc.min_lod && d.max_lod == desc.max_lod && d.lod_bias == desc.lod_bias &&
-            d.max_anisotropy == desc.max_anisotropy)
+            d.max_anisotropy == desc.max_anisotropy && p.max_anisotropy == s.max_anisotropy)
             return Ok(tex::SamplerRef(previous));
     }
     VkSamplerCreateInfo info { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -1651,8 +1659,8 @@ auto TextureContext::CreateSampler(const tex::SamplerDesc& desc)
     info.mipLodBias   = desc.lod_bias;
     info.minLod       = desc.min_lod;
     info.maxLod       = s.mipFilter == TextureMipmapFilter::None ? 0 : desc.max_lod;
-    info.anisotropyEnable = desc.max_anisotropy > 1;
-    info.maxAnisotropy    = desc.max_anisotropy;
+    info.anisotropyEnable = anisotropy > 1;
+    info.maxAnisotropy    = anisotropy;
     info.compareEnable    = s.compare_enable;
     info.compareOp        = ToVkType(s.compare_op);
     info.borderColor      = s.border_color == TextureBorderColor::TransparentBlack
