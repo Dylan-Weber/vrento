@@ -489,6 +489,12 @@ public:
         return Ok(TextureUploadPayload(Arc<Storage>::make(rstd::move(image), slot, mip)));
     }
     auto as_slice() const -> slice<u8> { return storage_ ? (*storage_)->bytes() : slice<u8> {}; }
+    // A payload that reads an Image's published (immutable) pixels in place can be handed to the GPU without a
+    // copy: the returned owner keeps those pixels alive. Payloads that own their bytes return None.
+    auto SharedOwner() const -> Option<Arc<dyn<rstd::any::Any>>> {
+        if (! storage_ || ! (*storage_)->image) return None();
+        return Some(Arc<dyn<rstd::any::Any>>::make(storage_->clone()));
+    }
     auto len() const -> usize { return as_slice().len(); }
     bool is_empty() const { return len() == usize(); }
     auto operator[](usize index) const -> u8 { return as_slice()[index]; }

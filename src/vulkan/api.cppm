@@ -682,6 +682,8 @@ struct ImageUploadRows {
 
 struct ImageUploadStatistics {
     VkDeviceSize live_bytes {}, capacity_bytes {}, free_capacity_bytes {};
+    // host memory imported (VK_EXT_external_memory_host) and read by the GPU in place, not staged
+    VkDeviceSize imported_bytes {};
 };
 
 class ImageUploadManager {
@@ -700,6 +702,17 @@ public:
     // single-layer 2D region; a zero source pitch means row_bytes.
     auto QueueRegion(VkImage image, VkBufferImageCopy region, slice<rstd::uint8_t> bytes,
                      rstd::uint32_t block_bytes = 4, Option<ImageUploadRows> source_rows = None())
+        -> Result<ImageUploadTicket, BackendError>;
+    // Whether the device enabled VK_EXT_external_memory_host.
+    bool CanImportHostMemory() const;
+    // Copies from `data` in place, with no staging copy: the memory is imported into Vulkan and `owner` keeps
+    // it alive (and unchanged) until the batch that records the copy has completed. `data` and `size` must be
+    // multiples of minImportedHostPointerAlignment (4 KiB); otherwise, and without the extension, this fails
+    // and the caller uses QueueRegion. Same region and source-row rules as QueueRegion.
+    auto QueueImportedRegion(VkImage image, VkBufferImageCopy region, const rstd::uint8_t* data,
+                             VkDeviceSize size, Arc<dyn<rstd::any::Any>> owner,
+                             rstd::uint32_t        block_bytes = 4,
+                             Option<ImageUploadRows> source_rows = None())
         -> Result<ImageUploadTicket, BackendError>;
     // Live bytes exclude alignment gaps; free capacity belongs to unleased cached blocks.
     auto statistics() const -> ImageUploadStatistics;

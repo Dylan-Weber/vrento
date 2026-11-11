@@ -135,6 +135,7 @@ public:
     }
 
     bool TryAllocate(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset) {
+        if (imported()) return false; // read-only host memory: never a staging destination
         auto aligned = AlignUp(m_cursor, alignment);
         if (aligned > m_size || size > m_size - aligned) return false;
         offset   = aligned;
@@ -161,7 +162,19 @@ public:
         return Ok(rstd::empty {});
     }
 
-    VkBuffer     handle() const noexcept { return m_buffer.handle.handle(); }
+    // A block that reads host memory in place (VK_EXT_external_memory_host): nothing to write or flush.
+    static auto CreateImported(const Device& device, const rstd::uint8_t* data, VkDeviceSize size,
+                               Arc<dyn<rstd::any::Any>> owner)
+        -> Result<Arc<UploadBlock>, BackendError> {
+        auto block  = Arc<UploadBlock>::make(device, size);
+        auto result = block->ImportHost(data, rstd::move(owner));
+        if (result.is_err()) return Err(result.unwrap_err());
+        return Ok(rstd::move(block));
+    }
+    bool         imported() const noexcept { return m_imported_owner.is_some(); }
+    VkBuffer     handle() const noexcept {
+        return imported() ? *m_imported_buffer : m_buffer.handle.handle();
+    }
     VkDeviceSize size() const noexcept { return m_size; }
     VkDeviceSize allocated_bytes() const noexcept { return m_allocated_bytes; }
 
@@ -170,6 +183,54 @@ public:
     Option<rstd::time::Instant> idle_since;
 
 private:
+    auto ImportHost(const rstd::uint8_t* data, Arc<dyn<rstd::any::Any>> owner)
+        -> Result<rstd::empty, BackendError> {
+        auto fetch = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+            m_device.handle().Dispatch().vkGetDeviceProcAddr(*m_device.handle(),
+                                                             "vkGetMemoryHostPointerPropertiesEXT"));
+        if (! fetch)
+            return Err(BackendError { "import host memory"_Str, BackendCause::Closed() });
+        VkMemoryHostPointerPropertiesEXT properties {
+            VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT
+        };
+        auto result = fetch(*m_device.handle(),
+                            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                            const_cast<rstd::uint8_t*>(data),
+                            &properties);
+        if (result != VK_SUCCESS)
+            return Err(BackendError { "query host pointer"_Str, BackendCause::Native(result) });
+        VkExternalMemoryBufferCreateInfo external { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+        external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        VkBufferCreateInfo info { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        info.pNext = &external;
+        info.size  = m_size;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        result     = m_device.handle().CreateBuffer(info, m_imported_buffer);
+        if (result != VK_SUCCESS)
+            return Err(BackendError { "create imported buffer"_Str, BackendCause::Native(result) });
+        VkMemoryRequirements requirements {};
+        m_device.handle().Dispatch().vkGetBufferMemoryRequirements(
+            *m_device.handle(), *m_imported_buffer, &requirements);
+        const auto types = requirements.memoryTypeBits & properties.memoryTypeBits;
+        if (! types)
+            return Err(BackendError { "import host memory"_Str,
+                                      BackendCause::Invalid("no compatible memory type"_Str) });
+        VkImportMemoryHostPointerInfoEXT import { VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT };
+        import.handleType   = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        import.pHostPointer = const_cast<rstd::uint8_t*>(data);
+        VkMemoryAllocateInfo allocate { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        allocate.pNext           = &import;
+        allocate.allocationSize  = max<VkDeviceSize>(m_size, requirements.size);
+        allocate.memoryTypeIndex = static_cast<rstd::uint32_t>(__builtin_ctz(types));
+        result                   = m_device.handle().AllocateMemory(allocate, m_imported_memory);
+        if (result != VK_SUCCESS)
+            return Err(BackendError { "import host memory"_Str, BackendCause::Native(result) });
+        result = m_imported_buffer.BindMemory(*m_imported_memory, 0);
+        if (result != VK_SUCCESS)
+            return Err(BackendError { "bind imported memory"_Str, BackendCause::Native(result) });
+        m_imported_owner = Some(rstd::move(owner));
+        return Ok(rstd::empty {});
+    }
     auto Initialize() -> Result<rstd::empty, BackendError> {
         VkBufferCreateInfo info { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                                   .size  = m_size,
@@ -192,6 +253,10 @@ private:
 
     const Device&              m_device;
     VkDeviceSize               m_size { 0 };
+    // imported blocks: the owner is destroyed last (declared first), then the memory, after the buffer
+    Option<Arc<dyn<rstd::any::Any>>> m_imported_owner;
+    vvk::DeviceMemory                m_imported_memory;
+    vvk::Buffer                      m_imported_buffer;
     AllocatedBufferParameters  m_buffer;
     Option<vvk::MemoryMapping> m_mapping;
     VkDeviceSize               m_cursor { 0 };
@@ -274,6 +339,8 @@ struct ImageUploadManager::Impl {
     u64                                      next_batch { 0 };
     Vec<Arc<UploadBlock>>                    upload_blocks;
     Option<Arc<RecordedImageUploads::State>> pending;
+    // imported blocks are never pooled; weak refs only tell statistics which are still in use
+    mutable Vec<rstd::sync::Weak<UploadBlock>> imported_blocks;
     auto AllocateUpload(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset)
         -> Result<Arc<UploadBlock>, BackendError> {
         Option<Arc<UploadBlock>> block;
@@ -918,6 +985,52 @@ ImageUploadManager::QueueRegion(VkImage image, VkBufferImageCopy region, slice<r
     return Ok(ticket);
 }
 
+bool ImageUploadManager::CanImportHostMemory() const {
+    if (! m_impl->initialized) return false;
+    for (const auto& name : m_impl->device.enabled_device_extensions())
+        if (name.as_ref().to_str().unwrap() == "VK_EXT_external_memory_host"_str) return true;
+    return false;
+}
+
+Result<ImageUploadTicket, BackendError> ImageUploadManager::QueueImportedRegion(
+    VkImage image, VkBufferImageCopy region, const rstd::uint8_t* data, VkDeviceSize size,
+    Arc<dyn<rstd::any::Any>> owner, rstd::uint32_t block_bytes,
+    Option<ImageUploadRows> source_rows) {
+    if (! m_impl->initialized)
+        return Err(BackendError { "queue image upload"_Str, BackendCause::Closed() });
+    if (! CanImportHostMemory())
+        return Err(BackendError { "queue imported image upload"_Str,
+                                  BackendCause::Unsupported("external memory host"_Str) });
+    constexpr VkDeviceSize alignment = 4096; // minImportedHostPointerAlignment on every driver seen
+    if (! block_bytes || ! image || ! data || ! size || size % alignment ||
+        reinterpret_cast<rstd::uintptr_t>(data) % alignment)
+        return Err(BackendError { "queue imported image upload"_Str,
+                                  BackendCause::Invalid("unaligned host memory"_Str) });
+    if (source_rows) {
+        if (! source_rows->row_bytes || ! source_rows->rows ||
+            (source_rows->source_pitch && source_rows->source_pitch != source_rows->row_bytes) ||
+            region.bufferRowLength || region.bufferImageHeight || region.imageExtent.depth != 1 ||
+            region.imageSubresource.layerCount != 1 ||
+            source_rows->row_bytes * source_rows->rows > size)
+            return Err(BackendError { "queue imported image upload"_Str,
+                                      BackendCause::Invalid("invalid source rows"_Str) });
+    }
+    auto block = UploadBlock::CreateImported(m_impl->device, data, size, rstd::move(owner));
+    if (block.is_err()) return Err(block.unwrap_err());
+    if (! m_impl->pending) {
+        ++m_impl->next_batch;
+        m_impl->pending            = Some(Arc<RecordedImageUploads::State>::make());
+        (*m_impl->pending)->serial = m_impl->next_batch;
+    }
+    region.bufferOffset = 0;
+    (*m_impl->pending)->blocks.push(block->clone());
+    m_impl->imported_blocks.push(block->downgrade());
+    (*m_impl->pending)->regions.push(ImageRegionOperation { image, region, block.unwrap() });
+    ImageUploadTicket ticket { .value = ++m_impl->next_ticket };
+    (*m_impl->pending)->tickets.push(decltype(ticket)(ticket));
+    return Ok(ticket);
+}
+
 auto ImageUploadManager::statistics() const -> ImageUploadStatistics {
     ImageUploadStatistics result;
     for (const auto& block : m_impl->upload_blocks) {
@@ -927,6 +1040,12 @@ auto ImageUploadManager::statistics() const -> ImageUploadStatistics {
         else
             result.live_bytes += block->allocated_bytes();
     }
+    m_impl->imported_blocks.retain([&](const rstd::sync::Weak<UploadBlock>& weak) {
+        if (weak.expired()) return false;
+        auto block = weak.upgrade();
+        result.imported_bytes += block->size();
+        return true;
+    });
     return result;
 }
 

@@ -1,4 +1,5 @@
 #include <rstd/macro.hpp>
+#include <stdlib.h>
 #include <rstd/test/gtest.hpp>
 import rstd;
 import rstd.test;
@@ -434,6 +435,94 @@ TEST(TextureVulkan, ImageStagingRowsAndLeaseLifetime) {
     EXPECT_EQ(uploads.statistics().live_bytes, 0u);
     uploads.destroy();
     EXPECT_EQ(uploads.statistics().capacity_bytes, 0u);
+    EXPECT_EQ(session.validation_errors(), 0u);
+}
+TEST(TextureVulkan, ImportedHostMemoryUploadsSkipStaging) {
+    // a decoded image in page-aligned memory is copied to the GPU straight from that memory: no pinned staging copy
+    array<vk::Extension, 1> extensions { vk::Extension { false, "VK_EXT_external_memory_host"_str } };
+    auto created =
+        vk::DeviceSession::create({ .device_extensions = extensions.as_slice(), .validation = true });
+    if (created.is_err()) GTEST_SKIP() << "Vulkan unavailable";
+    auto                   session = created.unwrap();
+    auto                   device  = vk::TextureContext::create(session).unwrap();
+    vk::ImageUploadManager uploads(session.device());
+    ASSERT_TRUE(uploads.init());
+    constexpr unsigned width = 1024, height = 1024; // 4 MiB of RGBA8
+    constexpr size_t   bytes = size_t(width) * height * 4;
+    tex::TextureDesc   desc;
+    desc.extent = { width, height };
+    desc.usage = tex::Usage::Sampled | tex::Usage::TransferDestination | tex::Usage::TransferSource;
+    auto texture = device.CreateTexture(desc).unwrap();
+    auto view    = device.CreateView(texture, {}).unwrap();
+    auto image   = vk::native_texture(texture).unwrap();
+    auto* memory = static_cast<rstd::uint8_t*>(aligned_alloc(4096, bytes));
+    ASSERT_NE(memory, nullptr);
+    for (size_t i {}; i < bytes; ++i) memory[i] = rstd::uint8_t((i * 7 + (i >> 12)) & 0xff);
+    VkBufferImageCopy region {};
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageExtent      = { width, height, 1 };
+    auto owner = rstd::sync::Arc<dyn<rstd::any::Any>>::make(rstd::sync::Arc<int>::make(0));
+    // unaligned memory or size is refused (the caller falls back to staging)
+    EXPECT_TRUE(uploads
+                    .QueueImportedRegion(image, region, memory + 16, VkDeviceSize(bytes - 4096),
+                                         owner.clone(), 4, Some(vk::ImageUploadRows { width * 4, height }))
+                    .is_err());
+    EXPECT_TRUE(uploads
+                    .QueueImportedRegion(image, region, memory, VkDeviceSize(bytes - 4),
+                                         owner.clone(), 4, Some(vk::ImageUploadRows { width * 4, height }))
+                    .is_err());
+    if (! uploads.CanImportHostMemory()) {
+        free(memory);
+        GTEST_SKIP() << "VK_EXT_external_memory_host unavailable";
+    }
+    auto ticket = uploads
+                      .QueueImportedRegion(image, region, memory, VkDeviceSize(bytes), owner.clone(),
+                                           4, Some(vk::ImageUploadRows { width * 4, height }))
+                      .unwrap();
+    EXPECT_TRUE(ticket.Valid());
+    EXPECT_EQ(uploads.statistics().capacity_bytes, 0u);
+    EXPECT_EQ(uploads.statistics().imported_bytes, VkDeviceSize(bytes));
+    {
+        // a staged upload queued in the same batch must get a staging block of its own, never the imported memory
+        tex::TextureDesc small;
+        small.extent = { 4, 4 };
+        small.usage  = tex::Usage::Sampled | tex::Usage::TransferDestination;
+        auto small_texture = device.CreateTexture(small).unwrap();
+        auto small_image   = vk::native_texture(small_texture).unwrap();
+        VkBufferImageCopy small_region {};
+        small_region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        small_region.imageExtent      = { 4, 4, 1 };
+        array<rstd::uint8_t, 64> small_bytes {};
+        uploads.QueueRegion(small_image, small_region, small_bytes.as_slice()).unwrap();
+        EXPECT_GE(uploads.statistics().capacity_bytes, 64u);
+        uploads.DiscardPendingUploads();
+        auto again = uploads
+                         .QueueImportedRegion(image, region, memory, VkDeviceSize(bytes), owner.clone(),
+                                              4, Some(vk::ImageUploadRows { width * 4, height }))
+                         .unwrap();
+        EXPECT_TRUE(again.Valid());
+    }
+    auto work = device.Begin().unwrap();
+    work.commands()
+        ->UseTexture({ view, tex::Access::TransferDestination, tex::Stages::Transfer })
+        .unwrap();
+    auto                     command = vk::native_command_recording(work, session).unwrap();
+    vk::RecordedImageUploads recorded;
+    uploads.RecordQueuedRegions(command, recorded).unwrap();
+    work.retain(uploads.CommitRecordedUploads(rstd::move(recorded)).unwrap());
+    auto done = device.Submit(rstd::move(work)).unwrap();
+    // the memory stays referenced until the copy has completed
+    EXPECT_GE(owner.strong_count(), usize(2));
+    device.wait(done).unwrap();
+    device.Poll().unwrap();
+    auto pixels = read(device, view);
+    ASSERT_EQ(pixels.len(), usize(bytes));
+    bool same = true;
+    for (size_t i {}; i < bytes && same; ++i) same = pixels[usize(i)] == u8(memory[i]);
+    EXPECT_TRUE(same);
+    EXPECT_EQ(uploads.statistics().imported_bytes, 0u);
+    uploads.destroy();
+    free(memory);
     EXPECT_EQ(session.validation_errors(), 0u);
 }
 TEST(TextureVulkan, SamplerAnisotropy) {

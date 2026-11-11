@@ -1,3 +1,6 @@
+module;
+#include <stdlib.h>
+
 export module vrento:vulkan.texture;
 export import :texture;
 export import :texture.prepare;
@@ -903,6 +906,26 @@ public:
         auto image              = native_texture(upload.target.texture()).unwrap();
         auto content            = slice<rstd::uint8_t>::from_raw_parts(
             reinterpret_cast<const rstd::uint8_t*>(bytes.as_raw_ptr()), bytes.len());
+        // Big pixels already in page-aligned memory (a decoded image) are read by the GPU in place: staging them
+        // would hold a second copy as large as the image (VRENTO_NO_HOST_IMPORT=1 turns this off).
+        constexpr rstd::uint64_t import_threshold = 4ull << 20;
+        const auto required = rstd::uint64_t(data.row_bytes) * rstd::uint64_t(data.rows);
+        if (required >= import_threshold && required % 4096 == 0 &&
+            (data.source_pitch == data.row_bytes || data.source_pitch == 0) &&
+            reinterpret_cast<rstd::uintptr_t>(content.as_raw_ptr()) % 4096 == 0 &&
+            uploads.CanImportHostMemory() && ! getenv("VRENTO_NO_HOST_IMPORT")) {
+            if (auto owner = upload.bytes.SharedOwner()) {
+                auto imported = uploads.QueueImportedRegion(
+                    image,
+                    region,
+                    content.as_raw_ptr(),
+                    required,
+                    owner.take().unwrap(),
+                    tex::format_layout(upload.target.texture().description().format).block_bytes,
+                    Some(ImageUploadRows { data.row_bytes, data.rows, data.source_pitch }));
+                if (imported.is_ok()) return Ok(empty {});
+            }
+        }
         auto queued = uploads.QueueRegion(
             image,
             region,
