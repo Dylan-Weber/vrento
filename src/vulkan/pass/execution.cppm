@@ -58,21 +58,23 @@ using FastMap = HashMap<K, V, FastBuildHasher>;
 template<typename K>
 using FastSet = rstd::collections::HashSet<K, FastBuildHasher>;
 
-// The bindings of one frame as plain words (ids, versions and what each binding reports), kept from
-// the last frame that passed validation: a frame whose words are equal needs no validation again.
 struct BindingCheckStats {
     rstd::uint64_t hits {}, misses {};
-    // Of the last frame that missed: the position of the first differing word (-1 when the number of
-    // bindings changed), as binding index * 11 + field (id, generation, version, kind, device, epoch,
-    // resource, bytes, mips|layers, aspects, revision).
-    rstd::int64_t last_difference { -1 };
+    rstd::int64_t  last_difference { -1 };
 };
+// The bindings of a frame as plain words (id, generation, version, kind, device, epoch, aliasing
+// ordinal, bytes, mips|layers, aspects, revision per binding), kept for the last frames that passed
+// validation: a frame whose words are equal to one of them needs no validation again.
 struct BindingCheckCache {
-    Vec<rstd::uint64_t> checked, scratch;
-    rstd::uint64_t      epoch {};
-    bool                valid {};
-    rstd::uint64_t      hits {}, misses {};
-    rstd::int64_t       last_difference { -1 };
+    // The signatures of the last few frames that passed (a scene cycling between a few binding
+    // patterns, such as animated textures, reuses all of them), the one being built, and where the
+    // next accepted one goes.
+    static constexpr rstd::size_t accepted_max = 6;
+    Vec<Vec<rstd::uint64_t>> accepted;
+    Vec<rstd::uint64_t>      scratch;
+    usize                    next {};
+    rstd::uint64_t           hits {}, misses {};
+    rstd::int64_t            last_difference { -1 };
 };
 
 using ResourceId        = fg::ResourceId;

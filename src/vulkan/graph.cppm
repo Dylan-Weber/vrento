@@ -135,6 +135,29 @@ class GraphBindings {
         FastMap<graph_texture::Identity, AliasGroup> aliases[2];
         Vec<Option<fg::Index>>                       slots;
         Vec<bool>                                    shared;
+        // Most bindings share their physical resource with no other binding and need none of the
+        // alias bookkeeping: find the ones that do.
+        FastMap<graph_texture::Identity, usize> populations[2];
+        Vec<bool>                               alias_candidate;
+        alias_candidate.resize(entries_.len(), false);
+        for (usize i {}; i < entries_.len(); ++i) {
+            const auto& info = infos[i];
+            if (info.kind != GraphResourceKind::Texture && info.kind != GraphResourceKind::Buffer)
+                continue;
+            auto& population = populations[info.kind == GraphResourceKind::Buffer ? 1 : 0];
+            if (auto count = population.get_mut(info.identity))
+                ++**count;
+            else
+                population.insert(info.identity, usize(1));
+        }
+        for (usize i {}; i < entries_.len(); ++i) {
+            const auto& info = infos[i];
+            if (info.kind != GraphResourceKind::Texture && info.kind != GraphResourceKind::Buffer)
+                continue;
+            alias_candidate[i] =
+                **populations[info.kind == GraphResourceKind::Buffer ? 1 : 0].get(info.identity) >
+                usize(1);
+        }
         for (usize i {}; i < entries_.len(); ++i) {
             const auto& entry    = entries_[i];
             auto        slot     = layout.slot(entry.id, entry.version);
@@ -144,8 +167,7 @@ class GraphBindings {
             slots.push(slot.clone());
             shared.push(bool(imported));
             const auto& info = infos[i];
-            if (info.kind != GraphResourceKind::Texture && info.kind != GraphResourceKind::Buffer)
-                continue;
+            if (! alias_candidate[i]) continue;
             auto& groups = aliases[info.kind == GraphResourceKind::Buffer ? 1 : 0];
             if (! groups.contains_key(info.identity)) groups.insert(info.identity, AliasGroup {});
             groups.get_mut(info.identity).unwrap()->add(entry.id, slot, imported);
@@ -172,6 +194,7 @@ class GraphBindings {
                       (resource.aspects & ~info.aspects))))
                     return Err(
                         GraphExecutionError { GraphExecutionStage::Binding, {}, resource.id });
+                if (! alias_candidate[i]) continue;
                 auto&       groups     = aliases[info.kind == GraphResourceKind::Buffer ? 1 : 0];
                 const auto& alias      = *groups.get(info.identity).unwrap();
                 const auto& own        = *alias.resources.get(entry.id).unwrap();
@@ -192,6 +215,8 @@ class GraphBindings {
             for (usize i {}; i < entries_.len(); ++i) {
                 const auto& entry = entries_[i];
                 if (! entry.version || ! slots[i]) continue;
+                // A conflict needs two bindings of one resource.
+                if ((**resources_.get(entry.id)).len() < usize(2)) continue;
                 if (! groups.contains_key(entry.id)) groups.insert(entry.id, VersionGroup {});
                 auto& group             = *groups.get_mut(entry.id).unwrap();
                 auto  identity          = infos[i].identity;
@@ -401,30 +426,52 @@ public:
                                (! entry.version || *entry.version == 0);
                 cache->scratch.push(compared ? rstd::uint64_t(info.content_revision) : 0);
             }
-            bool same = cache->valid && session.valid() && ! session.lost() &&
-                        cache->epoch == rstd::uint64_t(session.epoch()) &&
-                        cache->checked.len() == cache->scratch.len();
-            if (cache->valid && cache->checked.len() != cache->scratch.len())
-                cache->last_difference = -1;
-            else if (cache->valid)
-                for (usize i {}; same && i < cache->scratch.len(); ++i) {
-                    same = cache->checked[i] == cache->scratch[i];
-                    if (! same) cache->last_difference = rstd::int64_t(i.to_primitive());
+            // The device epoch leads the signature.
+            bool same = session.valid() && ! session.lost();
+            bool hit {};
+            if (same) {
+                for (const auto& signature : cache->accepted) {
+                    if (signature.len() != cache->scratch.len() + usize(1) ||
+                        signature[usize()] != rstd::uint64_t(session.epoch()))
+                        continue;
+                    bool equal = true;
+                    for (usize i {}; equal && i < cache->scratch.len(); ++i)
+                        equal = signature[i + usize(1)] == cache->scratch[i];
+                    if (equal) {
+                        hit = true;
+                        break;
+                    }
                 }
-            if (same)
+            }
+            if (hit)
                 ++cache->hits;
             else {
                 ++cache->misses;
-                cache->valid = false;
+                cache->last_difference = -1;
+                if (! cache->accepted.is_empty()) {
+                    const auto& latest = cache->accepted[cache->accepted.len() - usize(1)];
+                    if (latest.len() == cache->scratch.len() + usize(1))
+                        for (usize i {}; i < cache->scratch.len(); ++i)
+                            if (latest[i + usize(1)] != cache->scratch[i]) {
+                                cache->last_difference = rstd::int64_t(i.to_primitive());
+                                break;
+                            }
+                }
                 auto checked = validate_info(
                     graph.resources(), graph.binding_layout(), session, infos.as_slice(), true);
                 if (checked.is_err()) return Err(checked.unwrap_err());
                 auto uses = validate_uses(graph);
                 if (uses.is_err()) return Err(uses.unwrap_err());
-                cache->checked.clear();
-                for (const auto& word : cache->scratch) cache->checked.push(rstd::uint64_t(word));
-                cache->epoch = rstd::uint64_t(session.epoch());
-                cache->valid = true;
+                Vec<rstd::uint64_t> signature;
+                signature.reserve(cache->scratch.len() + usize(1));
+                signature.push(rstd::uint64_t(session.epoch()));
+                for (const auto& word : cache->scratch) signature.push(rstd::uint64_t(word));
+                if (cache->accepted.len().to_primitive() < BindingCheckCache::accepted_max)
+                    cache->accepted.push(rstd::move(signature));
+                else {
+                    cache->accepted[cache->next] = rstd::move(signature);
+                    cache->next = usize((cache->next.to_primitive() + 1) % BindingCheckCache::accepted_max);
+                }
             }
         }
         return freeze_info(graph.passes(),

@@ -1664,10 +1664,16 @@ TEST(GraphBindings, ValidationIsReusedOnlyForUnchangedBindings) {
     EXPECT_EQ(stats().misses, 2u);
     EXPECT_TRUE(make(1u, 2u, 3u, 1u).prepare(graph, session).is_err());
     EXPECT_EQ(stats().misses, 3u);
+    // The earlier pattern is still remembered.
     EXPECT_TRUE(make(1u, 2u, 3u).prepare(graph, session).is_ok());
-    EXPECT_EQ(stats().misses, 4u);
-    EXPECT_TRUE(make(1u, 2u, 3u).prepare(graph, session).is_ok());
+    EXPECT_EQ(stats().misses, 3u);
     EXPECT_EQ(stats().hits, 4u);
+    // A new aliasing pattern (read-only imports may share) is validated once, then remembered too.
+    EXPECT_TRUE(make(1u, 1u, 3u).prepare(graph, session).is_ok());
+    EXPECT_EQ(stats().misses, 4u);
+    EXPECT_TRUE(make(7u, 7u, 9u).prepare(graph, session).is_ok());
+    EXPECT_EQ(stats().misses, 4u);
+    EXPECT_EQ(stats().hits, 5u);
 }
 TEST(GraphBindings, FreezePassPropagatesWritesAcrossPhysicalAliases) {
     auto              session = vk::DeviceSession::create({ .validation = true }).unwrap();
