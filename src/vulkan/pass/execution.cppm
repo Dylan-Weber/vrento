@@ -10,6 +10,71 @@ export namespace vrento::vulkan
 using GraphIndex  = rstd::uint32_t;
 using GraphSerial = rstd::uint64_t;
 
+// A cheap hasher for the maps a frame builds and discards (bindings, validation): keys are small
+// integer tuples, never attacker controlled, and the SipHash of the default state dominated the
+// per-frame rebuild of a scene with hundreds of draws. Words are folded multiplicatively and the
+// result is finalized so both the low and the high bits are usable by the table.
+class FastHasher {
+    rstd::uint64_t state_ {};
+
+public:
+    FastHasher() noexcept = default;
+    void write(slice<u8> bytes) noexcept {
+        const auto*    p = reinterpret_cast<const unsigned char*>(bytes.as_ptr().as_raw_ptr());
+        rstd::size_t   n = bytes.len().to_primitive();
+        constexpr auto k = 0x9e3779b97f4a7c15ULL;
+        while (n >= 8) {
+            rstd::uint64_t word;
+            __builtin_memcpy(&word, p, 8);
+            state_ = (state_ ^ word) * k;
+            state_ ^= state_ >> 29;
+            p += 8;
+            n -= 8;
+        }
+        if (n >= 4) {
+            rstd::uint32_t word;
+            __builtin_memcpy(&word, p, 4);
+            state_ = (state_ ^ word) * k;
+            state_ ^= state_ >> 29;
+            p += 4;
+            n -= 4;
+        }
+        for (; n; --n, ++p) {
+            state_ = (state_ ^ *p) * k;
+            state_ ^= state_ >> 29;
+        }
+    }
+    auto finish() const noexcept -> u64 {
+        auto h = state_;
+        h ^= h >> 32;
+        h *= 0xd6e8feb86659fd93ULL;
+        h ^= h >> 32;
+        return u64(h);
+    }
+};
+using FastBuildHasher = rstd::hash::BuildHasherDefault<FastHasher>;
+template<typename K, typename V>
+using FastMap = HashMap<K, V, FastBuildHasher>;
+template<typename K>
+using FastSet = rstd::collections::HashSet<K, FastBuildHasher>;
+
+// The bindings of one frame as plain words (ids, versions and what each binding reports), kept from
+// the last frame that passed validation: a frame whose words are equal needs no validation again.
+struct BindingCheckStats {
+    rstd::uint64_t hits {}, misses {};
+    // Of the last frame that missed: the position of the first differing word (-1 when the number of
+    // bindings changed), as binding index * 11 + field (id, generation, version, kind, device, epoch,
+    // resource, bytes, mips|layers, aspects, revision).
+    rstd::int64_t last_difference { -1 };
+};
+struct BindingCheckCache {
+    Vec<rstd::uint64_t> checked, scratch;
+    rstd::uint64_t      epoch {};
+    bool                valid {};
+    rstd::uint64_t      hits {}, misses {};
+    rstd::int64_t       last_difference { -1 };
+};
+
 using ResourceId        = fg::ResourceId;
 using PassId            = fg::PassId;
 using GraphResourceKind = fg::ResourceKind;
@@ -325,10 +390,12 @@ class VulkanPassSet {
         VulkanPassData     declarations;
         fg::FrameGraph     graph;
         GraphBindingLayout bindings;
+        rstd::sync::Mutex<BindingCheckCache> check;
         Data(VulkanPassData values, fg::FrameGraph compiled)
             : declarations(rstd::move(values)),
               graph(rstd::move(compiled)),
-              bindings(declarations.resources.as_slice(), graph.inspect().allocations.as_slice()) {}
+              bindings(declarations.resources.as_slice(), graph.inspect().allocations.as_slice()),
+              check(BindingCheckCache {}) {}
     };
     rstd::sync::Arc<Data> data_;
     VulkanPassSet(VulkanPassData declarations, fg::FrameGraph graph)
@@ -451,6 +518,14 @@ public:
     auto frame_graph() const -> const fg::FrameGraph& { return data_->graph; }
     auto scope() const -> GraphSerial { return data_->graph.scope(); }
     auto binding_layout() const -> const GraphBindingLayout& { return data_->bindings; }
+    // How many frames skipped the binding validation (hits) and how many ran it (misses).
+    auto binding_check_stats() const -> BindingCheckStats {
+        auto cache = data_->check.lock().unwrap();
+        return { cache->hits, cache->misses, cache->last_difference };
+    }
+    auto binding_check() const -> rstd::sync::Mutex<BindingCheckCache>& {
+        return const_cast<rstd::sync::Mutex<BindingCheckCache>&>(data_->check);
+    }
     auto resources() const -> slice<GraphBindingRequirement> {
         return data_->declarations.resources.as_slice();
     }
