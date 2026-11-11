@@ -1,5 +1,8 @@
+module;
+#include <stdlib.h>
 export module vrento:resource_registry.prepared;
 import :fast_hash;
+import :resource_registry.decode_budget;
 import rstd;
 import :resource;
 import :vulkan.api;
@@ -615,6 +618,15 @@ enum class ResourcePrepareProgress
     Complete,
 };
 
+inline auto DecodeBudgetFromEnvironment() -> u64 {
+    // VRENTO_DECODE_BUDGET_MB overrides the default 128 MB of texture decodes in flight (for tuning)
+    if (const char* value = getenv("VRENTO_DECODE_BUDGET_MB")) {
+        auto megabytes = strtoull(value, nullptr, 10);
+        if (megabytes != 0) return u64(megabytes << 20);
+    }
+    return u64(128ull << 20);
+}
+
 class ResourcePrepareSession {
 public:
     ResourcePrepareSession(const ResourcePrepareSession&)                        = delete;
@@ -639,6 +651,7 @@ private:
         String                                key;
         Option<Arc<rstd::dyn<VideoPlayback>>> playback;
         Vec<PendingUse>                       uses;
+        u64                                   estimate {}; // decoded bytes, from the declared extent
     };
 
     struct DecodedContent {
@@ -656,6 +669,8 @@ private:
     Vec<PendingContent>                                   m_pending { Vec<PendingContent>::make() };
     usize                                                 m_next_submit {};
     usize                                                 m_completed {};
+    // decodes in flight are bounded by bytes as well as by workers
+    DecodeBudget                                          m_budget { DecodeBudget(DecodeBudgetFromEnvironment()) };
     Option<Arc<dyn<resource::TextureLoader>>>             m_loader;
     Option<rstd::thread::ThreadPool>                      m_pool;
     Option<rstd::thread::BlockingTaskSet<DecodedContent>> m_tasks;
@@ -927,6 +942,9 @@ public:
                     .key      = rstd::move(identity.key),
                     .playback = rstd::move(playback),
                     .uses     = Vec<ResourcePrepareSession::PendingUse>::make(),
+                    .estimate = identity.estimated_bytes != u64()
+                                    ? identity.estimated_bytes
+                                    : EstimateDecode(entry.request()),
                 });
             }
             session.m_pending[index].uses.push(ResourcePrepareSession::PendingUse {
@@ -1035,6 +1053,7 @@ public:
                 }
                 upload_trace.Finish();
             }
+            session.m_budget.Release(session.m_pending[item.index].estimate);
 
             ++session.m_completed;
             ++prepared_count;
@@ -1045,10 +1064,20 @@ public:
     }
 
 private:
+    static auto EstimateDecode(const resource::TextureRequest& request) -> u64 {
+        if (request.definition.is_none()) return DecodeBudget::Estimate(0, 0, 4, 1);
+        const auto& definition = *request.definition;
+        return DecodeBudget::Estimate(definition.width.to_primitive(),
+                                      definition.height.to_primitive(),
+                                      4,
+                                      definition.mip_levels.to_primitive());
+    }
     static auto SubmitAvailable(ResourcePrepareSession& session)
         -> Result<empty, resource::ResourceError> {
         while (session.m_next_submit < session.m_pending.len()) {
             const auto index     = session.m_next_submit;
+            const auto estimate  = session.m_pending[index].estimate;
+            if (! session.m_budget.Admit(estimate)) break;
             auto       key       = session.m_pending[index].key.clone();
             auto       loader    = session.m_loader->clone();
             auto       submitted = session.m_tasks->try_submit(
@@ -1059,6 +1088,7 @@ private:
                     };
                 });
             if (submitted.is_err()) {
+                session.m_budget.Release(estimate);
                 if (submitted.unwrap_err_unchecked() ==
                     rstd::thread::BlockingTaskSetSubmitError::Full) {
                     break;

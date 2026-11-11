@@ -1,5 +1,6 @@
 export module vrento:resource_registry;
 export import :resource;
+export import :resource_registry.decode_budget;
 export import :resource_registry.resource_key;
 export import :resource_registry.graphics;
 export import :resource_registry.texture_registry;

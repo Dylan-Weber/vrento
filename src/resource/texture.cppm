@@ -125,12 +125,15 @@ struct ImportedTextureContentIdentity {
     String key;
     u64    revision { 1 };
     u64    scope {};
+    // decoded size the provider expects (0 = unknown); schedules decodes by bytes, not part of the identity
+    u64 estimated_bytes {};
 
     auto clone() const -> ImportedTextureContentIdentity {
         return ImportedTextureContentIdentity {
-            .key      = key.clone(),
-            .revision = revision,
-            .scope    = scope,
+            .key             = key.clone(),
+            .revision        = revision,
+            .scope           = scope,
+            .estimated_bytes = estimated_bytes,
         };
     }
 

@@ -699,3 +699,31 @@ TEST(FastHash, HashMapsKeepEveryEntry) {
     }
     EXPECT_TRUE(map.get(u64(1)).is_none());
 }
+
+TEST(DecodeBudget, AdmitsWhileBytesFitAndAlwaysAtLeastOne) {
+    resource_registry::DecodeBudget budget(u64(100));
+    EXPECT_TRUE(budget.Admit(u64(60)));
+    EXPECT_FALSE(budget.Admit(u64(60)));
+    EXPECT_TRUE(budget.Admit(u64(40)));
+    EXPECT_EQ(budget.InFlight(), u64(100));
+    EXPECT_FALSE(budget.Admit(u64(1)));
+    budget.Release(u64(60));
+    EXPECT_TRUE(budget.Admit(u64(30)));
+    budget.Release(u64(40));
+    budget.Release(u64(30));
+    EXPECT_EQ(budget.InFlight(), u64());
+    // one texture larger than the whole budget still decodes, alone
+    EXPECT_TRUE(budget.Admit(u64(500)));
+    EXPECT_FALSE(budget.Admit(u64(1)));
+    budget.Release(u64(500));
+    EXPECT_TRUE(budget.Admit(u64(1)));
+}
+
+TEST(DecodeBudget, EstimatesBytesFromExtentFormatAndMips) {
+    EXPECT_EQ(resource_registry::DecodeBudget::Estimate(1024, 1024, 4, 1), u64(1024 * 1024 * 4));
+    // a full mip chain adds a third
+    EXPECT_EQ(resource_registry::DecodeBudget::Estimate(1024, 1024, 4, 11),
+              u64(1024 * 1024 * 4) + u64(1024 * 1024 * 4) / u64(3));
+    // an unknown extent counts as a modest texture rather than nothing
+    EXPECT_GT(resource_registry::DecodeBudget::Estimate(0, 0, 4, 1), u64());
+}
