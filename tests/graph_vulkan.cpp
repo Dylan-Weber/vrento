@@ -1609,6 +1609,66 @@ TEST(GraphBindings, PreparationScale) {
         }
     }
 }
+TEST(GraphBindings, ValidationIsReusedOnlyForUnchangedBindings) {
+    auto session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto counts  = rstd::sync::Arc<Counts>::make();
+    vrento::fg::FrameGraphBuilder builder(710);
+    auto                          id = builder.add_pass({ 1 }).unwrap();
+    vk::PassExecutionInfo         pass { .id = id, .kind = 9 };
+    Vec<vk::ResourceId>           ids;
+    for (unsigned n {}; n < 3; ++n) {
+        auto input = builder
+                         .import_resource({ .id    = { 3 * n + 1, 17 },
+                                            .kind  = vrento::fg::ResourceKind::Buffer,
+                                            .bytes = 64 })
+                         .unwrap();
+        pass.uses.push({ input.resource,
+                         0,
+                         vk::GraphAccess::Read,
+                         vk::PassUsage::Uniform,
+                         vk::PassStages::Vertex,
+                         { .size = 64 } });
+        ids.push(vk::ResourceId(input.resource));
+    }
+    vrento_test::declare_pass(builder, pass).unwrap();
+    Vec<vk::PassExecutionInfo> passes;
+    passes.push(rstd::move(pass));
+    auto graph =
+        vk::VulkanPassSet::associate(rstd::move(builder).finish().unwrap(), rstd::move(passes))
+            .unwrap();
+    auto make = [&](unsigned a, unsigned b, unsigned c, unsigned stale = 0) {
+        const unsigned physical[3] = { a, b, c };
+        vk::GraphBindings bindings(710);
+        for (unsigned n {}; n < 3; ++n)
+            bindings
+                .bind(ids[usize(n)],
+                      binding(counts,
+                              { session.epoch(), session.epoch() + (n == 0 ? stale : 0u), physical[n] }))
+                .unwrap();
+        return bindings;
+    };
+    auto stats = [&] { return graph.binding_check_stats(); };
+    // The same bindings, frame after frame: validated once.
+    for (unsigned frame {}; frame < 3; ++frame)
+        EXPECT_TRUE(make(1u, 2u, 3u).prepare(graph, session).is_ok());
+    EXPECT_EQ(stats().misses, 1u);
+    EXPECT_EQ(stats().hits, 2u);
+    // New physical resources with the same aliasing pattern (an upload buffer is new every
+    // frame): still reused.
+    EXPECT_TRUE(make(4u, 5u, 6u).prepare(graph, session).is_ok());
+    EXPECT_EQ(stats().misses, 1u);
+    EXPECT_EQ(stats().hits, 3u);
+    // A binding from another device epoch breaks the rules: validated again and refused, and the
+    // refusal is not remembered.
+    EXPECT_TRUE(make(1u, 2u, 3u, 1u).prepare(graph, session).is_err());
+    EXPECT_EQ(stats().misses, 2u);
+    EXPECT_TRUE(make(1u, 2u, 3u, 1u).prepare(graph, session).is_err());
+    EXPECT_EQ(stats().misses, 3u);
+    EXPECT_TRUE(make(1u, 2u, 3u).prepare(graph, session).is_ok());
+    EXPECT_EQ(stats().misses, 4u);
+    EXPECT_TRUE(make(1u, 2u, 3u).prepare(graph, session).is_ok());
+    EXPECT_EQ(stats().hits, 4u);
+}
 TEST(GraphBindings, FreezePassPropagatesWritesAcrossPhysicalAliases) {
     auto              session = vk::DeviceSession::create({ .validation = true }).unwrap();
     auto              queue   = vk::TextureContext::create(session).unwrap();

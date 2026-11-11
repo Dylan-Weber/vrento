@@ -1,6 +1,7 @@
 export module vrento:vulkan.resource_bindings;
 import rstd;
 import :pass.resources;
+import :vulkan.pass.execution;
 import :vulkan.frame;
 import :resource_registry.prepared;
 
@@ -21,6 +22,20 @@ inline auto capture_resources(const pass::GraphResourceMap&                   ma
         if (! frame.bindings.resolve(external.version.resource, external.version.version))
             return Err(GraphExecutionError {
                 GraphExecutionStage::Binding, {}, external.version.resource });
+    // Selections by use handle, in their original order: a scene selects once per draw texture,
+    // and scanning them all for every bound texture made this loop quadratic.
+    constexpr usize                            none { ~rstd::size_t(0) };
+    FastMap<resource::TextureUseHandle, usize> first;
+    Vec<usize>                                 chain;
+    chain.resize(selections.len(), none);
+    for (usize k {}; k < selections.len(); ++k) {
+        usize i = selections.len() - usize(1) - k;
+        if (auto previous = first.get_mut(selections[i].use)) {
+            chain[i]    = **previous;
+            **previous  = i;
+        } else
+            first.insert(selections[i].use, i);
+    }
     for (const auto& binding : mapping.textures) {
         auto version = binding.resource.version;
         auto value   = prepared.Resolve(binding.resource.handle);
@@ -38,8 +53,9 @@ inline auto capture_resources(const pass::GraphResourceMap&                   ma
                 vrento::vulkan::GraphExecutionCause::Texture(selected.unwrap_err()) });
         auto view = selected->view;
         bool overridden {};
-        for (const auto& selection : selections)
-            if (selection.use == binding.resource.handle) {
+        if (auto head = first.get(binding.resource.handle))
+            for (usize i = **head; i != none; i = chain[i]) {
+                const auto& selection = selections[i];
                 if (overridden &&
                     (view.texture().identity() != selection.view.texture().identity() ||
                      view.description() != selection.view.description()))
@@ -70,6 +86,13 @@ inline auto capture_resources(const pass::GraphResourceMap&                   ma
             version, Arc<dyn<GraphBinding>>::make(GraphTextureBinding(view)));
         if (bound.is_err()) return Err(bound.unwrap_err());
     }
+    // One entry per buffer version, found by hash: the scan of every earlier buffer for each new
+    // one was quadratic in the draws.
+    FastMap<fg::ResourceVersion, usize> buffer_index;
+    for (usize i {}; i < frame.buffers.len(); ++i) {
+        if (! buffer_index.contains_key(frame.buffers[i].version))
+            buffer_index.insert(frame.buffers[i].version, i);
+    }
     for (const auto& binding : mapping.buffers) {
         auto version = binding.resource.version;
         auto value   = prepared.Resolve(binding.resource.use);
@@ -82,15 +105,14 @@ inline auto capture_resources(const pass::GraphResourceMap&                   ma
         if (binding.range.offset > allocation.size() ||
             binding.range.size > allocation.size() - binding.range.offset)
             return Err(GraphExecutionError { GraphExecutionStage::Binding, {}, version.resource });
-        bool exists {};
-        for (const auto& buffer : frame.buffers)
-            if (buffer.version == version) {
-                if (buffer.allocation.identity() != allocation.identity())
-                    return Err(
-                        GraphExecutionError { GraphExecutionStage::Binding, {}, version.resource });
-                exists = true;
-            }
-        if (! exists) frame.buffers.push({ version, allocation.clone() });
+        if (auto found = buffer_index.get(version)) {
+            if (frame.buffers[**found].allocation.identity() != allocation.identity())
+                return Err(
+                    GraphExecutionError { GraphExecutionStage::Binding, {}, version.resource });
+        } else {
+            buffer_index.insert(version, frame.buffers.len());
+            frame.buffers.push({ version, allocation.clone() });
+        }
     }
     return Ok(empty {});
 }

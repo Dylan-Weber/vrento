@@ -54,9 +54,9 @@ struct GraphBindingEntry {
 class GraphBindings {
     GraphSerial                         scope_;
     Vec<GraphBindingEntry>              entries_;
-    HashMap<u64, usize>                 values_;
-    HashMap<ResourceId, Vec<usize>>     resources_;
-    HashMap<fg::ResourceVersion, usize> versions_;
+    FastMap<u64, usize>                 values_;
+    FastMap<ResourceId, Vec<usize>>     resources_;
+    FastMap<fg::ResourceVersion, usize> versions_;
 
     void append(GraphBindingEntry entry) {
         auto index = entries_.len();
@@ -91,7 +91,7 @@ class GraphBindings {
     }
     struct SlotCounts {
         usize               total {};
-        HashMap<u32, usize> slots;
+        FastMap<u32, usize> slots;
         void                add(Option<fg::Index> slot) {
             ++total;
             if (! slot) return;
@@ -115,7 +115,7 @@ class GraphBindings {
     };
     struct AliasGroup {
         AliasCounts                      counts;
-        HashMap<ResourceId, AliasCounts> resources;
+        FastMap<ResourceId, AliasCounts> resources;
         void                             add(ResourceId id, Option<fg::Index> slot, bool shared) {
             counts.add(slot, shared);
             if (! resources.contains_key(id)) resources.insert(id, AliasCounts {});
@@ -132,7 +132,7 @@ class GraphBindings {
                 {},
                 session.lost() ? GraphExecutionCause::Native(VK_ERROR_DEVICE_LOST)
                                : GraphExecutionCause::Reason(GraphFailure::Closed) });
-        HashMap<graph_texture::Identity, AliasGroup> aliases[2];
+        FastMap<graph_texture::Identity, AliasGroup> aliases[2];
         Vec<Option<fg::Index>>                       slots;
         Vec<bool>                                    shared;
         for (usize i {}; i < entries_.len(); ++i) {
@@ -185,10 +185,10 @@ class GraphBindings {
         }
         if (version_aliases) {
             struct VersionGroup {
-                HashMap<u32, graph_texture::Identity>       slots;
-                HashMap<graph_texture::Identity, fg::Index> identities;
+                FastMap<u32, graph_texture::Identity>       slots;
+                FastMap<graph_texture::Identity, fg::Index> identities;
             };
-            HashMap<ResourceId, VersionGroup> groups;
+            FastMap<ResourceId, VersionGroup> groups;
             for (usize i {}; i < entries_.len(); ++i) {
                 const auto& entry = entries_[i];
                 if (! entry.version || ! slots[i]) continue;
@@ -221,7 +221,7 @@ class GraphBindings {
         -> Result<GraphBindings, GraphExecutionError> {
         Vec<bool> used;
         used.resize(entries_.len(), false);
-        HashSet<graph_texture::Identity> written;
+        FastSet<graph_texture::Identity> written;
         for (const auto& pass : passes)
             for (const auto& use : pass.uses) {
                 auto index = locate(use.resource, Some(GraphIndex(use.version)));
@@ -364,12 +364,69 @@ public:
         -> Result<GraphBindings, GraphExecutionError> {
         if (scope_ != graph.scope())
             return Err(GraphExecutionError { GraphExecutionStage::Binding });
-        auto infos   = information();
-        auto checked = validate_info(
-            graph.resources(), graph.binding_layout(), session, infos.as_slice(), true);
-        if (checked.is_err()) return Err(checked.unwrap_err());
-        auto uses = validate_uses(graph);
-        if (uses.is_err()) return Err(uses.unwrap_err());
+        auto infos = information();
+        {
+            // Validation depends only on the graph (fixed), the session and the words below: the
+            // same words as the last frame that passed need no second pass over every binding.
+            auto cache = graph.binding_check().lock().unwrap();
+            cache->scratch.clear();
+            // Which bindings share a physical resource decides the validation, not the identity
+            // itself (a buffer uploaded this frame is new every frame), so identities enter as the
+            // number of the first binding with the same one.
+            FastMap<graph_texture::Identity, rstd::uint64_t> ordinals;
+            for (usize i {}; i < entries_.len(); ++i) {
+                const auto& entry = entries_[i];
+                const auto& info  = infos[i];
+                cache->scratch.push(rstd::uint64_t(entry.id.value));
+                cache->scratch.push(rstd::uint64_t(entry.id.generation));
+                cache->scratch.push(entry.version ? rstd::uint64_t(*entry.version)
+                                                  : ~rstd::uint64_t(0));
+                cache->scratch.push(rstd::uint64_t(info.kind));
+                cache->scratch.push(rstd::uint64_t(info.identity.device));
+                cache->scratch.push(rstd::uint64_t(info.identity.epoch));
+                rstd::uint64_t ordinal = ordinals.len().to_primitive();
+                if (auto seen = ordinals.get(info.identity))
+                    ordinal = **seen;
+                else
+                    ordinals.insert(info.identity, rstd::uint64_t(ordinal));
+                cache->scratch.push(rstd::uint64_t(ordinal));
+                cache->scratch.push(rstd::uint64_t(info.bytes));
+                cache->scratch.push(rstd::uint64_t(info.mip_levels) |
+                                    rstd::uint64_t(info.layers) << 32);
+                cache->scratch.push(rstd::uint64_t(info.aspects));
+                // The revision only matters where the validation compares it.
+                bool compared = true;
+                if (auto declared = graph.binding_layout().resource(entry.id))
+                    compared = graph.resources()[*declared].check_revision &&
+                               (! entry.version || *entry.version == 0);
+                cache->scratch.push(compared ? rstd::uint64_t(info.content_revision) : 0);
+            }
+            bool same = cache->valid && session.valid() && ! session.lost() &&
+                        cache->epoch == rstd::uint64_t(session.epoch()) &&
+                        cache->checked.len() == cache->scratch.len();
+            if (cache->valid && cache->checked.len() != cache->scratch.len())
+                cache->last_difference = -1;
+            else if (cache->valid)
+                for (usize i {}; same && i < cache->scratch.len(); ++i) {
+                    same = cache->checked[i] == cache->scratch[i];
+                    if (! same) cache->last_difference = rstd::int64_t(i.to_primitive());
+                }
+            if (same)
+                ++cache->hits;
+            else {
+                ++cache->misses;
+                cache->valid = false;
+                auto checked = validate_info(
+                    graph.resources(), graph.binding_layout(), session, infos.as_slice(), true);
+                if (checked.is_err()) return Err(checked.unwrap_err());
+                auto uses = validate_uses(graph);
+                if (uses.is_err()) return Err(uses.unwrap_err());
+                cache->checked.clear();
+                for (const auto& word : cache->scratch) cache->checked.push(rstd::uint64_t(word));
+                cache->epoch = rstd::uint64_t(session.epoch());
+                cache->valid = true;
+            }
+        }
         return freeze_info(graph.passes(),
                            graph.resources(),
                            &graph.binding_layout(),
