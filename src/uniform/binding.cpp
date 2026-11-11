@@ -4,6 +4,7 @@ import :resource;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
+using rstd::sync::atomic::Atomic;
 namespace vrento
 {
 namespace
@@ -138,7 +139,16 @@ private:
     ShaderMatrixAbi            m_abi;
 };
 
+Atomic<u64> g_updates { u64() }, g_evaluated { u64() }, g_uploaded { u64() }, g_identical { u64() };
 } // namespace
+
+auto uniform_update_stats() -> UniformUpdateStats {
+    constexpr auto order = rstd::sync::atomic::Ordering::Relaxed;
+    return { g_updates.load(order).to_primitive(),
+             g_evaluated.load(order).to_primitive(),
+             g_uploaded.load(order).to_primitive(),
+             g_identical.load(order).to_primitive() };
+}
 
 auto PrepareUniformSource(const UniformBufferLayout& layout, UniformSourceOwner owner, i32 priority,
                           ShaderMatrixConvention convention, ShaderMatrixAbi abi)
@@ -188,6 +198,8 @@ auto UniformBinding::SetParameters(slice<UniformParameter> parameters)
 auto UniformBinding::Update(ref<dyn<UniformUpdateContext>>              context,
                             mut_ref<dyn<resource::BufferContentWriter>> buffers)
     -> Result<empty, UniformBufferUpdateError> {
+    constexpr auto order = rstd::sync::atomic::Ordering::Relaxed;
+    g_updates.fetch_add(u64(1), order);
     auto& versions = m_versions;
     versions.clear();
     bool changed = m_dirty;
@@ -209,9 +221,30 @@ auto UniformBinding::Update(ref<dyn<UniformUpdateContext>>              context,
             return Err(
                 UniformBufferUpdateError { rstd::move(evaluated).unwrap_err_unchecked().message });
     }
-    auto updated = buffers->UpdateBuffer(m_buffer, data.as_slice());
-    if (updated.is_err())
-        return Err(UniformBufferUpdateError { rstd::move(updated).unwrap_err_unchecked().message });
+    g_evaluated.fetch_add(u64(1), order);
+    // A block equal to the one already uploaded changes nothing on the GPU: no staging copy, upload
+    // or barrier. Most blocks of a scene whose objects hold still are, though every source reports a
+    // new version each frame.
+    bool identical = m_has_uploaded && m_uploaded.len() == data.len() &&
+                     (data.len() == usize() ||
+                      __builtin_memcmp(data.as_slice().as_raw_ptr(),
+                                       m_uploaded.as_slice().as_raw_ptr(),
+                                       data.len().to_primitive()) == 0);
+    if (! identical) {
+        auto updated = buffers->UpdateBuffer(m_buffer, data.as_slice());
+        if (updated.is_err()) {
+            m_has_uploaded = false;
+            return Err(
+                UniformBufferUpdateError { rstd::move(updated).unwrap_err_unchecked().message });
+        }
+        g_uploaded.fetch_add(u64(1), order);
+        // The block just uploaded is the one to compare with next; its buffer is reused.
+        auto previous  = rstd::move(m_uploaded);
+        m_uploaded     = rstd::move(m_block);
+        m_block        = rstd::move(previous);
+        m_has_uploaded = true;
+    } else
+        g_identical.fetch_add(u64(1), order);
     // Failed evaluation or upload must leave every source eligible for retry.
     for (usize index {}; index < m_sources.len(); ++index) {
         m_sources[index].version   = versions[index];

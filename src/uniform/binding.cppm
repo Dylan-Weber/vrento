@@ -32,6 +32,13 @@ struct UniformParameter {
     UniformValueView value;
 };
 
+// How often uniform blocks were evaluated, uploaded, or found equal to the block already uploaded
+// (and so not uploaded) or unchanged by their sources' versions; process-wide, for diagnostics.
+struct UniformUpdateStats {
+    rstd::uint64_t updates {}, evaluated {}, uploaded {}, identical {};
+};
+auto uniform_update_stats() -> UniformUpdateStats;
+
 class UniformBinding {
 public:
     UniformBinding(resource::BufferUseHandle, UniformBufferLayout, Vec<BoundUniformSource>,
@@ -49,6 +56,8 @@ private:
     // Kept between updates: a binding is updated every frame it changes, and a block and a list of
     // versions allocated each time were most of its allocations.
     Vec<u8>                   m_block;
+    Vec<u8>                   m_uploaded;
+    bool                      m_has_uploaded { false };
     Vec<u64>                  m_versions;
     ShaderMatrixConvention    m_convention;
     ShaderMatrixAbi           m_abi;

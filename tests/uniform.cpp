@@ -22,6 +22,7 @@ struct State {
     u32      destroyed {};
     u32      evaluated {};
     bool     fail_evaluate { false };
+    float    value { 7.0f };
     u32      leases_created {};
     u32      leases_destroyed {};
 };
@@ -74,7 +75,7 @@ struct Source {
         ++state->evaluated;
         if (state->fail_evaluate)
             return Err(UniformError { String::make("evaluation failed"_str) });
-        float value = 7.0f;
+        float value = state->value;
         return sink->Write(
             UniformOutputId { u32(0) },
             UniformValueView { &value, usize(1), UniformValueLayout::Linear(usize(1)) });
@@ -335,18 +336,33 @@ static void BindingRetriesAndOwnsSources() {
         rstd_assert(writer.calls == u32(1));
         rstd_assert(binding.Update(view.as_ref(), sink.as_mut_ref()).is_ok());
         rstd_assert(writer.calls == u32(1));
+        // A new version with the same content: evaluated, but nothing to upload.
         ++frame.revision;
-        writer.fail = true;
+        const auto evaluated_before = state->evaluated;
+        rstd_assert(binding.Update(view.as_ref(), sink.as_mut_ref()).is_ok());
+        rstd_assert(state->evaluated == evaluated_before + u32(1));
+        rstd_assert(writer.calls == u32(1));
+        // A failed upload leaves the source eligible for retry.
+        ++frame.revision;
+        state->value = 8.0f;
+        writer.fail  = true;
         rstd_assert(binding.Update(view.as_ref(), sink.as_mut_ref()).is_err());
         rstd_assert(writer.calls == u32(2));
         writer.fail = false;
         rstd_assert(binding.Update(view.as_ref(), sink.as_mut_ref()).is_ok());
         rstd_assert(writer.calls == u32(3));
+        // The block that failed to upload is not remembered as uploaded, and a changed one is.
         ++frame.revision;
         state->fail_evaluate = true;
         rstd_assert(binding.Update(view.as_ref(), sink.as_mut_ref()).is_err());
         rstd_assert(writer.calls == u32(3));
         state->fail_evaluate = false;
+        state->value         = 9.0f;
+        rstd_assert(binding.Update(view.as_ref(), sink.as_mut_ref()).is_ok());
+        rstd_assert(writer.calls == u32(4));
+        rstd_assert(writer.bytes[usize()] != u8() || writer.bytes[usize(3)] != u8());
+        // Back to a content equal to the last upload on a new version: skipped again.
+        ++frame.revision;
         rstd_assert(binding.Update(view.as_ref(), sink.as_mut_ref()).is_ok());
         rstd_assert(writer.calls == u32(4));
     }
