@@ -18,8 +18,10 @@ export namespace vrento::vulkan
 // A pass opts in with a gate (copy_gate_allocate, passed to declare_texture_copy_output): the gate, not the pass id,
 // tells passes of different graphs and sessions apart.
 struct CopyRegion {
-    bool     skip {};
-    uint32_t x {}, y {}, width {}, height {};
+    bool skip {};
+    // the part wanted, as fractions of the copied extent (left, top, right, bottom); used when has_rect
+    bool  has_rect {};
+    float u0 {}, v0 {}, u1 { 1 }, v1 { 1 };
 };
 inline auto copy_gate_allocate() -> uint64_t {
     static std::atomic<uint64_t> next { 1 };
@@ -30,10 +32,23 @@ struct CopyGateTable {
     std::unordered_map<uint64_t, CopyRegion> regions;
 };
 inline CopyGateTable g_copy_gates;
-inline void          copy_gate_set(uint64_t gate, const CopyRegion& region) {
+inline void copy_gate_skip(uint64_t gate, bool skip) {
     if (! gate) return;
     std::lock_guard guard(g_copy_gates.lock);
-    g_copy_gates.regions[gate] = region;
+    g_copy_gates.regions[gate].skip = skip;
+}
+// nothing outside the rectangle is wanted; the fractions are of the copied extent
+inline void copy_gate_rect(uint64_t gate, float u0, float v0, float u1, float v1) {
+    if (! gate) return;
+    std::lock_guard guard(g_copy_gates.lock);
+    auto&           region = g_copy_gates.regions[gate];
+    region.has_rect        = true;
+    region.u0 = u0, region.v0 = v0, region.u1 = u1, region.v1 = v1;
+}
+inline void copy_gate_whole(uint64_t gate) {
+    if (! gate) return;
+    std::lock_guard guard(g_copy_gates.lock);
+    g_copy_gates.regions[gate].has_rect = false;
 }
 inline void copy_gate_clear(uint64_t gate) {
     if (! gate) return;
@@ -75,17 +90,21 @@ struct TextureTransferPrepared {
             if (gate) {
                 const auto wanted = copy_gate_get(gate);
                 if (wanted.skip) return Ok(empty {});
-                if (wanted.width && wanted.height) {
-                    // the wanted rectangle clipped to what the pass copies
-                    const auto right  = wanted.x + wanted.width < region.extent.width ? wanted.x + wanted.width
-                                                                                    : region.extent.width;
-                    const auto bottom = wanted.y + wanted.height < region.extent.height
-                                            ? wanted.y + wanted.height
-                                            : region.extent.height;
-                    if (wanted.x >= right || wanted.y >= bottom) return Ok(empty {});
-                    region.srcOffset = { int32_t(wanted.x), int32_t(wanted.y), 0 };
+                if (wanted.has_rect) {
+                    // the wanted rectangle, a pixel wider on each side, clipped to what the pass copies
+                    const auto  w = float(region.extent.width), h = float(region.extent.height);
+                    const float x0 = wanted.u0 * w - 1.0f, x1 = wanted.u1 * w + 1.0f,
+                                y0 = wanted.v0 * h - 1.0f, y1 = wanted.v1 * h + 1.0f;
+                    const auto left   = x0 > 0.0f ? uint32_t(x0) : 0u;
+                    const auto top    = y0 > 0.0f ? uint32_t(y0) : 0u;
+                    const auto right  = x1 < w ? uint32_t(x1) + 1u : region.extent.width;
+                    const auto bottom = y1 < h ? uint32_t(y1) + 1u : region.extent.height;
+                    const auto r      = right < region.extent.width ? right : region.extent.width;
+                    const auto b      = bottom < region.extent.height ? bottom : region.extent.height;
+                    if (left >= r || top >= b) return Ok(empty {});
+                    region.srcOffset = { int32_t(left), int32_t(top), 0 };
                     region.dstOffset = region.srcOffset;
-                    region.extent    = { right - wanted.x, bottom - wanted.y, 1 };
+                    region.extent    = { r - left, b - top, 1 };
                 }
             }
             context.session.device().handle().Dispatch().vkCmdCopyImage(
