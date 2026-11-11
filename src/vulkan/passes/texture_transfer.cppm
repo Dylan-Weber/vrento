@@ -1,3 +1,9 @@
+module;
+#include <atomic>
+#include <mutex>
+#include <stdint.h>
+#include <unordered_map>
+
 export module vrento:vulkan.passes.texture_transfer;
 export import :vulkan.graph;
 export import :vulkan.renderer;
@@ -5,11 +11,48 @@ import rstd;
 
 using namespace rstd::prelude;
 
+export namespace vrento::vulkan
+{
+// What a texture copy pass copies this frame, set by whoever owns the data that will read the copy, before the frame
+// records: nothing (no reader), or a rectangle of the pixels (the part read). A copy with no entry copies everything.
+// A pass opts in with a gate (copy_gate_allocate, passed to declare_texture_copy_output): the gate, not the pass id,
+// tells passes of different graphs and sessions apart.
+struct CopyRegion {
+    bool     skip {};
+    uint32_t x {}, y {}, width {}, height {};
+};
+inline auto copy_gate_allocate() -> uint64_t {
+    static std::atomic<uint64_t> next { 1 };
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+struct CopyGateTable {
+    std::mutex                           lock;
+    std::unordered_map<uint64_t, CopyRegion> regions;
+};
+inline CopyGateTable g_copy_gates;
+inline void          copy_gate_set(uint64_t gate, const CopyRegion& region) {
+    if (! gate) return;
+    std::lock_guard guard(g_copy_gates.lock);
+    g_copy_gates.regions[gate] = region;
+}
+inline void copy_gate_clear(uint64_t gate) {
+    if (! gate) return;
+    std::lock_guard guard(g_copy_gates.lock);
+    g_copy_gates.regions.erase(gate);
+}
+inline auto copy_gate_get(uint64_t gate) -> CopyRegion {
+    if (! gate) return {};
+    std::lock_guard guard(g_copy_gates.lock);
+    auto            found = g_copy_gates.regions.find(gate);
+    return found == g_copy_gates.regions.end() ? CopyRegion {} : found->second;
+}
+} // namespace vrento::vulkan
 namespace vrento::vulkan
 {
 struct TextureTransferPrepared {
     graph_texture::TextureViewRef source, target;
     VkImageCopy                   copy {};
+    uint64_t                      gate {};
     Option<TextureMipmapProgram>  mips;
     auto Record(GraphRecordContext& context) const -> Result<empty, GraphExecutionError> {
         auto fail = [](graph_texture::Error error) -> Result<empty, GraphExecutionError> {
@@ -28,6 +71,23 @@ struct TextureTransferPrepared {
             auto src = native_texture(source.texture()), dst = native_texture(target.texture());
             if (src.is_err()) return fail(src.unwrap_err());
             if (dst.is_err()) return fail(dst.unwrap_err());
+            VkImageCopy region = copy;
+            if (gate) {
+                const auto wanted = copy_gate_get(gate);
+                if (wanted.skip) return Ok(empty {});
+                if (wanted.width && wanted.height) {
+                    // the wanted rectangle clipped to what the pass copies
+                    const auto right  = wanted.x + wanted.width < region.extent.width ? wanted.x + wanted.width
+                                                                                    : region.extent.width;
+                    const auto bottom = wanted.y + wanted.height < region.extent.height
+                                            ? wanted.y + wanted.height
+                                            : region.extent.height;
+                    if (wanted.x >= right || wanted.y >= bottom) return Ok(empty {});
+                    region.srcOffset = { int32_t(wanted.x), int32_t(wanted.y), 0 };
+                    region.dstOffset = region.srcOffset;
+                    region.extent    = { right - wanted.x, bottom - wanted.y, 1 };
+                }
+            }
             context.session.device().handle().Dispatch().vkCmdCopyImage(
                 command.unwrap(),
                 src.unwrap(),
@@ -35,7 +95,7 @@ struct TextureTransferPrepared {
                 dst.unwrap(),
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 1,
-                &copy);
+                &region);
         }
         return Ok(empty {});
     }
@@ -79,7 +139,13 @@ auto TextureTransferBackend::Prepare(const PassExecutionInfo&   pass,
                         GraphExecutionError> {
         return Err(GraphExecutionError { GraphExecutionStage::Unsupported, pass.id });
     };
-    if (! pass.parameters.is_empty() || pass.graphics) return unsupported();
+    uint64_t gate {};
+    if (pass.kind == texture_copy_kind && pass.parameters.len() == usize(sizeof(uint64_t)))
+        for (unsigned i {}; i < sizeof(uint64_t); ++i)
+            gate |= uint64_t(pass.parameters[usize(i)]) << (8 * i);
+    else if (! pass.parameters.is_empty())
+        return unsupported();
+    if (pass.graphics) return unsupported();
     if (pass.kind == texture_sampled_kind) {
         if (pass.uses.len() != usize(1) || pass.uses[usize()].usage != PassUsage::Sampled ||
             pass.uses[usize()].access != GraphAccess::Read)
@@ -143,7 +209,9 @@ auto TextureTransferBackend::Prepare(const PassExecutionInfo&   pass,
     };
     region.extent = { from.width, from.height, 1 };
     return Ok(rstd::sync::Arc<dyn<VulkanPass>>::make(TextureTransferPrepared {
-        .source = rstd::move(src).unwrap(), .target = rstd::move(dst).unwrap(), .copy = region }));
+        .source = rstd::move(src).unwrap(), .target = rstd::move(dst).unwrap(),
+        .copy   = region,
+        .gate   = gate }));
 }
 } // namespace vrento::vulkan
 export namespace vrento::vulkan
@@ -153,8 +221,12 @@ struct TextureCopyDesc {
     pass::ContentRef source, target;
     GraphRange       source_range, target_range;
     LogicalQueue     queue { 1, QueueClass::Transfer };
+    uint64_t         gate {};
     auto             vulkan_io() const -> VulkanPassIO {
         VulkanPassIO result { .queue = queue, .kind = texture_copy_kind };
+        if (gate)
+            for (unsigned i {}; i < sizeof(uint64_t); ++i)
+                result.parameters.push(rstd::uint8_t(gate >> (8 * i)));
         result.inputs.push(
             { source.clone(), PassUsage::Transfer, PassStages::Transfer, source_range });
         result.outputs.push(
@@ -210,22 +282,25 @@ struct DeclaredTexturePass {
 inline auto declare_texture_copy_output(fg::FrameGraphBuilder& builder, PassId id,
                                         pass::ContentRef source, pass::ContentRef output,
                                         GraphRange from = {}, GraphRange to = {},
-                                        GraphSerial revision = 1) -> Result<PassInput, GraphError> {
-    return declare_input(builder,
-                         id,
-                         TextureCopyDesc { rstd::move(source), rstd::move(output), from, to },
-                         revision);
+                                        GraphSerial revision = 1, uint64_t gate = 0)
+    -> Result<PassInput, GraphError> {
+    return declare_input(
+        builder,
+        id,
+        TextureCopyDesc { rstd::move(source), rstd::move(output), from, to, { 1, QueueClass::Transfer }, gate },
+        revision);
 }
 inline auto declare_texture_copy_output(fg::FrameGraphBuilder& builder, PassId id,
                                         fg::ResourceVersion source, fg::ResourceVersion output,
                                         GraphRange from = {}, GraphRange to = {},
-                                        GraphSerial revision = 1) -> Result<PassInput, GraphError> {
+                                        GraphSerial revision = 1, uint64_t gate = 0)
+    -> Result<PassInput, GraphError> {
     auto input = pass::ContentRef::bind(builder, source);
     if (input.is_err()) return Err(input.unwrap_err());
     auto target = pass::ContentRef::bind(builder, output);
     if (target.is_err()) return Err(target.unwrap_err());
     return declare_texture_copy_output(
-        builder, id, input.unwrap(), target.unwrap(), from, to, revision);
+        builder, id, input.unwrap(), target.unwrap(), from, to, revision, gate);
 }
 inline auto declare_texture_copy(fg::FrameGraphBuilder& builder, PassId id, pass::ContentRef source,
                                  pass::ContentRef target, GraphRange from = {}, GraphRange to = {},
