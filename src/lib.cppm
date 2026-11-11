@@ -1,5 +1,6 @@
 export module vrento;
 
+export import :fast_hash;
 export import :types;
 export import :scene;
 export import :texture;

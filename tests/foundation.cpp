@@ -665,3 +665,37 @@ TEST(BackendErrors, DriverCacheOwnsIoPath) {
     EXPECT_EQ(cause.as_Io().path.as_str(), "/vrento-missing-directory/errors-cache-test"_str);
     EXPECT_TRUE(as<rstd::error::Error>(cause).source().is_some());
 }
+
+TEST(FastHash, KeysSpreadOverTheLowAndHighBitsTheTableUses) {
+    using State = FastHashState;
+    constexpr rstd::uint64_t count = 1 << 16;
+    rstd::uint32_t           low[256] {};
+    rstd::uint32_t           high[128] {};
+    for (rstd::uint64_t key = 0; key < count; ++key) {
+        auto hash = rstd::hash::hash_one(State {}, u64(key * 8));
+        ++low[hash.to_primitive() & 255u];
+        ++high[(hash.to_primitive() >> 57) & 127u];
+    }
+    for (auto bucket : low) EXPECT_LT(bucket, 2 * count / 256);
+    for (auto bucket : high) EXPECT_LT(bucket, 2 * count / 128);
+}
+
+TEST(FastHash, EqualKeysHashEqualAndDifferentKeysMostlyDiffer) {
+    FastHashState state;
+    EXPECT_EQ(rstd::hash::hash_one(state, u64(42)), rstd::hash::hash_one(state, u64(42)));
+    EXPECT_NE(rstd::hash::hash_one(state, u64(42)), rstd::hash::hash_one(state, u64(43)));
+    fg::ResourceId a { 3, 1 }, b { 3, 2 };
+    EXPECT_NE(rstd::hash::hash_one(state, a), rstd::hash::hash_one(state, b));
+}
+
+TEST(FastHash, HashMapsKeepEveryEntry) {
+    auto map = rstd::collections::HashMap<u64, usize, FastHashState>::make();
+    for (rstd::uint64_t key = 0; key < 5000; ++key) map.insert(u64(key * 977), usize(key));
+    EXPECT_EQ(map.len(), usize(5000));
+    for (rstd::uint64_t key = 0; key < 5000; ++key) {
+        auto found = map.get(u64(key * 977));
+        ASSERT_TRUE(found.is_some());
+        EXPECT_EQ(**found, usize(key));
+    }
+    EXPECT_TRUE(map.get(u64(1)).is_none());
+}

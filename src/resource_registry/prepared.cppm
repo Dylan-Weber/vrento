@@ -1,4 +1,5 @@
 export module vrento:resource_registry.prepared;
+import :fast_hash;
 import rstd;
 import :resource;
 import :vulkan.api;
@@ -16,6 +17,8 @@ using rstd::collections::HashMap;
 using rstd::sync::Arc;
 using namespace rstd::prelude;
 using namespace rstd::literals;
+using vrento::FastMap;
+
 
 export namespace vrento::resource_registry
 {
@@ -201,7 +204,7 @@ public:
     auto AffectedTextureDescriptors(slice<resource::TextureUseHandle> textures) const
         -> Vec<resource::DescriptorBindingHandle> {
         Vec<resource::DescriptorBindingHandle>           result;
-        HashMap<resource::DescriptorBindingHandle, bool> seen;
+        FastMap<resource::DescriptorBindingHandle, bool> seen;
         for (auto texture : textures)
             if (auto uses = m_texture_descriptors.get(texture))
                 for (auto descriptor : **uses)
@@ -530,14 +533,14 @@ public:
     void Remove(resource::ExternalUseHandle use) { (void)m_externals.remove(use); }
 
 private:
-    using TextureMap     = HashMap<resource::TextureUseHandle, PreparedTexture>;
-    using DescriptorMap  = HashMap<resource::DescriptorBindingHandle, PreparedDescriptorBinding>;
-    using BufferMap      = HashMap<resource::BufferUseHandle, PreparedBufferUse>;
-    using ShaderMap      = HashMap<resource::ShaderUseHandle, PreparedShaderUse>;
-    using PipelineMap    = HashMap<resource::PipelineUseHandle, PreparedPipeline>;
-    using RenderPassMap  = HashMap<resource::RenderPassUseHandle, PreparedRenderPass>;
-    using FramebufferMap = HashMap<resource::FramebufferUseHandle, PreparedFramebuffer>;
-    using ExternalMap    = HashMap<resource::ExternalUseHandle, PreparedExternalUse>;
+    using TextureMap     = FastMap<resource::TextureUseHandle, PreparedTexture>;
+    using DescriptorMap  = FastMap<resource::DescriptorBindingHandle, PreparedDescriptorBinding>;
+    using BufferMap      = FastMap<resource::BufferUseHandle, PreparedBufferUse>;
+    using ShaderMap      = FastMap<resource::ShaderUseHandle, PreparedShaderUse>;
+    using PipelineMap    = FastMap<resource::PipelineUseHandle, PreparedPipeline>;
+    using RenderPassMap  = FastMap<resource::RenderPassUseHandle, PreparedRenderPass>;
+    using FramebufferMap = FastMap<resource::FramebufferUseHandle, PreparedFramebuffer>;
+    using ExternalMap    = FastMap<resource::ExternalUseHandle, PreparedExternalUse>;
 
     u64                                                                       m_generation { 0 };
     TextureMap                                                                m_textures;
@@ -547,8 +550,8 @@ private:
     RenderPassMap                                                             m_render_passes;
     FramebufferMap                                                            m_framebuffers;
     DescriptorMap                                                             m_descriptors;
-    HashMap<resource::DescriptorBindingHandle, Vec<DescriptorTextureBinding>> m_descriptor_textures;
-    HashMap<resource::TextureUseHandle, Vec<resource::DescriptorBindingHandle>>
+    FastMap<resource::DescriptorBindingHandle, Vec<DescriptorTextureBinding>> m_descriptor_textures;
+    FastMap<resource::TextureUseHandle, Vec<resource::DescriptorBindingHandle>>
                 m_texture_descriptors;
     ExternalMap m_externals;
 };
@@ -795,7 +798,7 @@ public:
                        Option<mut_ref<dyn<resource::TextureContentProvider>>> content,
                        Option<mut_ref<dyn<resource::TexturePrepareObserver>>> observer)
         -> Result<empty, resource::ResourceError> {
-        auto pending_index = HashMap<resource::ImportedTextureContentIdentity, usize>::make();
+        auto pending_index = FastMap<resource::ImportedTextureContentIdentity, usize>::make();
         TexturePrepareTrace plan_trace(observer, TexturePrepareTrace::Kind::Plan);
 
         for (usize entry_index {}; entry_index < entries.len(); ++entry_index) {

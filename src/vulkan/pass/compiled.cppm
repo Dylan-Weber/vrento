@@ -1,4 +1,5 @@
 export module vrento:vulkan.pass.compiled;
+import :fast_hash;
 export import :vulkan.pass.graph_input;
 export import :vulkan.pass.resources;
 import :vulkan.pass.factory;
@@ -7,6 +8,8 @@ import rstd;
 using namespace rstd::prelude;
 using rstd::collections::HashMap;
 using rstd::sync::Arc;
+using vrento::FastMap;
+
 
 export namespace vrento::vulkan
 {
@@ -144,11 +147,11 @@ class CompiledGraph {
         Option<Arc<GraphicsCompileResources>> resources;
         Arc<ExecutionCounters>                execution;
         Arc<PassBindingOwner>                 identity { Arc<PassBindingOwner>::make() };
-        HashMap<PassId, usize>                indices;
+        FastMap<PassId, usize>                indices;
         Arc<Vec<usize>>                       routes;
         Data(VulkanPassSet set, DeviceSession device, GraphInput values, Vec<Entry> passes,
              Option<Arc<GraphicsCompileResources>> context, Arc<ExecutionCounters> counters,
-             HashMap<PassId, usize> index, Vec<usize> dispatch)
+             FastMap<PassId, usize> index, Vec<usize> dispatch)
             : graph(rstd::move(set)),
               session(rstd::move(device)),
               input(rstd::move(values)),
@@ -169,12 +172,12 @@ class CompiledGraph {
         auto descriptions = input.descriptions();
         if (entries.len() != descriptions.len() || entries.len() != graph.passes().len())
             return Err(GraphExecutionError { GraphExecutionStage::Schema });
-        HashMap<PassId, usize> descriptions_by_id;
+        FastMap<PassId, usize> descriptions_by_id;
         for (usize i {}; i < descriptions.len(); ++i)
             if (descriptions_by_id.insert(descriptions[i].execution().id, i))
                 return Err(GraphExecutionError { GraphExecutionStage::Schema,
                                                  descriptions[i].execution().id });
-        HashMap<PassId, usize> indices;
+        FastMap<PassId, usize> indices;
         for (usize i {}; i < entries.len(); ++i) {
             auto& entry = entries[i];
             auto  found = descriptions_by_id.get(entry.id);

@@ -1,4 +1,5 @@
 export module vrento:vulkan.pass.execution;
+import :fast_hash;
 export import :frame_graph;
 import rstd;
 
@@ -15,6 +16,8 @@ using PassId            = fg::PassId;
 using GraphResourceKind = fg::ResourceKind;
 using GraphAccess       = fg::Access;
 using GraphRange        = fg::ResourceRange;
+using vrento::FastMap;
+
 enum class QueueClass : GraphIndex
 {
     Graphics,
@@ -291,9 +294,9 @@ validate_pass_execution(const PassExecutionInfo& pass, slice<GraphBindingRequire
     return Ok(empty {});
 }
 class GraphBindingLayout {
-    HashMap<ResourceId, usize>              resources_;
-    HashMap<fg::ResourceVersion, fg::Index> versions_;
-    HashMap<ResourceId, fg::Index>          slots_;
+    FastMap<ResourceId, usize>              resources_;
+    FastMap<fg::ResourceVersion, fg::Index> versions_;
+    FastMap<ResourceId, fg::Index>          slots_;
     bool                                    allocations_ {};
 
 public:

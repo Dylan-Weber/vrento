@@ -3,6 +3,7 @@ module;
 #include <stdlib.h>
 
 export module vrento:vulkan.graph;
+import :fast_hash;
 export import :vulkan.pass.execution;
 export import :vulkan.texture;
 export import :vulkan.pass.pass;
@@ -12,6 +13,8 @@ import rstd;
 using namespace rstd::prelude;
 using rstd::collections::HashMap;
 using rstd::collections::HashSet;
+using vrento::FastMap;
+
 
 export namespace vrento::vulkan
 {
@@ -58,9 +61,9 @@ struct GraphBindingEntry {
 class GraphBindings {
     GraphSerial                         scope_;
     Vec<GraphBindingEntry>              entries_;
-    HashMap<u64, usize>                 values_;
-    HashMap<ResourceId, Vec<usize>>     resources_;
-    HashMap<fg::ResourceVersion, usize> versions_;
+    FastMap<u64, usize>                 values_;
+    FastMap<ResourceId, Vec<usize>>     resources_;
+    FastMap<fg::ResourceVersion, usize> versions_;
 
     void append(GraphBindingEntry entry) {
         auto index = entries_.len();
@@ -95,7 +98,7 @@ class GraphBindings {
     }
     struct SlotCounts {
         usize               total {};
-        HashMap<u32, usize> slots;
+        FastMap<u32, usize> slots;
         void                add(Option<fg::Index> slot) {
             ++total;
             if (! slot) return;
@@ -119,7 +122,7 @@ class GraphBindings {
     };
     struct AliasGroup {
         AliasCounts                      counts;
-        HashMap<ResourceId, AliasCounts> resources;
+        FastMap<ResourceId, AliasCounts> resources;
         void                             add(ResourceId id, Option<fg::Index> slot, bool shared) {
             counts.add(slot, shared);
             if (! resources.contains_key(id)) resources.insert(id, AliasCounts {});
@@ -136,7 +139,7 @@ class GraphBindings {
                 {},
                 session.lost() ? GraphExecutionCause::Native(VK_ERROR_DEVICE_LOST)
                                : GraphExecutionCause::Reason(GraphFailure::Closed) });
-        HashMap<graph_texture::Identity, AliasGroup> aliases[2];
+        FastMap<graph_texture::Identity, AliasGroup> aliases[2];
         Vec<Option<fg::Index>>                       slots;
         Vec<bool>                                    shared;
         for (usize i {}; i < entries_.len(); ++i) {
@@ -189,10 +192,10 @@ class GraphBindings {
         }
         if (version_aliases) {
             struct VersionGroup {
-                HashMap<u32, graph_texture::Identity>       slots;
-                HashMap<graph_texture::Identity, fg::Index> identities;
+                FastMap<u32, graph_texture::Identity>       slots;
+                FastMap<graph_texture::Identity, fg::Index> identities;
             };
-            HashMap<ResourceId, VersionGroup> groups;
+            FastMap<ResourceId, VersionGroup> groups;
             for (usize i {}; i < entries_.len(); ++i) {
                 const auto& entry = entries_[i];
                 if (! entry.version || ! slots[i]) continue;

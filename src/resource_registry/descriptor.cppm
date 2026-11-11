@@ -1,4 +1,5 @@
 export module vrento:resource_registry.descriptor;
+import :fast_hash;
 import rstd;
 import :resource;
 import :vulkan.api;
@@ -6,6 +7,8 @@ import :vulkan.api;
 using rstd::collections::HashMap;
 using rstd::sync::Arc;
 using namespace rstd::prelude;
+using vrento::FastMap;
+
 
 export namespace vrento::resource_registry
 {
@@ -209,8 +212,8 @@ public:
     }
 
 private:
-    using EntryMap    = HashMap<resource::DescriptorLayoutHandle, DescriptorLayoutEntry>;
-    using IdentityMap = HashMap<DescriptorSetSchema, resource::DescriptorLayoutHandle>;
+    using EntryMap    = FastMap<resource::DescriptorLayoutHandle, DescriptorLayoutEntry>;
+    using IdentityMap = FastMap<DescriptorSetSchema, resource::DescriptorLayoutHandle>;
 
     u64         m_generation { 1 };
     u64         m_next_index { 0 };
@@ -840,7 +843,7 @@ private:
     }
 
     Option<Arc<vvk::DescriptorArenaGeneration>>              m_pool;
-    HashMap<DescriptorSetPacketKey, vvk::DescriptorSetLease> m_packets;
+    FastMap<DescriptorSetPacketKey, vvk::DescriptorSetLease> m_packets;
     u64                                                      m_generation { 1 };
     u64                                                      m_next_index { 0 };
 };
