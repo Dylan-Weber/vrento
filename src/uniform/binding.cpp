@@ -188,15 +188,18 @@ auto UniformBinding::SetParameters(slice<UniformParameter> parameters)
 auto UniformBinding::Update(ref<dyn<UniformUpdateContext>>              context,
                             mut_ref<dyn<resource::BufferContentWriter>> buffers)
     -> Result<empty, UniformBufferUpdateError> {
-    auto versions = Vec<u64>::with_capacity(m_sources.len());
-    bool changed  = m_dirty;
+    auto& versions = m_versions;
+    versions.clear();
+    bool changed = m_dirty;
     for (auto& source : m_sources) {
         auto version = source.source->Version(context);
         changed      = changed || ! source.evaluated || source.version != version;
         versions.push(rstd::move(version));
     }
     if (! changed) return Ok(empty {});
-    auto data = m_base.clone();
+    auto& data = m_block;
+    data.clear();
+    data.extend_from_slice(m_base.as_slice());
     for (auto& source : m_sources) {
         SourceValueWriter writer(
             data.as_mut_slice().as_mut_ref(), m_layout, source, m_convention, m_abi);

@@ -46,6 +46,10 @@ private:
     UniformBufferLayout       m_layout;
     Vec<BoundUniformSource>   m_sources;
     Vec<u8>                   m_base;
+    // Kept between updates: a binding is updated every frame it changes, and a block and a list of
+    // versions allocated each time were most of its allocations.
+    Vec<u8>                   m_block;
+    Vec<u64>                  m_versions;
     ShaderMatrixConvention    m_convention;
     ShaderMatrixAbi           m_abi;
     bool                      m_dirty { true };

@@ -18,6 +18,7 @@ inline auto capture_resources(const pass::GraphResourceMap&                   ma
     -> Result<empty, GraphExecutionError> {
     if (mapping.scope != frame.bindings.scope() || prepared.Generation() != u64(mapping.scope))
         return Err(GraphExecutionError { GraphExecutionStage::Binding });
+    frame.bindings.reserve(mapping.externals.len() + mapping.textures.len() + mapping.buffers.len());
     for (const auto& external : mapping.externals)
         if (! frame.bindings.resolve(external.version.resource, external.version.version))
             return Err(GraphExecutionError {

@@ -54,21 +54,27 @@ struct GraphBindingEntry {
 class GraphBindings {
     GraphSerial                         scope_;
     Vec<GraphBindingEntry>              entries_;
+    // The bindings of one resource are a chain through next_ (a Vec per resource, built and freed
+    // every frame, was an allocation for each of thousands of bindings).
+    struct Group {
+        usize first, last, count;
+    };
+    static constexpr rstd::size_t       none_ = ~rstd::size_t(0);
+    Vec<usize>                          next_;
     FastMap<u64, usize>                 values_;
-    FastMap<ResourceId, Vec<usize>>     resources_;
+    FastMap<ResourceId, Group>          resources_;
     FastMap<fg::ResourceVersion, usize> versions_;
 
     void append(GraphBindingEntry entry) {
         auto index = entries_.len();
         if (! values_.contains_key(u64(entry.id.value))) values_.insert(u64(entry.id.value), index);
-        auto group = resources_.get_mut(entry.id);
-        if (group)
-            (*group)->push(usize(index));
-        else {
-            Vec<usize> indices;
-            indices.push(usize(index));
-            resources_.insert(entry.id, rstd::move(indices));
-        }
+        next_.push(usize(none_));
+        if (auto group = resources_.get_mut(entry.id)) {
+            next_[(*group)->last] = index;
+            (*group)->last        = index;
+            (*group)->count += usize(1);
+        } else
+            resources_.insert(entry.id, Group { index, index, usize(1) });
         if (entry.version) versions_.insert({ entry.id, *entry.version }, index);
         entries_.push(rstd::move(entry));
     }
@@ -78,8 +84,8 @@ class GraphBindings {
         }
         auto group = resources_.get(id);
         if (! group) return None();
-        auto first = (**group)[usize()];
-        if (! entries_[first].version || (! version && (*group)->len() == usize(1)))
+        auto first = (*group)->first;
+        if (! entries_[first].version || (! version && (*group)->count == usize(1)))
             return Some(first);
         return None();
     }
@@ -176,7 +182,7 @@ class GraphBindings {
             auto group = resources_.get(resource.id);
             if (! group)
                 return Err(GraphExecutionError { GraphExecutionStage::Binding, {}, resource.id });
-            for (auto i : **group) {
+            for (usize i = (*group)->first; i.to_primitive() != none_; i = next_[i]) {
                 const auto& entry = entries_[i];
                 const auto& info  = infos[i];
                 if (resource.check_revision && (! entry.version || *entry.version == 0) &&
@@ -216,7 +222,7 @@ class GraphBindings {
                 const auto& entry = entries_[i];
                 if (! entry.version || ! slots[i]) continue;
                 // A conflict needs two bindings of one resource.
-                if ((**resources_.get(entry.id)).len() < usize(2)) continue;
+                if ((**resources_.get(entry.id)).count < usize(2)) continue;
                 if (! groups.contains_key(entry.id)) groups.insert(entry.id, VersionGroup {});
                 auto& group             = *groups.get_mut(entry.id).unwrap();
                 auto  identity          = infos[i].identity;
@@ -255,7 +261,7 @@ class GraphBindings {
                 if (use.access == GraphAccess::Write) written.insert(infos[*index].identity);
             }
         GraphBindings result(scope_);
-        result.entries_.reserve(entries_.len());
+        result.reserve(entries_.len());
         for (usize i {}; i < entries_.len(); ++i) {
             const auto& entry     = entries_[i];
             bool        read_only = true;
@@ -291,6 +297,14 @@ class GraphBindings {
 
 public:
     explicit GraphBindings(GraphSerial scope): scope_(scope) {}
+    // Room for `count` bindings: the maps of a frame with thousands of them grew by rehashing.
+    void reserve(usize count) {
+        entries_.reserve(count);
+        next_.reserve(count);
+        (void)values_.try_reserve(count);
+        (void)resources_.try_reserve(count);
+        (void)versions_.try_reserve(count);
+    }
     auto scope() const -> GraphSerial { return scope_; }
     auto bind(ResourceId id, rstd::sync::Arc<dyn<GraphBinding>> binding)
         -> Result<empty, GraphExecutionError> {
@@ -329,7 +343,7 @@ public:
         Vec<GraphBindingRequirement> result;
         for (usize i {}; i < entries_.len(); ++i) {
             const auto& entry = entries_[i];
-            if ((**resources_.get(entry.id))[usize()] != i) continue;
+            if ((**resources_.get(entry.id)).first != i) continue;
             auto info = entry.binding->Info();
             result.push({ entry.id,
                           info.kind,
