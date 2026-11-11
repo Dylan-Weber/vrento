@@ -317,6 +317,20 @@ public:
     }
     static constexpr usize MaxPendingContents { 4 };
     static constexpr usize MaxUploadBatches { 3 };
+    // The count windows above admit however many bytes the textures are: a scene of 4k textures staged 486 MB of pinned
+    // memory and held 730 MB of pixels at its peak. Pixels waiting for a flush and staging still in flight are also
+    // bounded by bytes (a batch alone may exceed them: it always goes through).
+    static constexpr u64 DefaultMaxPendingBytes { 64ull << 20 };
+    static constexpr u64 DefaultMaxInFlightBytes { 128ull << 20 };
+    void SetByteLimits(u64 pending, u64 in_flight) {
+        m_max_pending_bytes   = pending;
+        m_max_in_flight_bytes = in_flight;
+    }
+    auto InFlightBytes() const -> u64 {
+        u64 bytes {};
+        for (auto value : m_in_flight_bytes) bytes += value;
+        return bytes;
+    }
     explicit RegistryTextureContext(vulkan::TextureContext context)
         : m_context(rstd::move(context)) {}
 
@@ -526,7 +540,8 @@ public:
             for (const auto& upload : pending.uploads) update.uploads.push(upload.clone());
             updates.push(rstd::move(update));
         }
-        m_recording = Some(work.receipt());
+        m_recording       = Some(work.receipt());
+        m_recording_bytes = PendingBytes();
         return Ok(rstd::move(updates));
     }
     bool RecordPendingUploads(texture::Submission& work) {
@@ -554,6 +569,8 @@ public:
         m_recorded_tickets.clear();
         m_recording = None();
         m_in_flight.push(texture::SubmissionToken(token));
+        m_in_flight_bytes.push(u64(m_recording_bytes));
+        m_recording_bytes = u64();
         statistics_.peak_upload_batches =
             rstd::cmp::max(statistics_.peak_upload_batches, u64(m_in_flight.len().to_primitive()));
         return true;
@@ -582,9 +599,10 @@ public:
         for (usize index {}; index < m_in_flight.len();) {
             auto ready = m_in_flight[index].poll();
             if (ready.is_err()) return Err(ready.unwrap_err_unchecked());
-            if (ready.unwrap_unchecked())
+            if (ready.unwrap_unchecked()) {
                 (void)m_in_flight.remove(index);
-            else
+                (void)m_in_flight_bytes.remove(index);
+            } else
                 ++index;
         }
         return Ok(empty {});
@@ -615,14 +633,22 @@ public:
     auto WaitWindow() -> Result<empty, texture::Error> {
         auto polled = Poll();
         if (polled.is_err()) return polled;
-        if (m_in_flight.len() < MaxUploadBatches) return Ok(empty {});
-        ++statistics_.window_waits;
-        auto start  = rstd::time::Instant::now();
-        auto waited = m_context.wait(m_in_flight[usize()]);
-        statistics_.window_wait_ns +=
-            u64(rstd::uint64_t(start.elapsed().as_nanos().to_primitive()));
-        if (waited.is_err()) return waited;
-        return Poll();
+        // the batch about to go in counts too, so a window of bytes holds the staging it will add
+        while (! m_in_flight.is_empty() &&
+               (m_in_flight.len() >= MaxUploadBatches ||
+                InFlightBytes() + PendingBytes() > m_max_in_flight_bytes)) {
+            ++statistics_.window_waits;
+            auto start  = rstd::time::Instant::now();
+            auto waited = m_context.wait(m_in_flight[usize()]);
+            statistics_.window_wait_ns +=
+                u64(rstd::uint64_t(start.elapsed().as_nanos().to_primitive()));
+            if (waited.is_err()) return waited;
+            const auto before = m_in_flight.len();
+            auto       polled = Poll();
+            if (polled.is_err()) return polled;
+            if (m_in_flight.len() == before) break;
+        }
+        return Ok(empty {});
     }
 
     auto WaitForUploads(texture::Serial timeout) -> Result<empty, texture::Error> {
@@ -666,7 +692,8 @@ private:
             if (! m_recording->cancelled()) return Err(texture::Error { texture::ErrorKind::Busy });
             CancelRecording();
         }
-        if (m_pending.len() >= MaxPendingContents) return Flush();
+        if (m_pending.len() >= MaxPendingContents || PendingBytes() >= m_max_pending_bytes)
+            return Flush();
         return WaitWindow();
     }
     auto Queue(Vec<TextureSlot> slots, Vec<texture::TextureUpload> uploads, bool transparent,
@@ -739,6 +766,10 @@ private:
     Option<mut_ref<dyn<TextureUploadPublisher>>> m_publisher;
     Vec<Pending>                                 m_pending;
     Vec<texture::SubmissionToken>                m_in_flight;
+    Vec<u64>                                     m_in_flight_bytes;
+    u64                                          m_recording_bytes {};
+    u64                                          m_max_pending_bytes { DefaultMaxPendingBytes };
+    u64                                          m_max_in_flight_bytes { DefaultMaxInFlightBytes };
     Option<texture::SubmissionReceipt>           m_recording;
     Vec<vulkan::ImageUploadTicket>               m_recorded_tickets;
     u64                                          m_next_ticket {};

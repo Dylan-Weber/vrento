@@ -227,6 +227,30 @@ TEST(RegistryTextureContext, SlowGpuBoundsPendingUploads) {
     rstd_assert(session.validation_errors() == 0);
 }
 
+TEST(RegistryTextureContext, ByteLimitsBoundPendingAndInFlightUploads) {
+    auto created = vk::DeviceSession::create({ .validation = true });
+    if (created.is_err()) GTEST_SKIP() << "Vulkan unavailable";
+    auto                             session = created.unwrap();
+    auto                             context = vk::TextureContext::create(session).unwrap();
+    registry::RegistryTextureContext textures(rstd::move(context));
+    // a few big textures must not fill the count-based windows: 16-byte images, two pending and three in flight at most
+    textures.SetByteLimits(u64(32), u64(48));
+    auto lifetime = Arc<PixelLifetime>::make();
+    for (unsigned index {}; index < 40; ++index) {
+        textures.CreateImportedTexture(PixelImage(lifetime.clone()), None()).unwrap();
+        EXPECT_LE(textures.PendingCount(), usize(2));
+        EXPECT_LE(textures.Statistics().pending_bytes, u64(32));
+        // in-flight bytes stay within the limit unless one batch alone is larger than it
+        EXPECT_LE(textures.InFlightBytes(), u64(48) + u64(32));
+    }
+    textures.Flush().unwrap();
+    textures.WaitForUploads(5'000'000'000).unwrap();
+    EXPECT_EQ(textures.InFlightBytes(), u64());
+    EXPECT_LE(textures.Statistics().peak_pending_bytes, u64(32));
+    EXPECT_EQ(lifetime->live, usize());
+    rstd_assert(session.validation_errors() == 0);
+}
+
 TEST(RegistryTextureContext, ImageIdentityReusesPreparedAllocationAndCancelledUpload) {
     auto created = vk::DeviceSession::create({ .validation = true });
     if (created.is_err()) GTEST_SKIP() << "Vulkan unavailable";
