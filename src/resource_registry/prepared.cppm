@@ -530,14 +530,14 @@ public:
     void Remove(resource::ExternalUseHandle use) { (void)m_externals.remove(use); }
 
 private:
-    using TextureMap     = HashMap<resource::TextureUseHandle, PreparedTexture>;
-    using DescriptorMap  = HashMap<resource::DescriptorBindingHandle, PreparedDescriptorBinding>;
-    using BufferMap      = HashMap<resource::BufferUseHandle, PreparedBufferUse>;
-    using ShaderMap      = HashMap<resource::ShaderUseHandle, PreparedShaderUse>;
-    using PipelineMap    = HashMap<resource::PipelineUseHandle, PreparedPipeline>;
-    using RenderPassMap  = HashMap<resource::RenderPassUseHandle, PreparedRenderPass>;
-    using FramebufferMap = HashMap<resource::FramebufferUseHandle, PreparedFramebuffer>;
-    using ExternalMap    = HashMap<resource::ExternalUseHandle, PreparedExternalUse>;
+    using TextureMap     = FastMap<resource::TextureUseHandle, PreparedTexture>;
+    using DescriptorMap  = FastMap<resource::DescriptorBindingHandle, PreparedDescriptorBinding>;
+    using BufferMap      = FastMap<resource::BufferUseHandle, PreparedBufferUse>;
+    using ShaderMap      = FastMap<resource::ShaderUseHandle, PreparedShaderUse>;
+    using PipelineMap    = FastMap<resource::PipelineUseHandle, PreparedPipeline>;
+    using RenderPassMap  = FastMap<resource::RenderPassUseHandle, PreparedRenderPass>;
+    using FramebufferMap = FastMap<resource::FramebufferUseHandle, PreparedFramebuffer>;
+    using ExternalMap    = FastMap<resource::ExternalUseHandle, PreparedExternalUse>;
 
     u64                                                                       m_generation { 0 };
     TextureMap                                                                m_textures;

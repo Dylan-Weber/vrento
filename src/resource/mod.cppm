@@ -1,5 +1,6 @@
 export module vrento:resource;
 export import :resource.handle;
+export import :resource.fast_hash;
 export import :resource.error;
 export import :resource.texture;
 export import :resource.buffer;

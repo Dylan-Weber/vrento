@@ -52,22 +52,24 @@ inline auto capture_resources(const pass::GraphResourceMap&                   ma
                 {},
                 version.resource,
                 vrento::vulkan::GraphExecutionCause::Texture(selected.unwrap_err()) });
-        auto view = selected->view;
-        bool overridden {};
+        // By reference: copying a view (an Arc and its description) once per selection and again
+        // to override was a large share of this loop in a scene with hundreds of draws.
+        const texture::TextureViewRef* view = &selected->view;
+        bool                           overridden {};
         if (auto head = first.get(binding.resource.handle))
             for (usize i = **head; i != none; i = chain[i]) {
                 const auto& selection = selections[i];
                 if (overridden &&
-                    (view.texture().identity() != selection.view.texture().identity() ||
-                     view.description() != selection.view.description()))
+                    (view->texture().identity() != selection.view.texture().identity() ||
+                     view->description() != selection.view.description()))
                     return Err(
                         GraphExecutionError { GraphExecutionStage::Binding, {}, version.resource });
-                view       = selection.view;
+                view       = &selection.view;
                 overridden = true;
             }
-        if (! view.valid())
+        if (! view->valid())
             return Err(GraphExecutionError { GraphExecutionStage::Binding, {}, version.resource });
-        const auto& range    = view.description().range;
+        const auto& range    = view->description().range;
         const auto& required = binding.range;
         if (required.aspect != (range.aspect == texture::Aspect::Depth ? 2u : 1u) ||
             required.first_mip > range.mip_count ||
@@ -77,14 +79,14 @@ inline auto capture_resources(const pass::GraphResourceMap&                   ma
             return Err(GraphExecutionError { GraphExecutionStage::Binding, {}, version.resource });
         if (auto existing = frame.bindings.resolve(version.resource, version.version)) {
             auto previous = (*existing)->Texture();
-            if (! previous || previous->texture().identity() != view.texture().identity() ||
-                previous->description() != view.description())
+            if (! previous || previous->texture().identity() != view->texture().identity() ||
+                previous->description() != view->description())
                 return Err(
                     GraphExecutionError { GraphExecutionStage::Binding, {}, version.resource });
             continue;
         }
         auto bound = frame.bindings.bind_version(
-            version, Arc<dyn<GraphBinding>>::make(GraphTextureBinding(view)));
+            version, Arc<dyn<GraphBinding>>::make(GraphTextureBinding(*view)));
         if (bound.is_err()) return Err(bound.unwrap_err());
     }
     // One entry per buffer version, found by hash: the scan of every earlier buffer for each new
