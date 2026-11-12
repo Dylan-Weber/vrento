@@ -1,3 +1,5 @@
+module;
+#include <time.h>
 export module vrento:vulkan.frame;
 export import :vulkan.renderer;
 import :resource_registry.system;
@@ -5,6 +7,14 @@ import rstd;
 
 export namespace vrento::vulkan
 {
+// Where GraphFrame::begin spends its time (microseconds summed over frames): pending uploads,
+// recording the upload batch, binding the buffers, preparing the frame
+inline unsigned long long g_begin_us[4] {};
+inline unsigned long long begin_now_us() {
+    timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000000ull + (unsigned long long)t.tv_nsec / 1000ull;
+}
 struct GraphFrameRequest {
     struct Buffer {
         fg::ResourceVersion version;
@@ -58,7 +68,10 @@ public:
                       GraphFrameRequest request, texture::Submission work,
                       Vec<resource_registry::PreparedTextureUpdate> regions = {})
         -> Result<GraphFrame, GraphExecutionError> {
+        const auto bt0 = begin_now_us();
         auto uploaded = resources->PreparePendingUploads(work);
+        g_begin_us[0] += begin_now_us() - bt0;
+        const auto bt1 = begin_now_us();
         if (uploaded.is_err()) {
             GraphExecutionError error { GraphExecutionStage::Prepare };
             error.cause = vrento::vulkan::GraphExecutionCause::Resource(uploaded.unwrap_err());
@@ -76,6 +89,8 @@ public:
         }
         work.retain(batch.clone());
         auto recorded = batch->Record(work);
+        g_begin_us[1] += begin_now_us() - bt1;
+        const auto bt2 = begin_now_us();
         if (recorded.is_err()) {
             GraphExecutionError error { GraphExecutionStage::Prepare };
             error.cause = vrento::vulkan::GraphExecutionCause::Resource(recorded.unwrap_err());
@@ -94,11 +109,14 @@ public:
             auto bound = request.bindings.bind_version(buffer.version, rstd::move(binding));
             if (bound.is_err()) return Err(bound.unwrap_err());
         }
+        g_begin_us[2] += begin_now_us() - bt2;
+        const auto bt3 = begin_now_us();
         auto started = graph.prepare_frame(request.bindings,
                                            request.parameters.as_slice(),
                                            rstd::move(request.scopes),
                                            true,
                                            &work);
+        g_begin_us[3] += begin_now_us() - bt3;
         if (started.is_err()) return Err(started.unwrap_err());
         return Ok(GraphFrame(rstd::move(resources), started.unwrap(), rstd::move(work)));
     }
