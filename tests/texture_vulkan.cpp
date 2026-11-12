@@ -731,6 +731,34 @@ TEST(TextureVulkan, MixedSubmission) {
     rstd_assert(rejected_receipt.cancelled());
     rstd_assert(session.validation_errors() == 0);
 }
+TEST(TextureVulkan, SubmissionFencesAreReused) {
+    // a fence per submission costs the NVIDIA driver a device client and a dozen ioctls each frame: a completed one
+    // goes back to the context's idle list and the next submission resets it instead of creating another
+    auto session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto context = vk::TextureContext::create(session).unwrap();
+    rstd_assert(context.IdleFenceCount() == usize());
+    for (int frame = 0; frame < 6; ++frame) {
+        auto work = context.Begin().unwrap();
+        auto done = context.Submit(rstd::move(work)).unwrap();
+        // the fence is in use until the work has completed and the context has retired it
+        rstd_assert(context.IdleFenceCount() == usize());
+        context.wait(done).unwrap();
+        done = {};
+        context.Poll().unwrap();
+        rstd_assert(context.IdleFenceCount() == usize(1));
+    }
+    // a submission still in flight keeps its own fence: two in flight, two idle afterwards
+    auto first  = context.Submit(context.Begin().unwrap()).unwrap();
+    auto second = context.Submit(context.Begin().unwrap()).unwrap();
+    rstd_assert(context.IdleFenceCount() == usize());
+    context.wait(first).unwrap();
+    context.wait(second).unwrap();
+    first  = {};
+    second = {};
+    context.Poll().unwrap();
+    rstd_assert(context.IdleFenceCount() == usize(2));
+    rstd_assert(session.validation_errors() == 0);
+}
 TEST(TextureVulkan, MultisampleResolveAndDepthLayout) {
     auto             session = vk::DeviceSession::create({ .validation = true }).unwrap();
     auto             context = vk::TextureContext::create(session).unwrap();

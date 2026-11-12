@@ -245,6 +245,11 @@ struct QueueSignal {
     tex::Serial                       identity {};
     QueueParameters                   queue;
     vvk::CommandPool                  pool;
+    // Completed submission fences, reset and reused by the next submissions: a fence is a driver object (NVIDIA opens
+    // a device client and runs a dozen ioctls to make one), too dear to create 60 times a second. Declared after the
+    // session so they are destroyed before it.
+    rstd::sync::Mutex<Vec<vvk::Fence>> idle_fences { Vec<vvk::Fence> {} };
+    static constexpr usize             max_idle_fences { 8 };
     QueueSignal(DeviceSession s, tex::Serial id, QueueParameters selected)
         : session(rstd::move(s)), identity(id), queue(selected) {}
     auto value() const -> Result<tex::Serial, tex::Error> {
@@ -262,7 +267,14 @@ struct SubmissionFence {
     VkFence                          borrowed {};
     Option<Arc<dyn<rstd::any::Any>>> owner;
     bool                             completed {};
+    Option<Arc<QueueSignal>>         recycle_into;
     explicit SubmissionFence(DeviceSession value): session(rstd::move(value)) {}
+    // an own fence that was seen signaled goes back to its queue's idle list (nothing waits on it any more)
+    ~SubmissionFence() {
+        if (! completed || ! recycle_into || ! *owned) return;
+        auto idle = (*recycle_into)->idle_fences.lock().unwrap();
+        if (idle->len() < QueueSignal::max_idle_fences) idle->push(rstd::move(owned));
+    }
     auto handle() const -> VkFence { return borrowed ? borrowed : *owned; }
     auto Poll() -> Result<bool, tex::Error> {
         if (completed) return Ok(true);
@@ -1007,6 +1019,7 @@ public:
     auto Begin() -> Result<tex::Submission, tex::Error>;
     auto Submit(tex::Submission work) -> Result<tex::SubmissionToken, tex::Error>;
     auto Poll() -> Result<empty, tex::Error>;
+    auto IdleFenceCount() const -> usize { return signal_->idle_fences.lock().unwrap()->len(); }
     bool hasPendingSubmissions() const { return ! pending_.is_empty() || ! producers_.is_empty(); }
     auto wait(const tex::SubmissionToken& token, tex::Serial timeout = 5'000'000'000)
         -> Result<empty, tex::Error>;
@@ -1982,10 +1995,22 @@ auto TextureContext::Submit(tex::Submission work) -> Result<tex::SubmissionToken
         completion_fence->borrowed = recording.fence->fence;
         completion_fence->owner    = Some(recording.fence->owner.clone());
     } else {
-        VkFenceCreateInfo fence_info { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-        auto              created = session().observe_result(
-            session().device().handle().CreateFence(fence_info, completion_fence->owned));
-        if (created != VK_SUCCESS) return Err(texture_error(created));
+        Option<vvk::Fence> idle;
+        {
+            auto fences = signal_->idle_fences.lock().unwrap();
+            idle        = fences->pop();
+        }
+        if (idle.is_some()) {
+            auto reset = session().observe_result(idle->Reset());
+            if (reset != VK_SUCCESS) return Err(texture_error(reset));
+            completion_fence->owned = idle.take().unwrap();
+        } else {
+            VkFenceCreateInfo fence_info { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            auto              created = session().observe_result(
+                session().device().handle().CreateFence(fence_info, completion_fence->owned));
+            if (created != VK_SUCCESS) return Err(texture_error(created));
+        }
+        completion_fence->recycle_into = Some(signal_.clone());
     }
     recording.completion_fence = Some(completion_fence.clone());
     tex::SubmissionToken token(Arc<dyn<tex::Dependency>>::make(

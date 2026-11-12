@@ -1,3 +1,7 @@
+module;
+#include <stdint.h>
+#include <stdlib.h>
+
 export module vrento:vulkan.graph;
 export import :vulkan.pass.execution;
 export import :vulkan.texture;
@@ -847,6 +851,81 @@ inline auto record_pass_access(const PassExecutionInfo& pass, const GraphBinding
         }
     return Ok(empty {});
 }
+// GPU time per pass, for performance work. Off unless OWE_GPU_TIMING is set: then every pass recorded whole (render pass
+// entered and left in one call) is bracketed by two timestamps in a query pool, and pass_timing_take() reads the pairs
+// back once the frame has completed (frames are not overlapped). Needs a graphics queue with timestamp support and
+// synchronization2 (vkCmdWriteTimestamp2).
+struct PassTime {
+    uint64_t pass {};
+    double   ms {};
+};
+struct PassTimingState {
+    static constexpr uint32_t kMaxPasses = 4096;
+    VkQueryPool               pool {};
+    VkDevice                  device {};
+    PFN_vkGetQueryPoolResults get_results {};
+    uint32_t                  used {};
+    uint64_t                  ids[kMaxPasses] {};
+    bool                      failed {};
+};
+inline PassTimingState g_pass_timing;
+inline bool            pass_timing_enabled() {
+    static const bool enabled = getenv("OWE_GPU_TIMING") != nullptr;
+    return enabled;
+}
+// the pair of timestamps for `pass`, written before its first command; ~0u when not timed
+inline uint32_t pass_timing_begin(const DeviceSession& session, VkCommandBuffer cb, uint64_t pass) {
+    auto& t = g_pass_timing;
+    if (t.failed || t.used >= PassTimingState::kMaxPasses) return ~0u;
+    const auto& dispatch = session.device().handle().Dispatch();
+    if (! t.pool) {
+        if (! dispatch.vkCreateQueryPool || ! dispatch.vkCmdWriteTimestamp2) {
+            t.failed = true;
+            return ~0u;
+        }
+        VkQueryPoolCreateInfo info { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        info.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+        info.queryCount = PassTimingState::kMaxPasses * 2;
+        t.device        = *session.device().handle();
+        if (dispatch.vkCreateQueryPool(t.device, &info, nullptr, &t.pool) != VK_SUCCESS) {
+            t.failed = true;
+            return ~0u;
+        }
+        t.get_results = dispatch.vkGetQueryPoolResults;
+    }
+    const uint32_t slot = t.used++;
+    t.ids[slot]         = pass;
+    dispatch.vkCmdResetQueryPool(cb, t.pool, slot * 2, 2);
+    dispatch.vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, t.pool, slot * 2);
+    return slot;
+}
+inline void pass_timing_end(const DeviceSession& session, VkCommandBuffer cb, uint32_t slot) {
+    if (slot == ~0u) return;
+    session.device().handle().Dispatch().vkCmdWriteTimestamp2(
+        cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_pass_timing.pool, slot * 2 + 1);
+}
+// the frame's pass times (the frame must have completed), and starts the next frame's list
+inline auto pass_timing_take(double timestamp_period_ns) -> Vec<PassTime> {
+    Vec<PassTime> out;
+    auto&         t = g_pass_timing;
+    if (! t.pool || t.used == 0) return out;
+    static uint64_t results[PassTimingState::kMaxPasses * 2];
+    const auto      count = t.used;
+    t.used                = 0;
+    if (t.get_results(t.device,
+                      t.pool,
+                      0,
+                      count * 2,
+                      sizeof(uint64_t) * count * 2,
+                      results,
+                      sizeof(uint64_t),
+                      VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+        return out;
+    for (uint32_t i = 0; i < count; ++i)
+        out.push(PassTime { t.ids[i],
+                            double(results[i * 2 + 1] - results[i * 2]) * timestamp_period_ns / 1e6 });
+    return out;
+}
 inline auto record_prepared_pass(const DeviceSession& session, const PassExecutionInfo& pass,
                                  const GraphBindings&                    bindings,
                                  const rstd::sync::Arc<dyn<VulkanPass>>& prepared,
@@ -879,6 +958,10 @@ inline auto record_prepared_pass(const DeviceSession& session, const PassExecuti
     }
     GraphRecordContext context { session, bindings, pass, work, scope.clone() };
     const auto&        dispatch = session.device().handle().Dispatch();
+    const uint32_t     timing =
+        enter && leave && pass_timing_enabled()
+                ? pass_timing_begin(session, recording.unwrap(), pass.id.value)
+                : ~0u;
     if (scope && enter) {
         auto                  info = (*scope)->Info();
         VkRenderPassBeginInfo begin { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
@@ -910,6 +993,7 @@ inline auto record_prepared_pass(const DeviceSession& session, const PassExecuti
     }
     auto recorded = prepared->Record(context);
     if (scope && (leave || recorded.is_err())) dispatch.vkCmdEndRenderPass(recording.unwrap());
+    pass_timing_end(session, recording.unwrap(), timing);
     if (recorded.is_err()) return fail(recorded.unwrap_err());
     if (pass.graphics && leave) {
         const Option<GraphAttachment>* attachments[] { &pass.graphics->color,
