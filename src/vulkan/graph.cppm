@@ -410,9 +410,98 @@ public:
             auto cache = graph.binding_check().lock().unwrap();
             cache->scratch.clear();
             // Which bindings share a physical resource decides the validation, not the identity
-            // itself (a buffer uploaded this frame is new every frame), so identities enter as the
-            // number of the first binding with the same one.
-            FastMap<graph_texture::Identity, rstd::uint64_t> ordinals;
+            // itself (a buffer uploaded this frame is new every frame, and which bindings it is
+            // shared with changes from frame to frame), and of that only the shape of a group of
+            // bindings sharing one: sharing among read-only imports decides nothing (validate_info
+            // counts only the other bindings against them), and the rest depends on how the
+            // resources and allocation slots of the group's members equal each other, not on which
+            // they are. The words below describe each group holding a binding that is not a
+            // read-only import by that shape, sorted, after the per-binding words.
+            const auto&           layout             = graph.binding_layout();
+            const auto&           declared_resources = graph.resources();
+            Vec<bool>             shared;
+            shared.resize(entries_.len(), false);
+            if (layout.has_allocations())
+                for (usize i {}; i < entries_.len(); ++i) {
+                    auto declared = layout.resource(entries_[i].id);
+                    shared[i]     = declared && declared_resources[*declared].read_only_import;
+                }
+            FastMap<graph_texture::Identity, usize> populations[2];
+            for (usize i {}; i < entries_.len(); ++i) {
+                const auto& info = infos[i];
+                if (info.kind != GraphResourceKind::Texture && info.kind != GraphResourceKind::Buffer)
+                    continue;
+                auto& population = populations[info.kind == GraphResourceKind::Buffer ? 1 : 0];
+                if (auto count = population.get_mut(info.identity))
+                    ++**count;
+                else
+                    population.insert(info.identity, usize(1));
+            }
+            FastMap<graph_texture::Identity, Vec<usize>> groups[2];
+            for (usize i {}; i < entries_.len(); ++i) {
+                const auto& info = infos[i];
+                if (info.kind != GraphResourceKind::Texture && info.kind != GraphResourceKind::Buffer)
+                    continue;
+                const int side = info.kind == GraphResourceKind::Buffer ? 1 : 0;
+                if (**populations[side].get(info.identity) < usize(2)) continue;
+                if (auto existing = groups[side].get_mut(info.identity))
+                    (*existing)->push(usize(i));
+                else {
+                    Vec<usize> first;
+                    first.push(usize(i));
+                    groups[side].insert(info.identity, rstd::move(first));
+                }
+            }
+            Vec<rstd::uint64_t>                  shapes;
+            FastMap<rstd::uint64_t, rstd::uint64_t> local_resources, local_slots;
+            for (int side = 0; side < 2; ++side)
+                for (const auto& [identity, members] : groups[side].iter()) {
+                    bool restricted = false;
+                    for (usize k {}; k < members->len(); ++k)
+                        restricted = restricted || ! shared[(*members)[k]];
+                    if (! restricted) continue;
+                    local_resources.clear();
+                    local_slots.clear();
+                    rstd::uint64_t shape = 0x9e3779b97f4a7c15ull + rstd::uint64_t(side);
+                    auto           mix   = [&](rstd::uint64_t word) {
+                        shape = (shape ^ word) * 0x100000001b3ull;
+                        shape ^= shape >> 29;
+                    };
+                    for (usize k {}; k < members->len(); ++k) {
+                        const auto& entry = entries_[(*members)[k]];
+                        auto        slot  = layout.slot(entry.id, entry.version);
+                        auto resource = rstd::uint64_t(entry.id.value) << 32 | rstd::uint64_t(entry.id.generation);
+                        auto local_resource = local_resources.get(resource);
+                        if (! local_resource) {
+                            local_resources.insert(resource, rstd::uint64_t(local_resources.len().to_primitive()));
+                            local_resource = local_resources.get(resource);
+                        }
+                        rstd::uint64_t local_slot = ~rstd::uint64_t(0);
+                        if (slot) {
+                            auto found = local_slots.get(rstd::uint64_t(*slot));
+                            if (! found) {
+                                local_slots.insert(rstd::uint64_t(*slot), rstd::uint64_t(local_slots.len().to_primitive()));
+                                found = local_slots.get(rstd::uint64_t(*slot));
+                            }
+                            local_slot = **found;
+                        }
+                        mix(**local_resource);
+                        mix(local_slot);
+                        mix(shared[(*members)[k]] ? 1 : 2);
+                    }
+                    mix(rstd::uint64_t(members->len().to_primitive()));
+                    shapes.push(rstd::move(shape));
+                }
+            // Sorted, so the order the groups were found in is not part of the signature.
+            {
+                auto raw = shapes.as_mut_slice();
+                for (usize i = usize(1); i < raw.len(); ++i)
+                    for (usize j = i; j > usize() && raw[j - usize(1)] > raw[j]; j = j - usize(1)) {
+                        auto swap = raw[j];
+                        raw[j] = raw[j - usize(1)];
+                        raw[j - usize(1)] = swap;
+                    }
+            }
             for (usize i {}; i < entries_.len(); ++i) {
                 const auto& entry = entries_[i];
                 const auto& info  = infos[i];
@@ -423,12 +512,17 @@ public:
                 cache->scratch.push(rstd::uint64_t(info.kind));
                 cache->scratch.push(rstd::uint64_t(info.identity.device));
                 cache->scratch.push(rstd::uint64_t(info.identity.epoch));
-                rstd::uint64_t ordinal = ordinals.len().to_primitive();
-                if (auto seen = ordinals.get(info.identity))
-                    ordinal = **seen;
-                else
-                    ordinals.insert(info.identity, rstd::uint64_t(ordinal));
-                cache->scratch.push(rstd::uint64_t(ordinal));
+                cache->scratch.push(rstd::uint64_t(0));
+                // Bindings of one resource that share a physical resource (versions of it): the
+                // first of them with the same one.
+                rstd::uint64_t twin = ~rstd::uint64_t(0);
+                if (entry.version && (**resources_.get(entry.id)).count >= usize(2))
+                    for (usize j = (**resources_.get(entry.id)).first; j != i; j = next_[j])
+                        if (infos[j].identity == info.identity) {
+                            twin = rstd::uint64_t(j.to_primitive());
+                            break;
+                        }
+                cache->scratch.push(rstd::uint64_t(twin));
                 cache->scratch.push(rstd::uint64_t(info.bytes));
                 cache->scratch.push(rstd::uint64_t(info.mip_levels) |
                                     rstd::uint64_t(info.layers) << 32);
@@ -440,6 +534,7 @@ public:
                                (! entry.version || *entry.version == 0);
                 cache->scratch.push(compared ? rstd::uint64_t(info.content_revision) : 0);
             }
+            for (const auto& shape : shapes) cache->scratch.push(rstd::uint64_t(shape));
             // The device epoch leads the signature.
             bool same = session.valid() && ! session.lost();
             bool hit {};
