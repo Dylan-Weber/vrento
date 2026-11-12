@@ -312,9 +312,9 @@ validate_pass_execution(const PassExecutionInfo& pass, slice<GraphBindingRequire
     return Ok(empty {});
 }
 class GraphBindingLayout {
-    HashMap<ResourceId, usize>              resources_;
-    HashMap<fg::ResourceVersion, fg::Index> versions_;
-    HashMap<ResourceId, fg::Index>          slots_;
+    FastMap<ResourceId, usize>              resources_;
+    FastMap<fg::ResourceVersion, fg::Index> versions_;
+    FastMap<ResourceId, fg::Index>          slots_;
     bool                                    allocations_ {};
 
 public:
@@ -490,6 +490,14 @@ public:
     }
     auto dependencies() const -> slice<GraphDependency> {
         return data_->declarations.dependencies.as_slice();
+    }
+    // The plan itself, and the limit checks of compile() without a copy of it (it is read, never changed)
+    auto plan() const -> const GraphExecutionPlan& { return data_->graph.inspect(); }
+    auto check_limits(GraphLimits limits = {}) const -> Result<empty, GraphError> {
+        return data_->graph.check_limits({ .resources    = limits.resources,
+                                           .passes       = limits.passes,
+                                           .uses         = limits.uses,
+                                           .dependencies = limits.dependencies });
     }
     auto compile(GraphLimits limits = {}) const -> Result<GraphExecutionPlan, GraphError> {
         return data_->graph.compile({ .resources    = limits.resources,
