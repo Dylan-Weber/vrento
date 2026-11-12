@@ -390,6 +390,11 @@ public:
         : state_(Some(Arc<ViewState>::make(rstd::move(t), d, rstd::move(b)))) {}
     bool valid() const { return bool(state_); }
     auto texture() const -> const TextureRef& { return (*state_)->texture; }
+    // Whether both are the same view (one a copy of the other): then they equal in everything.
+    bool same_view(const TextureViewRef& other) const {
+        return state_.is_some() && other.state_.is_some() &&
+               state_->as_ptr().as_raw_ptr() == other.state_->as_ptr().as_raw_ptr();
+    }
     auto description() const -> const ViewDesc& { return (*state_)->desc; }
     bool permits(bool write) const {
         auto& s = *texture().backend_state();

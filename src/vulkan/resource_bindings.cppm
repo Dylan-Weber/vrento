@@ -59,7 +59,8 @@ inline auto capture_resources(const pass::GraphResourceMap&                   ma
         if (auto head = first.get(binding.resource.handle))
             for (usize i = **head; i != none; i = chain[i]) {
                 const auto& selection = selections[i];
-                if (overridden &&
+                // draws sampling one texture hold copies of one view: nothing to compare
+                if (overridden && ! view->same_view(selection.view) &&
                     (view->texture().identity() != selection.view.texture().identity() ||
                      view->description() != selection.view.description()))
                     return Err(

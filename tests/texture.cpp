@@ -301,6 +301,22 @@ TEST(Texture, PublicApi) {
                     .unwrap_err()
                     .kind == ErrorKind::Invalid);
 }
+TEST(Texture, ACopyOfAViewIsTheSameView) {
+    FakeDevice  receiver;
+    auto        api = dyn<TextureDevice>::from_ref(receiver);
+    TextureDesc desc;
+    desc.extent  = { 8, 8 };
+    auto texture = api->CreateTexture(desc).unwrap();
+    auto view    = api->CreateView(texture, {}).unwrap();
+    auto copy    = view;
+    auto other   = api->CreateView(texture, {}).unwrap();
+    rstd_assert(view.same_view(copy));
+    rstd_assert(copy.same_view(view));
+    // a view made again over the same texture equals it in everything but is not the same view
+    rstd_assert(! view.same_view(other));
+    rstd_assert(! view.same_view(TextureViewRef {}));
+    rstd_assert(! TextureViewRef {}.same_view(TextureViewRef {}));
+}
 TEST(Texture, SamplerAnisotropy) {
     SamplerDesc desc;
     rstd_assert(desc.max_anisotropy == 1 && validate_sampler(desc).is_ok());
