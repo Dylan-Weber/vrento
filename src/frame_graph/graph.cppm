@@ -65,7 +65,8 @@ public:
     auto exports() const -> slice<ResourceVersion> { return data_->graph.exports.as_slice(); }
     auto inspect() const -> const FrameGraphPlan& { return data_->plan; }
     auto clone_data() const -> FrameGraphData { return data_->graph.clone(); }
-    auto compile(Limits limits = {}) const -> Result<FrameGraphPlan, Error> {
+    // The limit checks of compile(), without the copy of the plan
+    auto check_limits(Limits limits = {}) const -> Result<empty, Error> {
         if (resources().len().to_primitive() > limits.resources ||
             versions().len().to_primitive() > limits.versions ||
             passes().len().to_primitive() > limits.passes)
@@ -79,6 +80,11 @@ public:
         for (const auto& next : data_->plan.successors) edges += next.len().to_primitive();
         if (uses > limits.uses || edges > limits.dependencies || names > limits.name_bytes)
             return Err(Error { ErrorKind::Limit });
+        return Ok(empty {});
+    }
+    auto compile(Limits limits = {}) const -> Result<FrameGraphPlan, Error> {
+        auto checked = check_limits(limits);
+        if (checked.is_err()) return Err(checked.unwrap_err());
         return Ok(data_->plan.clone());
     }
 };
