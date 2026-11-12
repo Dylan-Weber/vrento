@@ -54,7 +54,7 @@ struct MatrixCoordinate {
     u32 column;
 };
 
-MatrixCoordinate UniformMatrixCoordinate(u32 row, u32 column, ShaderMatrixConvention convention,
+inline MatrixCoordinate UniformMatrixCoordinate(u32 row, u32 column, ShaderMatrixConvention convention,
                                          ShaderMatrixAbi matrix_abi) {
     const auto shader_row    = matrix_abi == ShaderMatrixAbi::Hlsl ? column : row;
     const auto shader_column = matrix_abi == ShaderMatrixAbi::Hlsl ? row : column;

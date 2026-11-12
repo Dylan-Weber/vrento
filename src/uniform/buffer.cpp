@@ -13,9 +13,12 @@ namespace
 bool WriteFloat(mut_ref<u8[]> destination, usize offset, float value) {
     if (offset > destination.len() || usize(sizeof(float)) > destination.len() - offset)
         return false;
-    auto bytes =
-        slice<u8>::from_raw_parts(reinterpret_cast<const byte*>(&value), usize(sizeof(float)));
-    for (usize index {}; index < bytes.len(); ++index) destination[offset + index] = bytes[index];
+    auto*       out = reinterpret_cast<unsigned char*>(destination.as_raw_ptr()) + offset.to_primitive();
+    const auto* in  = reinterpret_cast<const unsigned char*>(&value);
+    out[0]          = in[0];
+    out[1]          = in[1];
+    out[2]          = in[2];
+    out[3]          = in[3];
     return true;
 }
 
@@ -202,7 +205,11 @@ auto SerializeUniformValue(mut_ref<u8[]> destination, const UniformSlot& slot,
                 rstd::format("uniform {} value kind does not match reflection", slot.name.as_str()),
         });
     }
-    for (usize index {}; index < slot.size; ++index) destination[slot.offset + index] = u8();
+    {
+        auto*      zero = reinterpret_cast<unsigned char*>(destination.as_raw_ptr()) + slot.offset.to_primitive();
+        const auto size = slot.size.to_primitive();
+        for (decltype(slot.size.to_primitive()) index {}; index < size; ++index) zero[index] = 0;
+    }
     if (value_matrix) {
         return SerializeMatrixValue(destination, slot, value, convention, matrix_abi);
     }
