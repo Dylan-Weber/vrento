@@ -658,6 +658,8 @@ public:
     ImageUploadManager               uploads;
     RecordedImageUploads             recorded_images;
     Vec<RecordingTexture>            textures;
+    // where each texture of the recording is in `textures` (it is looked up for every use of it)
+    FastMap<tex::Identity, usize>    texture_index;
     Vec<tex::TextureViewRef>         views;
     Vec<tex::SamplerRef>             samplers;
     Vec<RecordingDependency>         dependencies;
@@ -725,8 +727,8 @@ public:
         if (storage.recording && storage.recording != identity)
             return Err(tex::Error { tex::ErrorKind::Busy });
         usize index {};
-        while (index < textures.len() && textures[index].texture.identity() != texture.identity())
-            ++index;
+        if (auto found = texture_index.get(texture.identity())) index = **found;
+        else index = textures.len();
         if (index == textures.len()) {
             if (! emit_barrier) return Err(tex::Error { tex::ErrorKind::Invalid });
             RecordingTexture entry { texture };
@@ -734,6 +736,7 @@ public:
             auto backend = rstd::any::downcast_ref<NativeTexture>(storage.backing.deref()).unwrap();
             for (auto state : backend->tracking->states)
                 entry.native_states.push(NativeAccess(state));
+            (void)texture_index.insert(texture.identity(), textures.len());
             textures.push(rstd::move(entry));
             storage.recording = identity;
             auto dependency   = storage.last_use.valid() ? storage.last_use : storage.last_write;
