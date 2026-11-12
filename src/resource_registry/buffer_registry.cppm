@@ -309,14 +309,14 @@ private:
     }
 
     template<typename Value>
-    using HandleMap = HashMap<resource::BufferHandle, Value>;
+    using HandleMap = FastMap<resource::BufferHandle, Value>;
 
     u64                                     m_generation { 1 };
     u64                                     m_next_index { 0 };
     HandleMap<BufferEntry>                  m_entries;
     HandleMap<Arc<BufferPhysical>>          m_resources;
-    HashMap<String, resource::BufferHandle> m_names;
-    HashMap<u64, PendingBufferUpload>       m_pending_uploads;
+    FastMap<String, resource::BufferHandle> m_names;
+    FastMap<u64, PendingBufferUpload>       m_pending_uploads;
 };
 
 } // namespace vrento::resource_registry

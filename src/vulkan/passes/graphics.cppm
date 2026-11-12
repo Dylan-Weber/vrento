@@ -227,15 +227,48 @@ inline auto declare_graphics_clear(fg::FrameGraphBuilder& graph, PassId id,
 struct GraphicsDrawRange {
     rstd::uint32_t count {}, first {};
 };
+// A list shared by the frames that use it: a draw whose viewports, scissors and ranges stay the same
+// hands the same list to every frame instead of allocating a copy of each
+template<typename T>
+class SharedList {
+    Option<Arc<Vec<T>>> m_data;
+
+public:
+    SharedList() = default;
+    explicit SharedList(Vec<T> values): m_data(Some(Arc<Vec<T>>::make(rstd::move(values)))) {}
+    SharedList(const SharedList& other)
+        : m_data(other.m_data.is_some() ? Some((*other.m_data).clone()) : None<Arc<Vec<T>>>()) {}
+    SharedList(SharedList&&) = default;
+    auto operator=(const SharedList& other) -> SharedList& {
+        m_data = other.m_data.is_some() ? Some((*other.m_data).clone()) : None<Arc<Vec<T>>>();
+        return *this;
+    }
+    auto operator=(SharedList&&) -> SharedList& = default;
+    auto as_slice() const -> slice<T> {
+        return m_data.is_some() ? (**m_data).as_slice() : slice<T> {};
+    }
+    auto is_empty() const -> bool { return as_slice().is_empty(); }
+    auto len() const -> usize { return as_slice().len(); }
+    auto begin() const { return as_slice().as_raw_ptr(); }
+    auto end() const { return as_slice().as_raw_ptr() + as_slice().len().to_primitive(); }
+    // the list holds exactly these values
+    auto holds(slice<T> values) const -> bool {
+        auto mine = as_slice();
+        if (mine.len() != values.len()) return false;
+        return values.len() == usize() ||
+               __builtin_memcmp(mine.as_raw_ptr(), values.as_raw_ptr(),
+                                values.len().to_primitive() * sizeof(T)) == 0;
+    }
+};
 struct GraphicsFrameData {
     Vec<resource_registry::PreparedDescriptorBinding> descriptors;
     Vec<BufferAllocation>                             vertices, buffers;
     Option<BufferAllocation>                          indices;
     Vec<texture::TextureViewRef>                      textures;
     Vec<texture::SamplerRef>                          samplers;
-    Vec<VkViewport>                                   viewports;
-    Vec<VkRect2D>                                     scissors;
-    Vec<GraphicsDrawRange>                            draws;
+    SharedList<VkViewport>                            viewports;
+    SharedList<VkRect2D>                              scissors;
+    SharedList<GraphicsDrawRange>                     draws;
     rstd::uint32_t                                    instances { 1 };
     bool                                              visible { true };
 };

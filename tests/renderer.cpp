@@ -877,9 +877,15 @@ TEST(VulkanRenderer, GraphicsDrawRebindsAndRecompilesRecipeWithDeviceCache) {
             .bind(target.resource, Arc<dyn<vk::GraphBinding>>::make(vk::GraphTextureBinding(view)))
             .unwrap();
         vk::GraphicsFrameData input;
-        input.viewports.push({ 0, 0, 4, 4, 0, 1 });
-        input.scissors.push({ { 0, 0 }, { 4, 4 } });
-        input.draws.push({ 3, 0 });
+        Vec<VkViewport>        viewports;
+        Vec<VkRect2D>          scissors;
+        Vec<vk::GraphicsDrawRange> draws;
+        viewports.push({ 0, 0, 4, 4, 0, 1 });
+        scissors.push({ { 0, 0 }, { 4, 4 } });
+        draws.push({ 3, 0 });
+        input.viewports = vk::SharedList<VkViewport>(rstd::move(viewports));
+        input.scissors  = vk::SharedList<VkRect2D>(rstd::move(scissors));
+        input.draws     = vk::SharedList<vk::GraphicsDrawRange>(rstd::move(draws));
         Vec<vk::PassFrameBinding> parameters;
         parameters.push(
             renderer.compiled()->frame<vk::GraphicsDrawPass>(id, 1, rstd::move(input)).unwrap());

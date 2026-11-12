@@ -103,10 +103,15 @@ inline auto texture_output_frame(const DeviceSession&                           
     if (snapshot.is_err()) return Err(snapshot.unwrap_err());
     GraphicsFrameData result;
     result.descriptors.push(snapshot.unwrap());
-    result.viewports.push(
-        { 0, float(extent.height), float(extent.width), -float(extent.height), 0, 1 });
-    result.scissors.push({ { 0, 0 }, extent });
-    result.draws.push({ 4, 0 });
+    Vec<VkViewport>        viewports;
+    Vec<VkRect2D>          scissors;
+    Vec<GraphicsDrawRange> draws;
+    viewports.push({ 0, float(extent.height), float(extent.width), -float(extent.height), 0, 1 });
+    scissors.push({ { 0, 0 }, extent });
+    draws.push({ 4, 0 });
+    result.viewports = SharedList<VkViewport>(rstd::move(viewports));
+    result.scissors  = SharedList<VkRect2D>(rstd::move(scissors));
+    result.draws     = SharedList<GraphicsDrawRange>(rstd::move(draws));
     return Ok(rstd::move(result));
 }
 class TextureOutput {

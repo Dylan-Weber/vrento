@@ -840,7 +840,7 @@ private:
     }
 
     Option<Arc<vvk::DescriptorArenaGeneration>>              m_pool;
-    HashMap<DescriptorSetPacketKey, vvk::DescriptorSetLease> m_packets;
+    FastMap<DescriptorSetPacketKey, vvk::DescriptorSetLease> m_packets;
     u64                                                      m_generation { 1 };
     u64                                                      m_next_index { 0 };
 };

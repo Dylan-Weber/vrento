@@ -302,7 +302,7 @@ public:
 
     auto Pump(vulkan::TextureContext& context, double seconds)
         -> Result<empty, resource::ResourceError> {
-        rstd::collections::HashSet<texture::Serial> pumped;
+        FastSet<texture::Serial> pumped;
         for (const auto& [handle, physical] : m_resources.iter()) {
             auto slots = physical->allocation->Slots();
             if (slots.is_empty()) continue;
@@ -467,7 +467,7 @@ public:
     }
 
     void RetainActive(slice<resource::TextureHandle> handles) {
-        auto active = HashSet<resource::TextureHandle>::with_capacity(handles.len());
+        auto active = FastSet<resource::TextureHandle>::with_capacity(handles.len());
         for (usize index {}; index < handles.len(); ++index) {
             (void)active.insert(handles[index]);
         }
@@ -536,13 +536,13 @@ private:
         return definition;
     }
     template<typename Value>
-    using HandleMap = HashMap<resource::TextureHandle, Value>;
+    using HandleMap = FastMap<resource::TextureHandle, Value>;
 
     struct Snapshot {
         HandleMap<Texture>                                        textures;
         HandleMap<TexturePhysical>                                resources;
-        HashMap<TextureRegistryIdentity, resource::TextureHandle> handles;
-        HashMap<TextureRegistryIdentity, TextureResourceRef>      legacy_definitions;
+        FastMap<TextureRegistryIdentity, resource::TextureHandle> handles;
+        FastMap<TextureRegistryIdentity, TextureResourceRef>      legacy_definitions;
     };
 
     auto CloneSnapshot() const -> Snapshot {
@@ -574,10 +574,10 @@ private:
     u64                                                       m_next_index { 0 };
     HandleMap<Texture>                                        m_textures;
     HandleMap<TexturePhysical>                                m_resources;
-    HashMap<TextureRegistryIdentity, resource::TextureHandle> m_handles;
-    HashMap<u64, Vec<PendingTextureUpload>>                   m_pending_uploads;
+    FastMap<TextureRegistryIdentity, resource::TextureHandle> m_handles;
+    FastMap<u64, Vec<PendingTextureUpload>>                   m_pending_uploads;
     Option<Box<Snapshot>>                                     m_transaction;
-    HashMap<TextureRegistryIdentity, TextureResourceRef>      m_legacy_definitions;
+    FastMap<TextureRegistryIdentity, TextureResourceRef>      m_legacy_definitions;
 };
 
 } // namespace vrento::resource

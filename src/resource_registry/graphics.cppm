@@ -358,7 +358,7 @@ public:
     void Reset() { m_seen.clear(); }
 
 private:
-    HashMap<FramebufferCacheKey, u64, rstd::hash::RandomState, FramebufferCacheKeyEqual> m_seen;
+    HashMap<FramebufferCacheKey, u64, FastBuildHasher, FramebufferCacheKeyEqual> m_seen;
 };
 
 class FramebufferRegistry {
@@ -466,9 +466,9 @@ private:
         return { .index = m_next_index++, .generation = m_generation };
     }
 
-    using HandleMap = HashMap<resource::FramebufferHandle, Weak<vvk::Framebuffer>>;
+    using HandleMap = FastMap<resource::FramebufferHandle, Weak<vvk::Framebuffer>>;
 
-    HashMap<FramebufferCacheKey, Entry, rstd::hash::RandomState, FramebufferCacheKeyEqual>
+    HashMap<FramebufferCacheKey, Entry, FastBuildHasher, FramebufferCacheKeyEqual>
               m_entries;
     u64       m_generation { 1 };
     u64       m_next_index { 0 };
@@ -581,7 +581,7 @@ private:
         return { .index = m_next_index++, .generation = m_generation };
     }
 
-    using HandleMap = HashMap<resource::RenderPassHandle, Weak<vvk::RenderPass>>;
+    using HandleMap = FastMap<resource::RenderPassHandle, Weak<vvk::RenderPass>>;
 
     static auto CreateRenderPass(const Device& device, const RenderPassResourceDesc& desc)
         -> Result<vvk::RenderPass, resource::ResourceError> {
@@ -684,7 +684,7 @@ private:
         return Ok(rstd::move(pass));
     }
 
-    HashMap<RenderPassCacheKey, Entry, rstd::hash::RandomState, RenderPassCacheKeyEqual> m_entries;
+    HashMap<RenderPassCacheKey, Entry, FastBuildHasher, RenderPassCacheKeyEqual> m_entries;
     u64       m_generation { 1 };
     u64       m_next_index { 0 };
     HandleMap m_handles;

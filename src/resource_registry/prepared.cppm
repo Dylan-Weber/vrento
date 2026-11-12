@@ -201,7 +201,7 @@ public:
     auto AffectedTextureDescriptors(slice<resource::TextureUseHandle> textures) const
         -> Vec<resource::DescriptorBindingHandle> {
         Vec<resource::DescriptorBindingHandle>           result;
-        HashMap<resource::DescriptorBindingHandle, bool> seen;
+        FastMap<resource::DescriptorBindingHandle, bool> seen;
         for (auto texture : textures)
             if (auto uses = m_texture_descriptors.get(texture))
                 for (auto descriptor : **uses)
@@ -547,8 +547,8 @@ private:
     RenderPassMap                                                             m_render_passes;
     FramebufferMap                                                            m_framebuffers;
     DescriptorMap                                                             m_descriptors;
-    HashMap<resource::DescriptorBindingHandle, Vec<DescriptorTextureBinding>> m_descriptor_textures;
-    HashMap<resource::TextureUseHandle, Vec<resource::DescriptorBindingHandle>>
+    FastMap<resource::DescriptorBindingHandle, Vec<DescriptorTextureBinding>> m_descriptor_textures;
+    FastMap<resource::TextureUseHandle, Vec<resource::DescriptorBindingHandle>>
                 m_texture_descriptors;
     ExternalMap m_externals;
 };
