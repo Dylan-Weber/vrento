@@ -1668,12 +1668,84 @@ TEST(GraphBindings, ValidationIsReusedOnlyForUnchangedBindings) {
     EXPECT_TRUE(make(1u, 2u, 3u).prepare(graph, session).is_ok());
     EXPECT_EQ(stats().misses, 3u);
     EXPECT_EQ(stats().hits, 4u);
-    // A new aliasing pattern (read-only imports may share) is validated once, then remembered too.
+    // Read-only imports may share a physical resource: no new pattern (see
+    // SharingBetweenReadOnlyImportsDoesNotInvalidateTheReusedValidation, where a planned resource
+    // makes that known; here nothing is planned, and still the sharing decides nothing).
     EXPECT_TRUE(make(1u, 1u, 3u).prepare(graph, session).is_ok());
-    EXPECT_EQ(stats().misses, 4u);
+    EXPECT_EQ(stats().misses, 3u);
     EXPECT_TRUE(make(7u, 7u, 9u).prepare(graph, session).is_ok());
-    EXPECT_EQ(stats().misses, 4u);
-    EXPECT_EQ(stats().hits, 5u);
+    EXPECT_EQ(stats().misses, 3u);
+    EXPECT_EQ(stats().hits, 6u);
+}
+TEST(GraphBindings, SharingBetweenReadOnlyImportsDoesNotInvalidateTheReusedValidation) {
+    auto session = vk::DeviceSession::create({ .validation = true }).unwrap();
+    auto counts  = rstd::sync::Arc<Counts>::make();
+    vrento::fg::FrameGraphBuilder builder(711);
+    auto                          id = builder.add_pass({ 1 }).unwrap();
+    vk::PassExecutionInfo         pass { .id = id, .kind = 9 };
+    Vec<vk::ResourceId>           ids;
+    for (unsigned n {}; n < 3; ++n) {
+        auto input = builder
+                         .import_resource({ .id    = { 3 * n + 1, 17 },
+                                            .kind  = vrento::fg::ResourceKind::Buffer,
+                                            .bytes = 64 })
+                         .unwrap();
+        pass.uses.push({ input.resource,
+                         0,
+                         vk::GraphAccess::Read,
+                         vk::PassUsage::Uniform,
+                         vk::PassStages::Vertex,
+                         { .size = 64 } });
+        ids.push(vk::ResourceId(input.resource));
+    }
+    // A planned resource, so the graph has allocation slots and read-only imports are known to
+    // be shared freely.
+    auto planned = builder
+                       .create_resource({ .id               = { 100, 1 },
+                                          .kind             = vrento::fg::ResourceKind::Buffer,
+                                          .bytes            = 64,
+                                          .allocation_class = 1 })
+                       .unwrap();
+    planned = builder.reserve_write(id, planned).unwrap();
+    pass.uses.push({ planned.resource,
+                     planned.version,
+                     vk::GraphAccess::Write,
+                     vk::PassUsage::Transfer,
+                     vk::PassStages::Transfer,
+                     { .size = 64 } });
+    vrento_test::declare_pass(builder, pass).unwrap();
+    Vec<vk::PassExecutionInfo> passes;
+    passes.push(rstd::move(pass));
+    auto graph =
+        vk::VulkanPassSet::associate(rstd::move(builder).finish().unwrap(), rstd::move(passes))
+            .unwrap();
+    auto make = [&](unsigned a, unsigned b, unsigned c, unsigned own) {
+        const unsigned physical[3] = { a, b, c };
+        vk::GraphBindings bindings(711);
+        for (unsigned n {}; n < 3; ++n)
+            bindings
+                .bind(ids[usize(n)],
+                      binding(counts, { session.epoch(), session.epoch(), physical[n] }))
+                .unwrap();
+        bindings
+            .bind_version(planned,
+                          binding(counts, { session.epoch(), session.epoch(), own }))
+            .unwrap();
+        return bindings;
+    };
+    auto stats = [&] { return graph.binding_check_stats(); };
+    EXPECT_TRUE(make(1u, 2u, 3u, 50u).prepare(graph, session).is_ok());
+    EXPECT_EQ(stats().misses, 1u);
+    // Read-only imports now share one physical resource (uniform blocks not uploaded this frame
+    // against uploaded ones): no new validation.
+    EXPECT_TRUE(make(1u, 1u, 3u, 51u).prepare(graph, session).is_ok());
+    EXPECT_TRUE(make(7u, 7u, 7u, 52u).prepare(graph, session).is_ok());
+    EXPECT_EQ(stats().misses, 1u);
+    EXPECT_EQ(stats().hits, 2u);
+    // The planned resource sharing a physical resource with a read-only import is another
+    // pattern, validated on its own.
+    (void)make(1u, 2u, 3u, 2u).prepare(graph, session);
+    EXPECT_EQ(stats().misses, 2u);
 }
 TEST(GraphBindings, FreezePassPropagatesWritesAcrossPhysicalAliases) {
     auto              session = vk::DeviceSession::create({ .validation = true }).unwrap();
