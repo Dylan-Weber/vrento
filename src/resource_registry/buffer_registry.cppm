@@ -16,6 +16,7 @@ struct BufferEntry {
     auto request() const -> const resource::BufferRequest& { return definition.definition(); }
     u64  definition_version { 1 };
     u64  content_version { 1 };
+    u64  last_touched { 0 }; // BufferRegistry collection of the last Register of this name
 };
 
 struct BufferPhysical {
@@ -216,6 +217,30 @@ public:
         });
     }
 
+    // Drops the entries (and their names) that nothing refers to any more: no live physical buffer is held
+    // outside this registry and the name has not been registered for `max_idle` calls. A scene whose draw names
+    // change on every render-graph rebuild would otherwise grow m_entries/m_names without bound.
+    auto PruneUnused(u64 max_idle = u64(1024)) -> usize {
+        ++m_collection;
+        Vec<String> dropped;
+        m_entries.retain([&](const resource::BufferHandle& handle, BufferEntry& entry) {
+            if (m_collection - entry.last_touched <= max_idle) return true;
+            auto physical = m_resources.get(handle);
+            if (physical.is_some() && (**physical).strong_count() > usize(1)) return true;
+            dropped.push(entry.request().name.clone());
+            return false;
+        });
+        for (const auto& name : dropped) {
+            auto handle = m_names.get(name);
+            if (handle.is_some()) {
+                auto key = **handle;
+                (void)m_resources.remove(key);
+            }
+            (void)m_names.remove(name);
+        }
+        return dropped.len();
+    }
+
     void Reset() {
         m_allocations = u64();
         m_resources.clear();
@@ -290,7 +315,8 @@ private:
                 (**entry).request().content_identity != request.content_identity) {
                 ++(**entry).content_version;
             }
-            (**entry).definition = rstd::move(definition);
+            (**entry).definition   = rstd::move(definition);
+            (**entry).last_touched = m_collection;
             return (**entry).handle;
         }
 
@@ -301,8 +327,9 @@ private:
         auto name = request.name.clone();
         (void)m_entries.insert(handle,
                                BufferEntry {
-                                   .handle     = handle,
-                                   .definition = rstd::move(definition),
+                                   .handle       = handle,
+                                   .definition   = rstd::move(definition),
+                                   .last_touched = m_collection,
                                });
         (void)m_names.insert(rstd::move(name), handle);
         return handle;
@@ -311,6 +338,7 @@ private:
     template<typename Value>
     using HandleMap = FastMap<resource::BufferHandle, Value>;
 
+    u64                                     m_collection { 0 };
     u64                                     m_generation { 1 };
     u64                                     m_next_index { 0 };
     HandleMap<BufferEntry>                  m_entries;
