@@ -951,6 +951,7 @@ public:
         m_registries.RenderPassCache().PruneExpired();
         m_registries.FramebufferCache().PruneExpired();
         m_registries.Memory().Refresh(memory);
+        (void)m_registries.Buffers().PruneUnused();
         if (m_registries.Memory().ShouldEvictTransient()) {
             m_registries.TextureEntries().EvictUnused();
             m_registries.Buffers().EvictUnused();

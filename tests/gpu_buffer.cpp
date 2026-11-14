@@ -600,4 +600,25 @@ TEST(GpuBuffer, ZeroAndCopiedSourceSurviveCancellationAndRestore) {
     for (auto byte : cleared) EXPECT_EQ(byte, u8());
     EXPECT_EQ(session.validation_errors(), 0u);
 }
+TEST(BufferRegistryPrune, DropsIdleNamesAndKeepsTouchedOnes) {
+    registry::BufferRegistry buffers;
+    auto declare = [&](rstd::string::String name) {
+        return buffers.Declare(vrento::resource::BufferRequest {
+            .name       = rstd::move(name),
+            .definition = { .size = usize(64), .usage = vrento::resource::BufferUsage::Vertex, .alignment = usize(4) },
+        });
+    };
+    for (int i = 0; i < 500; ++i) (void)declare(rstd::format("draw:{}:0:vertex", i));
+    auto keep = declare(rstd::format("keep"));
+    EXPECT_EQ(buffers.Size(), usize(501));
+    // within the idle window nothing goes
+    for (int i = 0; i < 8; ++i) EXPECT_EQ(buffers.PruneUnused(u64(8)), usize());
+    // past it, the names that were never registered again go; the one declared again each round stays
+    for (int i = 0; i < 16; ++i) {
+        (void)declare(rstd::format("keep"));
+        (void)buffers.PruneUnused(u64(8));
+    }
+    EXPECT_EQ(buffers.Size(), usize(1));
+    EXPECT_EQ(declare(rstd::format("keep")).index, keep.index);
+}
 } // namespace vrento_test::gpu_buffer
