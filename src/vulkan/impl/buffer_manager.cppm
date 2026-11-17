@@ -1,11 +1,13 @@
 module;
 
 #include <rstd/macro.hpp>
+#include <stdlib.h>
 #include "vvk/macros.hpp"
 
 module vrento:vulkan.impl.buffer_manager;
 
 import :vulkan.api;
+import :vulkan.upload_plan;
 
 import rstd;
 import rstd.log;
@@ -691,52 +693,141 @@ auto BufferManager::TryRecordUploads(vvk::CommandBuffer& cmd, RecordedBufferUplo
         auto flushed = block->Flush();
         if (flushed.is_err()) return flushed;
     }
-    for (usize i {}; i < (*m_impl->pending)->copies.len(); ++i) {
-        const auto& copy = (*m_impl->pending)->copies[i];
-        // Uploads may overwrite ranges read by an earlier submission.
-        VkBufferMemoryBarrier overwrite { .sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-                                          .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT |
-                                                           VK_ACCESS_MEMORY_WRITE_BIT,
-                                          .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-                                          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                                          .buffer              = copy.destination,
-                                          .offset              = copy.destination_offset,
-                                          .size                = copy.size };
-        cmd.PipelineBarrier(
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, overwrite);
-        if (copy.source)
-            cmd.CopyBuffer((*copy.source)->handle(),
-                           copy.destination,
-                           VkBufferCopy {
-                               .srcOffset = copy.source_offset,
-                               .dstOffset = copy.destination_offset,
-                               .size      = copy.size,
-                           });
-        else
-            cmd.FillBuffer(copy.destination, copy.destination_offset, copy.size, 0);
-        auto category = unsigned(copy.usage);
-        ++m_impl->statistics.recorded_copies[category];
-        m_impl->statistics.recorded_bytes[category] += copy.size;
-    }
-    for (const auto& copy : (*m_impl->pending)->copies) {
-        VkBufferMemoryBarrier barrier {
-            .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-            .srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask       = DestinationAccess(copy.usage),
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer              = copy.destination,
-            .offset              = copy.destination_offset,
-            .size                = copy.size,
-        };
-        cmd.PipelineBarrier(
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            DestinationStages(copy.usage,
-                              m_impl->device.capabilities().geometry_shader,
-                              m_impl->device.graphics_queue().flags & VK_QUEUE_COMPUTE_BIT),
-            VK_DEPENDENCY_BY_REGION_BIT,
-            barrier);
+    // OWE_UPLOAD_BATCH=0: a barrier, a copy and a barrier per upload, as before batching
+    static const bool batched = [] {
+        const char* value = getenv("OWE_UPLOAD_BATCH");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (! batched) {
+        for (usize i {}; i < (*m_impl->pending)->copies.len(); ++i) {
+            const auto& copy = (*m_impl->pending)->copies[i];
+            // Uploads may overwrite ranges read by an earlier submission.
+            VkBufferMemoryBarrier overwrite { .sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                                              .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                                                               VK_ACCESS_MEMORY_WRITE_BIT,
+                                              .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                              .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                              .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                              .buffer              = copy.destination,
+                                              .offset              = copy.destination_offset,
+                                              .size                = copy.size };
+            cmd.PipelineBarrier(
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, overwrite);
+            if (copy.source)
+                cmd.CopyBuffer((*copy.source)->handle(),
+                               copy.destination,
+                               VkBufferCopy {
+                                   .srcOffset = copy.source_offset,
+                                   .dstOffset = copy.destination_offset,
+                                   .size      = copy.size,
+                               });
+            else
+                cmd.FillBuffer(copy.destination, copy.destination_offset, copy.size, 0);
+            auto category = unsigned(copy.usage);
+            ++m_impl->statistics.recorded_copies[category];
+            m_impl->statistics.recorded_bytes[category] += copy.size;
+        }
+        for (const auto& copy : (*m_impl->pending)->copies) {
+            VkBufferMemoryBarrier barrier {
+                .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                .srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask       = DestinationAccess(copy.usage),
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer              = copy.destination,
+                .offset              = copy.destination_offset,
+                .size                = copy.size,
+            };
+            cmd.PipelineBarrier(
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                DestinationStages(copy.usage,
+                                  m_impl->device.capabilities().geometry_shader,
+                                  m_impl->device.graphics_queue().flags & VK_QUEUE_COMPUTE_BIT),
+                VK_DEPENDENCY_BY_REGION_BIT,
+                barrier);
+        }
+    } else {
+        const auto& copies = (*m_impl->pending)->copies;
+        const bool  geometry = m_impl->device.capabilities().geometry_shader;
+        const bool  compute  = m_impl->device.graphics_queue().flags & VK_QUEUE_COMPUTE_BIT;
+        // Uploads may overwrite ranges read by an earlier submission: one barrier for all of them.
+        Vec<VkBufferMemoryBarrier> before, after;
+        Vec<UploadCopy>            plan_input;
+        VkPipelineStageFlags       after_stages {};
+        for (const auto& copy : copies) {
+            before.push({ .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                          .srcAccessMask       = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                          .dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
+                          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                          .buffer              = copy.destination,
+                          .offset              = copy.destination_offset,
+                          .size                = copy.size });
+            after.push({ .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                         .srcAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
+                         .dstAccessMask       = DestinationAccess(copy.usage),
+                         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                         .buffer              = copy.destination,
+                         .offset              = copy.destination_offset,
+                         .size                = copy.size });
+            after_stages |= DestinationStages(copy.usage, geometry, compute);
+            plan_input.push({ .source             = copy.source ? (*copy.source)->handle() : VK_NULL_HANDLE,
+                              .destination        = copy.destination,
+                              .source_offset      = copy.source_offset,
+                              .destination_offset = copy.destination_offset,
+                              .size               = copy.size });
+        }
+        if (! before.is_empty())
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                0,
+                                {},
+                                before.as_slice(),
+                                {});
+        Vec<VkBufferCopy> regions;
+        for (const auto& command : PlanUploadCommands(plan_input.as_slice())) {
+            switch (command.kind) {
+            case UploadCommand::Kind::Barrier: {
+                const VkMemoryBarrier write_after_write { .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                                                          .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                                          .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT };
+                cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    0,
+                                    slice<VkMemoryBarrier>::from_raw_parts(&write_after_write, usize(1)),
+                                    {},
+                                    {});
+                break;
+            }
+            case UploadCommand::Kind::Fill: {
+                const auto& copy = copies[command.first];
+                cmd.FillBuffer(copy.destination, copy.destination_offset, copy.size, 0);
+                break;
+            }
+            case UploadCommand::Kind::Copy:
+                regions.clear();
+                for (usize i = command.first; i < command.first + command.count; ++i)
+                    AppendUploadRegion(regions,
+                                       { .srcOffset = copies[i].source_offset,
+                                         .dstOffset = copies[i].destination_offset,
+                                         .size      = copies[i].size });
+                cmd.CopyBuffer(command.source, command.destination, regions.as_slice());
+                break;
+            }
+        }
+        for (const auto& copy : copies) {
+            auto category = unsigned(copy.usage);
+            ++m_impl->statistics.recorded_copies[category];
+            m_impl->statistics.recorded_bytes[category] += copy.size;
+        }
+        if (! after.is_empty())
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                after_stages,
+                                VK_DEPENDENCY_BY_REGION_BIT,
+                                {},
+                                after.as_slice(),
+                                {});
     }
     (*m_impl->pending)->recorded = true;
     return Ok(rstd::empty {});

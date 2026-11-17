@@ -621,4 +621,60 @@ TEST(BufferRegistryPrune, DropsIdleNamesAndKeepsTouchedOnes) {
     EXPECT_EQ(buffers.Size(), usize(1));
     EXPECT_EQ(declare(rstd::format("keep")).index, keep.index);
 }
+// A batch of buffer uploads records one copy command per run of copies between the same two buffers, and a
+// transfer barrier only where a copy writes bytes an earlier copy of the batch wrote.
+TEST(UploadPlan, MergesRunsAndOrdersOverlappingWrites) {
+    auto a   = reinterpret_cast<VkBuffer>(rstd::uintptr_t(0x10));
+    auto b   = reinterpret_cast<VkBuffer>(rstd::uintptr_t(0x20));
+    auto src = reinterpret_cast<VkBuffer>(rstd::uintptr_t(0x30));
+    using K  = UploadCommand::Kind;
+    using C  = UploadCopy;
+    auto plan = [](auto... copies) {
+        Vec<UploadCopy> list;
+        (list.push(UploadCopy(copies)), ...);
+        return PlanUploadCommands(list.as_slice());
+    };
+    EXPECT_TRUE(plan().is_empty());
+    // three copies from one staging block into one buffer, not adjacent: one command of three regions
+    auto merged = plan(C { src, a, 0, 0, 16 }, C { src, a, 16, 64, 16 }, C { src, a, 32, 32, 16 });
+    ASSERT_EQ(merged.len(), usize(1));
+    EXPECT_EQ(merged[usize(0)].kind, K::Copy);
+    EXPECT_EQ(merged[usize(0)].first, usize(0));
+    EXPECT_EQ(merged[usize(0)].count, usize(3));
+    // another destination starts a new command, in order
+    auto split = plan(C { src, a, 0, 0, 16 }, C { src, b, 16, 0, 16 }, C { src, a, 32, 16, 16 });
+    ASSERT_EQ(split.len(), usize(3));
+    EXPECT_EQ(split[usize(1)].destination, b);
+    EXPECT_EQ(split[usize(2)].first, usize(2));
+    // a zero fill is a command of its own and ends a run
+    auto fill = plan(C { src, a, 0, 0, 16 }, C { VK_NULL_HANDLE, a, 0, 16, 16 }, C { src, a, 16, 32, 16 });
+    ASSERT_EQ(fill.len(), usize(3));
+    EXPECT_EQ(fill[usize(1)].kind, K::Fill);
+    EXPECT_EQ(fill[usize(1)].first, usize(1));
+    // a copy over bytes written earlier in the batch waits for that write: barrier, then a new command
+    auto overlap = plan(C { src, a, 0, 0, 16 }, C { src, b, 0, 0, 16 }, C { src, a, 16, 8, 16 });
+    ASSERT_EQ(overlap.len(), usize(4));
+    EXPECT_EQ(overlap[usize(2)].kind, K::Barrier);
+    EXPECT_EQ(overlap[usize(3)].kind, K::Copy);
+    EXPECT_EQ(overlap[usize(3)].first, usize(2));
+    // touching ranges do not overlap
+    EXPECT_EQ(plan(C { src, a, 0, 0, 16 }, C { src, a, 16, 16, 16 }).len(), usize(1));
+    // after a barrier the writes before it no longer count: the third copy overlaps only the first
+    auto twice = plan(C { src, a, 0, 0, 16 }, C { src, a, 0, 8, 8 }, C { src, a, 0, 0, 8 });
+    ASSERT_EQ(twice.len(), usize(3));
+    EXPECT_EQ(twice[usize(1)].kind, K::Barrier);
+    EXPECT_EQ(twice[usize(2)].count, usize(2));
+}
+// Regions that continue each other in both buffers become one region; any gap or jump starts a new one.
+TEST(UploadPlan, AppendRegionCoalescesContiguousRuns) {
+    Vec<VkBufferCopy> regions;
+    AppendUploadRegion(regions, { .srcOffset = 0, .dstOffset = 256, .size = 64 });
+    AppendUploadRegion(regions, { .srcOffset = 64, .dstOffset = 320, .size = 32 });
+    ASSERT_EQ(regions.len(), usize(1));
+    EXPECT_EQ(regions[usize(0)].size, VkDeviceSize(96));
+    AppendUploadRegion(regions, { .srcOffset = 96, .dstOffset = 1024, .size = 16 }); // destination jumps
+    AppendUploadRegion(regions, { .srcOffset = 128, .dstOffset = 1040, .size = 16 }); // source jumps
+    ASSERT_EQ(regions.len(), usize(3));
+    EXPECT_EQ(regions[usize(2)].srcOffset, VkDeviceSize(128));
+}
 } // namespace vrento_test::gpu_buffer
