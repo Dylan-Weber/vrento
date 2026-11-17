@@ -21,3 +21,4 @@ export import :vulkan.pipeline_layout;
 export import :vulkan.passes.surface;
 export import :vulkan.texture_output;
 export import :vulkan.resource_bindings;
+export import :vulkan.upload_plan;
